@@ -1,0 +1,14 @@
+[package]
+name = "lilium-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+lilium-common.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+rust_decimal.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

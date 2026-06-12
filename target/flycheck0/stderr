@@ -1,0 +1,100 @@
+   0.106980000s  INFO prepare_target{force=false package_id=lilium-database v0.1.0 (/Users/bearice/Working/github/dzmm-spider-rust/crates/lilium-database) target="lilium_database"}: cargo::core::compiler::fingerprint: fingerprint error for lilium-database v0.1.0 (/Users/bearice/Working/github/dzmm-spider-rust/crates/lilium-database)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("lilium_database", ["lib"], "/Users/bearice/Working/github/dzmm-spider-rust/crates/lilium-database/src/lib.rs", Edition2021) }
+   0.107000500s  INFO prepare_target{force=false package_id=lilium-database v0.1.0 (/Users/bearice/Working/github/dzmm-spider-rust/crates/lilium-database) target="lilium_database"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/bearice/Working/github/dzmm-spider-rust/target/debug/.fingerprint/lilium-database-3005eaa60bdc5059/lib-lilium_database`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   7: cargo::ops::cargo_compile::compile_ws
+   8: cargo::ops::cargo_compile::compile_with_exec
+   9: cargo::ops::cargo_compile::compile
+  10: cargo::commands::check::exec
+  11: <cargo::cli::Exec>::exec
+  12: cargo::main
+  13: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  14: std::rt::lang_start::<()>::{closure#0}
+  15: std::rt::lang_start_internal
+  16: _main
+   0.114463041s  INFO prepare_target{force=false package_id=lilium-database v0.1.0 (/Users/bearice/Working/github/dzmm-spider-rust/crates/lilium-database) target="lilium_database"}: cargo::core::compiler::fingerprint: fingerprint error for lilium-database v0.1.0 (/Users/bearice/Working/github/dzmm-spider-rust/crates/lilium-database)/Check { test: true }/TargetInner { name_inferred: true, ..: lib_target("lilium_database", ["lib"], "/Users/bearice/Working/github/dzmm-spider-rust/crates/lilium-database/src/lib.rs", Edition2021) }
+   0.114472750s  INFO prepare_target{force=false package_id=lilium-database v0.1.0 (/Users/bearice/Working/github/dzmm-spider-rust/crates/lilium-database) target="lilium_database"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/bearice/Working/github/dzmm-spider-rust/target/debug/.fingerprint/lilium-database-3b0f86277efce3c5/test-lib-lilium_database`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   7: cargo::ops::cargo_compile::compile_ws
+   8: cargo::ops::cargo_compile::compile_with_exec
+   9: cargo::ops::cargo_compile::compile
+  10: cargo::commands::check::exec
+  11: <cargo::cli::Exec>::exec
+  12: cargo::main
+  13: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  14: std::rt::lang_start::<()>::{closure#0}
+  15: std::rt::lang_start_internal
+  16: _main
+   0.115884958s  INFO prepare_target{force=false package_id=lilium-spider v0.1.0 (/Users/bearice/Working/github/dzmm-spider-rust/binaries/lilium-spider) target="lilium-spider"}: cargo::core::compiler::fingerprint: fingerprint error for lilium-spider v0.1.0 (/Users/bearice/Working/github/dzmm-spider-rust/binaries/lilium-spider)/Check { test: false }/TargetInner { name: "lilium-spider", doc: true, ..: with_path("/Users/bearice/Working/github/dzmm-spider-rust/binaries/lilium-spider/src/main.rs", Edition2021) }
+   0.115891833s  INFO prepare_target{force=false package_id=lilium-spider v0.1.0 (/Users/bearice/Working/github/dzmm-spider-rust/binaries/lilium-spider) target="lilium-spider"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/bearice/Working/github/dzmm-spider-rust/target/debug/.fingerprint/lilium-spider-8a366f624600fd98/bin-lilium-spider`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   7: cargo::ops::cargo_compile::compile_ws
+   8: cargo::ops::cargo_compile::compile_with_exec
+   9: cargo::ops::cargo_compile::compile
+  10: cargo::commands::check::exec
+  11: <cargo::cli::Exec>::exec
+  12: cargo::main
+  13: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  14: std::rt::lang_start::<()>::{closure#0}
+  15: std::rt::lang_start_internal
+  16: _main
+   0.118157708s  INFO prepare_target{force=false package_id=lilium-spider v0.1.0 (/Users/bearice/Working/github/dzmm-spider-rust/binaries/lilium-spider) target="lilium-spider"}: cargo::core::compiler::fingerprint: fingerprint error for lilium-spider v0.1.0 (/Users/bearice/Working/github/dzmm-spider-rust/binaries/lilium-spider)/Check { test: true }/TargetInner { name: "lilium-spider", doc: true, ..: with_path("/Users/bearice/Working/github/dzmm-spider-rust/binaries/lilium-spider/src/main.rs", Edition2021) }
+   0.118164125s  INFO prepare_target{force=false package_id=lilium-spider v0.1.0 (/Users/bearice/Working/github/dzmm-spider-rust/binaries/lilium-spider) target="lilium-spider"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/bearice/Working/github/dzmm-spider-rust/target/debug/.fingerprint/lilium-spider-bd4c0b786092ce28/test-bin-lilium-spider`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   7: cargo::ops::cargo_compile::compile_ws
+   8: cargo::ops::cargo_compile::compile_with_exec
+   9: cargo::ops::cargo_compile::compile
+  10: cargo::commands::check::exec
+  11: <cargo::cli::Exec>::exec
+  12: cargo::main
+  13: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  14: std::rt::lang_start::<()>::{closure#0}
+  15: std::rt::lang_start_internal
+  16: _main
+    Checking lilium-database v0.1.0 (/Users/bearice/Working/github/dzmm-spider-rust/crates/lilium-database)
+error: could not compile `lilium-database` (lib test) due to 1 previous error; 1 warning emitted
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `lilium-database` (lib) due to 1 previous error; 1 warning emitted

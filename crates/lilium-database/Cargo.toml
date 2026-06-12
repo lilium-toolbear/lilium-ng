@@ -1,0 +1,18 @@
+[package]
+name = "lilium-database"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+lilium-common.workspace = true
+lilium-models.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
+rust_decimal.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
