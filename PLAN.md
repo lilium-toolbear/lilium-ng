@@ -1,4 +1,4 @@
-# DZMM Rust 重写实现计划
+# Lilium 实现计划
 
 ## 技术栈
 
@@ -22,18 +22,18 @@
 
 ### T1.1 初始化 Workspace
 ```bash
-mkdir dzmm-rust && cd dzmm-rust
-cargo init --name dzmm-common crates/dzmm-common
-cargo init --name dzmm-models crates/dzmm-models
-cargo init --name dzmm-database crates/dzmm-database
+mkdir lilium && cd lilium
+cargo init --name lilium-common crates/lilium-common
+cargo init --name lilium-models crates/lilium-models
+cargo init --name lilium-database crates/lilium-database
 ```
 
-### T1.2 实现 dzmm-common
-- 错误类型 `DzmmError`
+### T1.2 实现 lilium-common
+- 错误类型 `LiliumError`
 - 常量 `TICK_INTERVAL_MINUTES`, `BATCH_SIZE` 等
 - 工具函数 `utc_now()`, `quantize_decimal()`
 
-### T1.3 实现 dzmm-models
+### T1.3 实现 lilium-models
 按领域组织：
 - `message.rs` - Message, MessageContent
 - `user.rs` - User, UserInfo
@@ -45,7 +45,7 @@ cargo init --name dzmm-database crates/dzmm-database
 - `futures.rs` - FuturesOrder, FuturesPosition
 - `ingestion.rs` - WebSocketEvent, EventEnvelope
 
-### T1.4 实现 dzmm-database
+### T1.4 实现 lilium-database
 - `pool.rs` - DbPool 连接池
 - `migrations/` - SQL 迁移文件
 - `notifications.rs` - LISTEN/NOTIFY
@@ -57,9 +57,9 @@ cargo init --name dzmm-database crates/dzmm-database
 
 ## 阶段 2: 客户端层
 
-### T2.1 初始化 dzmm-api-client
+### T2.1 初始化 lilium-api-client
 ```bash
-cargo init --name dzmm-api-client crates/dzmm-api-client
+cargo init --name lilium-api-client crates/lilium-api-client
 ```
 
 ### T2.2 实现 HTTP 客户端
@@ -83,9 +83,9 @@ cargo init --name dzmm-api-client crates/dzmm-api-client
 
 ## 阶段 3: 业务逻辑层
 
-### T3.1 初始化 dzmm-core
+### T3.1 初始化 lilium-core
 ```bash
-cargo init --name dzmm-core crates/dzmm-core
+cargo init --name lilium-core crates/lilium-core
 ```
 
 ### T3.2 实现 pal_work 模块
@@ -121,9 +121,9 @@ cargo init --name dzmm-core crates/dzmm-core
 
 ## 阶段 4: 服务层
 
-### T4.1 初始化 dzmm-services
+### T4.1 初始化 lilium-services
 ```bash
-cargo init --name dzmm-services crates/dzmm-services
+cargo init --name lilium-services crates/lilium-services
 ```
 
 ### T4.2 定义服务 trait
@@ -146,9 +146,9 @@ cargo init --name dzmm-services crates/dzmm-services
 
 ## 阶段 5: Spider 服务（第一个迁移目标）
 
-### T5.1 初始化 dzmm-spider
+### T5.1 初始化 lilium-spider
 ```bash
-cargo init --name dzmm-spider binaries/dzmm-spider
+cargo init --name lilium-spider binaries/lilium-spider
 ```
 
 ### T5.2 实现 Arbiter
@@ -205,13 +205,13 @@ codegen-units = 1
 ### T7.2 Systemd 服务
 ```ini
 [Unit]
-Description=DZMM Spider Rust Service
+Description=Lilium Spider Service
 After=network.target postgresql.service
 
 [Service]
 Type=simple
-User=dzmm
-ExecStart=/opt/dzmm-rust/dzmm-spider
+User=lilium
+ExecStart=/opt/lilium/lilium-spider
 Restart=always
 
 [Install]
@@ -228,16 +228,16 @@ WantedBy=multi-user.target
 
 ## 后续阶段（Spider 验证通过后）
 
-### 阶段 8: dzmm-bot
+### 阶段 8: lilium-bot
 - 40+ 命令迁移
 - ACL、限流
 
-### 阶段 9: dzmm-web
+### 阶段 9: lilium-web
 - FastAPI → axum
 - GraphQL (async-graphql)
 - 静态文件服务
 
-### 阶段 10: dzmm-cli
+### 阶段 10: lilium-cli
 - wsctl 等命令行工具
 
 ---
@@ -261,14 +261,14 @@ WantedBy=multi-user.target
 
 ### M1: 基础可用 (第 1 周末)
 - Workspace 骨架
-- dzmm-common, dzmm-models, dzmm-database
+- lilium-common, lilium-models, lilium-database
 
 ### M2: 客户端可用 (第 2 周末)
-- dzmm-api-client
+- lilium-api-client
 - 能连接 DZMM API
 
 ### M3: Spider 可用 (第 3 周末)
-- dzmm-spider 独立运行
+- lilium-spider 独立运行
 - 能处理 WebSocket 事件
 
 ### M4: 生产就绪 (第 4 周末)
@@ -281,9 +281,9 @@ WantedBy=multi-user.target
 ## 并行任务
 
 以下任务可以并行：
-- T1.2 (dzmm-common) 和 T1.3 (dzmm-models)
-- T3.2-T3.6 (dzmm-core 各模块)
-- T5.2-T5.5 (dzmm-spider 各组件)
+- T1.2 (lilium-common) 和 T1.3 (lilium-models)
+- T3.2-T3.6 (lilium-core 各模块)
+- T5.2-T5.5 (lilium-spider 各组件)
 
 ---
 
