@@ -38,6 +38,11 @@
 - NOTIFY 作为唤醒信号，轮询获取数据
 - 符合 Python 的 stream_with_polling 模式
 
+### 9. ✅ 服务层重构
+- 创建了 lilium-services crate
+- Processor 调用 services 而不是直接写 SQL
+- 修复了依赖方向: processor -> services -> database
+
 ## 仍存在的差距
 
 ### 1. Processor 高级功能
