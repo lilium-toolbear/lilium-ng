@@ -42,6 +42,8 @@
 - 创建了 lilium-services crate
 - Processor 调用 services 而不是直接写 SQL
 - 修复了依赖方向: processor -> services -> database
+- 删除了未使用的 lilium-spider-core crate
+- 修复了 SQL 重复问题
 
 ## 仍存在的差距
 

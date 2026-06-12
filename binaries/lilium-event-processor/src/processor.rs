@@ -179,7 +179,7 @@ impl EventProcessor {
         match event.event.as_str() {
             "message:new" => {
                 if let Some(msg) = lilium_models::dzmm::message::Message::from_websocket(&event.data) {
-                    self.message_service.create_message(&self.pool, &msg).await?;
+                    self.message_service.create_message(&self.pool, &msg, &event.data).await?;
                 }
             }
             "message:updated" => {
@@ -197,8 +197,14 @@ impl EventProcessor {
                     self.message_service.mark_recalled(&self.pool, message_id).await?;
                 }
             }
-            "presence:user-online" | "group:member-joined" | "group:member-left" => {
-                // Ignored for now
+            "presence:user-online" => {
+                // User online - no action needed for now
+            }
+            "group:member-joined" => {
+                // Room member joined - handled by system message detection
+            }
+            "group:member-left" => {
+                // Room member left - handled by system message detection
             }
             _ => {
                 // Unknown event type
@@ -395,6 +401,48 @@ mod tests {
         assert_eq!(content_type, Some("text"));
         let content_text = event.data["message"]["content"]["text"].as_str();
         assert_eq!(content_text, Some("updated content"));
+    }
+
+    #[test]
+    fn test_system_message_join_detection() {
+        let event = make_event("message:new", serde_json::json!({
+            "chatroomId": "room1",
+            "message": {
+                "messageId": "msg1",
+                "sentBy": "user1",
+                "content": {"type": "system", "text": "user1 加入了群聊"}
+            }
+        }));
+        let msg = lilium_models::dzmm::message::Message::from_websocket(&event.data).unwrap();
+        assert_eq!(msg.content_type.as_deref(), Some("system"));
+        assert!(msg.content_text.as_deref().unwrap().contains("加入了群聊"));
+    }
+
+    #[test]
+    fn test_system_message_leave_detection() {
+        let event = make_event("message:new", serde_json::json!({
+            "chatroomId": "room1",
+            "message": {
+                "messageId": "msg1",
+                "sentBy": "user1",
+                "content": {"type": "system", "text": "user1 离开了群聊"}
+            }
+        }));
+        let msg = lilium_models::dzmm::message::Message::from_websocket(&event.data).unwrap();
+        assert!(msg.content_text.as_deref().unwrap().contains("离开了群聊"));
+    }
+
+    #[test]
+    fn test_media_content_detection() {
+        let event = make_event("message:new", serde_json::json!({
+            "chatroomId": "room1",
+            "message": {
+                "messageId": "msg1",
+                "content": {"type": "image", "url": "http://example.com/img.jpg"}
+            }
+        }));
+        let content_type = event.data["message"]["content"]["type"].as_str();
+        assert!(matches!(content_type, Some("image" | "video" | "voice" | "sticker")));
     }
 
     #[test]

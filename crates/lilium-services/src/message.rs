@@ -1,6 +1,7 @@
 use anyhow::Result;
 use lilium_database::queries::messages as msg_queries;
 use lilium_models::dzmm::message::Message;
+use crate::room_member::RoomMemberService;
 
 /// Service for processing message events
 pub struct MessageService;
@@ -11,8 +12,53 @@ impl MessageService {
     }
 
     /// Process a message:new event
-    pub async fn create_message(&self, pool: &sqlx::PgPool, message: &Message) -> Result<bool> {
-        msg_queries::create_message_if_missing(pool, message).await
+    /// Returns Some(message_id) if the message has media content that needs downloading
+    pub async fn create_message(
+        &self,
+        pool: &sqlx::PgPool,
+        message: &Message,
+        data: &serde_json::Value,
+    ) -> Result<Option<String>> {
+        msg_queries::create_message_if_missing(pool, message).await?;
+
+        // Detect membership system messages and update room member state
+        if message.content_type.as_deref() == Some("system") {
+            if let Some(text) = &message.content_text {
+                if text.contains("加入了群聊") {
+                    if let Some(sent_by) = &message.sent_by {
+                        let room_member_svc = RoomMemberService::new(pool.clone());
+                        room_member_svc.upsert_member(
+                            &message.room_id,
+                            sent_by,
+                            "member",
+                            message.sent_at,
+                        ).await?;
+                    }
+                } else if text.contains("离开了群聊") {
+                    if let Some(sent_by) = &message.sent_by {
+                        let room_member_svc = RoomMemberService::new(pool.clone());
+                        room_member_svc.mark_member_left(
+                            &message.room_id,
+                            sent_by,
+                            message.sent_at,
+                        ).await?;
+                    }
+                }
+            }
+        }
+
+        // Check if message has media content
+        if let Some(msg_data) = data.get("message") {
+            if let Some(content) = msg_data.get("content") {
+                if let Some(content_type) = content.get("type").and_then(|v| v.as_str()) {
+                    if matches!(content_type, "image" | "video" | "voice" | "sticker") {
+                        return Ok(Some(message.message_id.clone()));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     /// Process a message:updated event
