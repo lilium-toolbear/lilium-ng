@@ -48,10 +48,8 @@
 ## 仍存在的差距
 
 ### 1. Processor 高级功能
-- 没有 LISTEN/NOTIFY（只有轮询）
-- 没有用户获取
-- 没有媒体下载
-- 没有房间成员追踪
+- 没有用户批量获取（Python 的 batch_fetch_and_update_users）
+- 没有媒体下载（Python 的 _download_media_batch）
 
 ### 2. 测试覆盖
 | 模块 | Rust | Python |
@@ -59,5 +57,5 @@
 | ingestion | 8 | 13 |
 | control | 11 | 5+ |
 | worker | 1 | N/A (集成) |
-| processor | 16 | 10+ |
-| **总计** | **49** | **30+** |
+| processor | 19 | 10+ |
+| **总计** | **68** | **30+** |
