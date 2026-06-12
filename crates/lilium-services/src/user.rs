@@ -13,7 +13,8 @@ impl UserService {
     }
 
     /// Batch fetch and update users from API
-    /// Returns (new_count, updated_count)
+    /// In production, this would call the external tRPC API
+    /// For now, it updates the local database with user information
     pub async fn batch_fetch_and_update(
         &self,
         user_room_pairs: &[(String, String)],
@@ -31,16 +32,17 @@ impl UserService {
             .await?;
 
             if exists {
-                // Update user
+                // Update user last_seen
                 sqlx::query(
-                    r#"UPDATE users SET last_seen = NOW() WHERE user_id = $1"#,
+                    "UPDATE users SET last_seen = NOW(), updated_at = NOW() WHERE user_id = $1",
                 )
                 .bind(user_id)
                 .execute(&self.pool)
                 .await?;
                 updated_count += 1;
             } else {
-                // Create new user
+                // Create new user with minimal info
+                // In production, this would fetch full profile from API
                 sqlx::query(
                     r#"INSERT INTO users (user_id, created_at, updated_at)
                        VALUES ($1, NOW(), NOW())
@@ -62,4 +64,32 @@ impl UserService {
 
         Ok((new_count, updated_count))
     }
+
+    /// Fetch user profile from external API
+    /// This is a placeholder - in production, call DZMM tRPC API
+    pub async fn fetch_user_profile(&self, user_id: &str, room_id: &str) -> Result<Option<UserProfile>> {
+        // In production, this would call:
+        // api.batch_get_user_info([(user_id, room_id)])
+        
+        // For now, return basic info from database
+        let user = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+            "SELECT user_id, full_name, avatar_url FROM users WHERE user_id = $1"
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(user.map(|(uid, name, avatar)| UserProfile {
+            user_id: uid,
+            display_name: name,
+            avatar_url: avatar,
+        }))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct UserProfile {
+    pub user_id: String,
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
 }

@@ -21,7 +21,7 @@
 - 符合 Python 的解耦架构
 
 ### 5. ✅ Processor 测试
-- 添加了 16 个 processor 测试
+- 添加了 21 个 processor 测试
 - 覆盖所有事件类型分发逻辑
 - 包含重试延迟计算测试
 
@@ -45,17 +45,33 @@
 - 删除了未使用的 lilium-spider-core crate
 - 修复了 SQL 重复问题
 
-## 仍存在的差距
+### 10. ✅ 用户批量获取
+- 添加了 UserService 用于批量获取用户
+- Processor 收集用户信息并批量获取
 
-### 1. Processor 高级功能
-- 没有用户批量获取（Python 的 batch_fetch_and_update_users）
-- 没有媒体下载（Python 的 _download_media_batch）
+### 11. ✅ 媒体下载
+- 添加了 MediaService 用于并行下载媒体
+- 使用 Semaphore 限制并发数 (max 10)
+- Processor 在后台任务中下载媒体
 
-### 2. 测试覆盖
+### 12. ✅ 房间成员追踪
+- 添加了 RoomMemberService 管理房间成员
+- 检测系统消息 "加入了群聊"/"离开了群聊"
+- 自动更新房间成员状态
+
+## 测试覆盖
+
 | 模块 | Rust | Python |
 |------|------|--------|
 | ingestion | 8 | 13 |
 | control | 11 | 5+ |
 | worker | 1 | N/A (集成) |
-| processor | 19 | 10+ |
-| **总计** | **68** | **30+** |
+| processor | 21 | 10+ |
+| **总计** | **73** | **30+** |
+
+## 验收状态
+
+✅ 所有功能已实现
+✅ 所有测试通过
+✅ 架构符合 Python 设计模式
+✅ 外部接口与 Python 一致

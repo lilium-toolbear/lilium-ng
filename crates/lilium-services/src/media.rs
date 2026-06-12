@@ -1,6 +1,7 @@
 use anyhow::Result;
 use sqlx::PgPool;
 use tracing::{info, warn};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
@@ -8,11 +9,19 @@ use tokio::sync::Semaphore;
 #[derive(Clone)]
 pub struct MediaService {
     pool: PgPool,
+    data_path: PathBuf,
 }
 
 impl MediaService {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            data_path: PathBuf::from("./data"),
+        }
+    }
+
+    pub fn with_data_path(pool: PgPool, data_path: PathBuf) -> Self {
+        Self { pool, data_path }
     }
 
     /// Download media for multiple messages in parallel
@@ -30,12 +39,13 @@ impl MediaService {
 
         let mut handles = Vec::new();
         for message_id in message_ids {
-            let permit = semaphore.clone().clone().acquire_owned().await?;
+            let permit = semaphore.clone().acquire_owned().await?;
             let message_id = message_id.clone();
             let pool = self.pool.clone();
+            let data_path = self.data_path.clone();
 
             let handle = tokio::spawn(async move {
-                let result = Self::download_single_media(&pool, &message_id).await;
+                let result = Self::download_single_media(&pool, &message_id, &data_path).await;
                 drop(permit);
                 (message_id, result)
             });
@@ -45,7 +55,7 @@ impl MediaService {
 
         for handle in handles {
             match handle.await {
-                Ok((_message_id, Ok(()))) => {
+                Ok((_, Ok(()))) => {
                     success_count += 1;
                 }
                 Ok((message_id, Err(e))) => {
@@ -69,21 +79,47 @@ impl MediaService {
     }
 
     /// Download media for a single message
-    async fn download_single_media(pool: &PgPool, message_id: &str) -> Result<()> {
+    async fn download_single_media(pool: &PgPool, message_id: &str, data_path: &PathBuf) -> Result<()> {
         // Get message with media content
-        let message = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
-            r#"SELECT message_id, attachment_url, attachment_file
+        let message = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>)>(
+            r#"SELECT message_id, content_type, attachment_url, attachment_file
                FROM messages WHERE message_id = $1"#,
         )
         .bind(message_id)
         .fetch_optional(pool)
         .await?;
 
-        if let Some((_, Some(url), _)) = message {
-            // Download media from URL
-            // In a real implementation, this would download the file
-            // For now, just log that we would download
-            tracing::debug!(message_id = %message_id, url = %url, "Would download media");
+        if let Some((_, content_type, Some(url), _)) = message {
+            // Determine file extension based on content type
+            let ext = match content_type.as_deref() {
+                Some("image") => "jpg",
+                Some("video") => "mp4",
+                Some("voice") => "m4a",
+                Some("sticker") => "png",
+                _ => "bin",
+            };
+
+            // Create directory structure
+            let media_dir = data_path.join("media").join(message_id);
+            tokio::fs::create_dir_all(&media_dir).await?;
+
+            let file_path = media_dir.join(format!("attachment.{}", ext));
+
+            // Download the file
+            let response = reqwest::get(&url).await?;
+            let bytes = response.bytes().await?;
+            tokio::fs::write(&file_path, &bytes).await?;
+
+            // Update message with file path
+            sqlx::query(
+                "UPDATE messages SET attachment_file = $1 WHERE message_id = $2"
+            )
+            .bind(file_path.to_string_lossy().to_string())
+            .bind(message_id)
+            .execute(pool)
+            .await?;
+
+            info!(message_id = %message_id, path = %file_path.display(), "Downloaded media");
         }
 
         Ok(())
