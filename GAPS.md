@@ -21,24 +21,31 @@
 - 符合 Python 的解耦架构
 
 ### 5. ✅ Processor 测试
-- 添加了 13 个 processor 测试
+- 添加了 16 个 processor 测试
 - 覆盖所有事件类型分发逻辑
+- 包含重试延迟计算测试
+
+### 6. ✅ 服务边界拆分
+- 拆分为 lilium-spider (arbiter+worker) 和 lilium-event-processor
+- 符合 Python 的多进程微服务架构
+
+### 7. ✅ 移除启动时迁移
+- 数据库迁移由 Python Alembic 管理
+- Rust 启动时不运行迁移
 
 ## 仍存在的差距
 
-### 1. Processor 缺少高级功能
+### 1. Processor 高级功能
 - 没有 LISTEN/NOTIFY（只有轮询）
-- 没有重试和退避
-- 没有事务性批处理
 - 没有用户获取
 - 没有媒体下载
 - 没有房间成员追踪
 
-### 2. 测试覆盖差距
+### 2. 测试覆盖
 | 模块 | Rust | Python |
 |------|------|--------|
 | ingestion | 8 | 13 |
 | control | 11 | 5+ |
 | worker | 1 | N/A (集成) |
-| processor | 13 | 10+ |
-| **总计** | **46** | **30+** |
+| processor | 16 | 10+ |
+| **总计** | **49** | **30+** |

@@ -1,8 +1,9 @@
 use anyhow::Result;
-use sqlx::PgPool;
+use sqlx::postgres::{PgListener, PgPool};
 use tracing::{info, error, warn};
 use chrono::{DateTime, Utc};
 use tokio::time::{interval, Duration};
+use tokio::sync::mpsc;
 
 use lilium_models::ingestion::{WebSocketEvent, EventProcessorOffset};
 
@@ -51,23 +52,55 @@ impl EventProcessor {
             "Loaded initial cursor"
         );
 
+        // Try to use LISTEN/NOTIFY with polling fallback
+        match self.run_with_notify(&mut cursor).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                warn!(error = %e, "LISTEN/NOTIFY failed, falling back to polling only");
+                self.run_with_polling_only(&mut cursor).await
+            }
+        }
+    }
+
+    async fn run_with_notify(&self, cursor: &mut CursorPosition) -> Result<()> {
+        let mut listener = PgListener::connect_with(&self.pool).await?;
+        listener.listen("websocket_event_inserted").await?;
+
+        info!("Subscribed to websocket_event_inserted channel");
+
+        let (notify_tx, mut notify_rx) = mpsc::channel(100);
+
+        // Spawn NOTIFY listener task
+        let pool_clone = self.pool.clone();
+        let notify_task = tokio::spawn(async move {
+            loop {
+                match listener.recv().await {
+                    Ok(notification) => {
+                        let _ = notify_tx.send(()).await;
+                    }
+                    Err(e) => {
+                        error!(error = %e, "NOTIFY listener error");
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Initial poll
+        self.poll_and_process(cursor).await?;
+
+        // Main loop with NOTIFY + polling fallback
         let mut poll_interval = interval(self.polling_interval);
 
         loop {
             tokio::select! {
+                _ = notify_rx.recv() => {
+                    // NOTIFY received, poll immediately
+                    self.poll_and_process(cursor).await?;
+                }
                 _ = poll_interval.tick() => {
-                    match self.poll_new_events(&cursor).await {
-                        Ok(events) => {
-                            if events.is_empty() {
-                                continue;
-                            }
-                            info!(count = events.len(), "Processing batch");
-                            self.process_batch_with_retry(&events, &mut cursor).await?;
-                        }
-                        Err(e) => {
-                            error!(error = %e, "Failed to poll events");
-                        }
-                    }
+                    // Polling fallback
+                    self.poll_and_process(cursor).await?;
                 }
                 _ = tokio::signal::ctrl_c() => {
                     info!("Shutting down event processor");
@@ -76,6 +109,43 @@ impl EventProcessor {
             }
         }
 
+        notify_task.abort();
+        Ok(())
+    }
+
+    async fn run_with_polling_only(&self, cursor: &mut CursorPosition) -> Result<()> {
+        info!("Running with polling only (no LISTEN/NOTIFY)");
+
+        let mut poll_interval = interval(self.polling_interval);
+
+        loop {
+            tokio::select! {
+                _ = poll_interval.tick() => {
+                    self.poll_and_process(cursor).await?;
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    info!("Shutting down event processor");
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn poll_and_process(&self, cursor: &mut CursorPosition) -> Result<()> {
+        match self.poll_new_events(cursor).await {
+            Ok(events) => {
+                if events.is_empty() {
+                    return Ok(());
+                }
+                info!(count = events.len(), "Processing batch");
+                self.process_batch_with_retry(&events, cursor).await?;
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to poll events");
+            }
+        }
         Ok(())
     }
 
@@ -163,7 +233,6 @@ impl EventProcessor {
                             error = %e,
                             "Max retries exceeded, skipping batch"
                         );
-                        // Skip entire batch but advance cursor
                         self.skip_batch(events, cursor).await?;
                         return Ok(());
                     }
@@ -183,10 +252,10 @@ impl EventProcessor {
     }
 
     fn calculate_retry_delay(&self, attempt: u32) -> Duration {
-        let base_delay = self.initial_retry_delay.as_secs_f64();
-        let delay = base_delay * self.retry_backoff_factor.powi(attempt as i32 - 1);
+        let base_delay: f64 = self.initial_retry_delay.as_secs_f64();
+        let backoff_factor: f64 = self.retry_backoff_factor;
+        let delay = base_delay * backoff_factor.powi(attempt as i32 - 1);
         let capped_delay = delay.min(self.max_retry_delay.as_secs_f64());
-        // Add jitter (0.5x to 1.5x)
         let jitter = 0.5 + rand::random::<f64>();
         Duration::from_secs_f64(capped_delay * jitter)
     }
@@ -210,14 +279,12 @@ impl EventProcessor {
                     last_timestamp = Some(event.timestamp);
                 }
                 Err(e) => {
-                    // Rollback transaction on any error
                     tx.rollback().await?;
                     return Err(e);
                 }
             }
         }
 
-        // Update cursor within the same transaction
         sqlx::query(
             r#"INSERT INTO event_processor_offsets (processor_id, last_processed_id, last_processed_timestamp, updated_at)
                VALUES ($1, $2, $3, NOW())
@@ -232,10 +299,8 @@ impl EventProcessor {
         .execute(&mut *tx)
         .await?;
 
-        // Commit transaction
         tx.commit().await?;
 
-        // Update in-memory cursor
         cursor.last_processed_id = last_id;
         cursor.last_processed_timestamp = last_timestamp;
 
@@ -303,7 +368,6 @@ impl EventProcessor {
                                 .execute(&mut **tx)
                                 .await?;
                         } else if let Some(text) = content.get("text").and_then(|v| v.as_str()) {
-                            // Content update - preserve history
                             sqlx::query(
                                 r#"UPDATE messages SET
                                    content_text = $1,
@@ -372,27 +436,22 @@ mod tests {
 
     #[test]
     fn test_retry_delay_calculation() {
-        // Test retry delay calculation without needing a database connection
         let initial_delay: f64 = 1.0;
         let max_delay: f64 = 60.0;
         let backoff_factor: f64 = 2.0;
 
-        // Calculate delay for attempt 1
         let delay1 = initial_delay * backoff_factor.powi(0);
-        assert!(delay1 >= 0.5 && delay1 <= 1.5, "delay1 should be around 1s");
+        assert!(delay1 >= 0.5 && delay1 <= 1.5);
 
-        // Calculate delay for attempt 2
         let delay2 = initial_delay * backoff_factor.powi(1);
-        assert!(delay2 >= 1.0 && delay2 <= 3.0, "delay2 should be around 2s");
+        assert!(delay2 >= 1.0 && delay2 <= 3.0);
 
-        // Calculate delay for attempt 3
         let delay3 = initial_delay * backoff_factor.powi(2);
-        assert!(delay3 >= 2.0 && delay3 <= 6.0, "delay3 should be around 4s");
+        assert!(delay3 >= 2.0 && delay3 <= 6.0);
 
-        // Test max delay cap
         let delay_large = initial_delay * backoff_factor.powi(10);
         let capped = delay_large.min(max_delay);
-        assert!(capped <= max_delay, "delay should be capped at max_delay");
+        assert!(capped <= max_delay);
     }
 
     #[test]
