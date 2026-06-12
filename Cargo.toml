@@ -5,6 +5,7 @@ members = [
     "crates/lilium-database",
     "crates/lilium-core",
     "binaries/lilium-spider",
+    "binaries/lilium-event-processor",
 ]
 resolver = "2"
 
@@ -61,3 +62,6 @@ rust_decimal = { version = "1", features = ["serde-with-str"] }
 
 # 字符串枚举
 strum = { version = "0.26", features = ["derive"] }
+
+# 随机数
+rand = "0.8"

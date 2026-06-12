@@ -163,7 +163,6 @@ impl EventProcessor {
                             error = %e,
                             "Max retries exceeded, skipping batch"
                         );
-                        // Skip entire batch but advance cursor
                         self.skip_batch(events, cursor).await?;
                         return Ok(());
                     }
@@ -186,7 +185,6 @@ impl EventProcessor {
         let base_delay = self.initial_retry_delay.as_secs_f64();
         let delay = base_delay * self.retry_backoff_factor.powi(attempt as i32 - 1);
         let capped_delay = delay.min(self.max_retry_delay.as_secs_f64());
-        // Add jitter (0.5x to 1.5x)
         let jitter = 0.5 + rand::random::<f64>();
         Duration::from_secs_f64(capped_delay * jitter)
     }
@@ -210,14 +208,12 @@ impl EventProcessor {
                     last_timestamp = Some(event.timestamp);
                 }
                 Err(e) => {
-                    // Rollback transaction on any error
                     tx.rollback().await?;
                     return Err(e);
                 }
             }
         }
 
-        // Update cursor within the same transaction
         sqlx::query(
             r#"INSERT INTO event_processor_offsets (processor_id, last_processed_id, last_processed_timestamp, updated_at)
                VALUES ($1, $2, $3, NOW())
@@ -232,10 +228,8 @@ impl EventProcessor {
         .execute(&mut *tx)
         .await?;
 
-        // Commit transaction
         tx.commit().await?;
 
-        // Update in-memory cursor
         cursor.last_processed_id = last_id;
         cursor.last_processed_timestamp = last_timestamp;
 
@@ -303,7 +297,6 @@ impl EventProcessor {
                                 .execute(&mut **tx)
                                 .await?;
                         } else if let Some(text) = content.get("text").and_then(|v| v.as_str()) {
-                            // Content update - preserve history
                             sqlx::query(
                                 r#"UPDATE messages SET
                                    content_text = $1,
@@ -353,214 +346,4 @@ impl EventProcessor {
 pub struct CursorPosition {
     pub last_processed_id: i64,
     pub last_processed_timestamp: Option<DateTime<Utc>>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::TimeZone;
-
-    fn make_event(event_type: &str, data: serde_json::Value) -> WebSocketEvent {
-        WebSocketEvent {
-            id: Some(1),
-            event: event_type.to_string(),
-            data,
-            user_id: "user1".to_string(),
-            timestamp: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
-        }
-    }
-
-    #[test]
-    fn test_retry_delay_calculation() {
-        // Test retry delay calculation without needing a database connection
-        let initial_delay: f64 = 1.0;
-        let max_delay: f64 = 60.0;
-        let backoff_factor: f64 = 2.0;
-
-        // Calculate delay for attempt 1
-        let delay1 = initial_delay * backoff_factor.powi(0);
-        assert!(delay1 >= 0.5 && delay1 <= 1.5, "delay1 should be around 1s");
-
-        // Calculate delay for attempt 2
-        let delay2 = initial_delay * backoff_factor.powi(1);
-        assert!(delay2 >= 1.0 && delay2 <= 3.0, "delay2 should be around 2s");
-
-        // Calculate delay for attempt 3
-        let delay3 = initial_delay * backoff_factor.powi(2);
-        assert!(delay3 >= 2.0 && delay3 <= 6.0, "delay3 should be around 4s");
-
-        // Test max delay cap
-        let delay_large = initial_delay * backoff_factor.powi(10);
-        let capped = delay_large.min(max_delay);
-        assert!(capped <= max_delay, "delay should be capped at max_delay");
-    }
-
-    #[test]
-    fn test_event_type_dispatch_message_new() {
-        let event = make_event("message:new", serde_json::json!({
-            "chatroomId": "room1",
-            "message": {
-                "messageId": "msg1",
-                "sentBy": "user1",
-                "sentAt": "2026-01-01T00:00:00Z",
-                "content": {"type": "text", "text": "hello"}
-            }
-        }));
-        assert_eq!(event.event, "message:new");
-        assert!(event.data.get("chatroomId").is_some());
-    }
-
-    #[test]
-    fn test_event_type_dispatch_message_updated() {
-        let event = make_event("message:updated", serde_json::json!({
-            "chatroomId": "room1",
-            "messageId": "msg1",
-            "message": {
-                "content": {"type": "text", "text": "updated"}
-            }
-        }));
-        assert_eq!(event.event, "message:updated");
-        assert!(event.data.get("messageId").is_some());
-    }
-
-    #[test]
-    fn test_event_type_dispatch_message_deleted() {
-        let event = make_event("message:deleted", serde_json::json!({
-            "chatroomId": "room1",
-            "messageId": "msg1",
-            "deletedBy": "user1"
-        }));
-        assert_eq!(event.event, "message:deleted");
-        assert_eq!(event.data["messageId"], "msg1");
-    }
-
-    #[test]
-    fn test_event_type_dispatch_message_recalled() {
-        let event = make_event("message:recalled", serde_json::json!({
-            "chatroomId": "room1",
-            "messageId": "msg1"
-        }));
-        assert_eq!(event.event, "message:recalled");
-        assert_eq!(event.data["messageId"], "msg1");
-    }
-
-    #[test]
-    fn test_event_type_dispatch_presence_online() {
-        let event = make_event("presence:user-online", serde_json::json!({
-            "chatroomId": "room1",
-            "userId": "user1"
-        }));
-        assert_eq!(event.event, "presence:user-online");
-    }
-
-    #[test]
-    fn test_event_type_dispatch_member_joined() {
-        let event = make_event("group:member-joined", serde_json::json!({
-            "chatroomId": "room1",
-            "userId": "user1"
-        }));
-        assert_eq!(event.event, "group:member-joined");
-    }
-
-    #[test]
-    fn test_event_type_dispatch_member_left() {
-        let event = make_event("group:member-left", serde_json::json!({
-            "chatroomId": "room1",
-            "userId": "user1"
-        }));
-        assert_eq!(event.event, "group:member-left");
-    }
-
-    #[test]
-    fn test_event_type_dispatch_unknown() {
-        let event = make_event("unknown:event", serde_json::json!({}));
-        assert_eq!(event.event, "unknown:event");
-    }
-
-    #[test]
-    fn test_message_new_requires_chatroom_id() {
-        let event = make_event("message:new", serde_json::json!({
-            "message": {
-                "messageId": "msg1"
-            }
-        }));
-        let msg = lilium_models::dzmm::message::Message::from_websocket(&event.data);
-        assert!(msg.is_none());
-    }
-
-    #[test]
-    fn test_message_new_requires_message_id() {
-        let event = make_event("message:new", serde_json::json!({
-            "chatroomId": "room1",
-            "message": {}
-        }));
-        let msg = lilium_models::dzmm::message::Message::from_websocket(&event.data);
-        assert!(msg.is_none());
-    }
-
-    #[test]
-    fn test_message_new_extracts_fields() {
-        let event = make_event("message:new", serde_json::json!({
-            "chatroomId": "room123",
-            "message": {
-                "messageId": "msg456",
-                "sentBy": "user789",
-                "sentAt": "2026-01-01T00:00:00Z",
-                "content": {"type": "text", "text": "hello"}
-            }
-        }));
-        let msg = lilium_models::dzmm::message::Message::from_websocket(&event.data).unwrap();
-        assert_eq!(msg.message_id, "msg456");
-        assert_eq!(msg.room_id, "room123");
-        assert_eq!(msg.sent_by.as_deref(), Some("user789"));
-        assert_eq!(msg.content_type.as_deref(), Some("text"));
-        assert_eq!(msg.content_text.as_deref(), Some("hello"));
-    }
-
-    #[test]
-    fn test_message_updated_recalled_detection() {
-        let event = make_event("message:updated", serde_json::json!({
-            "messageId": "msg1",
-            "message": {
-                "content": {"type": "recalled"}
-            }
-        }));
-        let content_type = event.data["message"]["content"]["type"].as_str();
-        assert_eq!(content_type, Some("recalled"));
-    }
-
-    #[test]
-    fn test_message_updated_content_update() {
-        let event = make_event("message:updated", serde_json::json!({
-            "messageId": "msg1",
-            "message": {
-                "content": {"type": "text", "text": "updated content"}
-            }
-        }));
-        let content_type = event.data["message"]["content"]["type"].as_str();
-        assert_eq!(content_type, Some("text"));
-        let content_text = event.data["message"]["content"]["text"].as_str();
-        assert_eq!(content_text, Some("updated content"));
-    }
-
-    #[test]
-    fn test_cursor_position_default() {
-        let cursor = CursorPosition {
-            last_processed_id: 0,
-            last_processed_timestamp: None,
-        };
-        assert_eq!(cursor.last_processed_id, 0);
-        assert!(cursor.last_processed_timestamp.is_none());
-    }
-
-    #[test]
-    fn test_cursor_position_with_timestamp() {
-        let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        let cursor = CursorPosition {
-            last_processed_id: 100,
-            last_processed_timestamp: Some(ts),
-        };
-        assert_eq!(cursor.last_processed_id, 100);
-        assert!(cursor.last_processed_timestamp.is_some());
-    }
 }

@@ -964,6 +964,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "lilium-event-processor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "lilium-common",
+ "lilium-database",
+ "lilium-models",
+ "rand",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "lilium-models"
 version = "0.1.0"
 dependencies = [
@@ -987,6 +1007,7 @@ dependencies = [
  "lilium-core",
  "lilium-database",
  "lilium-models",
+ "rand",
  "serde",
  "serde_json",
  "sqlx",
