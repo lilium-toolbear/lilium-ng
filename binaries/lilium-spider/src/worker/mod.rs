@@ -2,10 +2,8 @@ use anyhow::Result;
 use sqlx::PgPool;
 use tracing::{info, error};
 use std::sync::Arc;
-use tokio::sync::mpsc;
 
 use crate::ingestion::{EventIngestor, EventWriter, DiskSpillBuffer};
-use lilium_models::ingestion::EventEnvelope;
 
 pub struct Worker {
     account_id: String,
@@ -34,7 +32,7 @@ impl Worker {
         let spill = DiskSpillBuffer::new(buffer_path);
 
         // Create event ingestor
-        let (ingestor, rx) = EventIngestor::new(
+        let (ingestor, _rx) = EventIngestor::new(
             self.account_id.clone(),
             self.queue_size,
             spill,
@@ -45,18 +43,16 @@ impl Worker {
         let writer = EventWriter::new(ingestor.clone(), self.batch_size);
 
         // Spawn writer task
-        let writer_pool = self.pool.clone();
         let writer_account = self.account_id.clone();
         let writer_task = tokio::spawn(async move {
-            Self::run_writer(writer, writer_pool, writer_account).await;
+            Self::run_writer(writer, writer_account).await;
         });
 
-        // Connect to WebSocket and process events
+        // Connect to WebSocket and enqueue events (NOT process them)
         let ws_account = self.account_id.clone();
-        let ws_pool = self.pool.clone();
         let ws_ingestor = ingestor.clone();
         let ws_task = tokio::spawn(async move {
-            Self::run_websocket(ws_account, ws_pool, ws_ingestor, rx).await;
+            Self::run_websocket(ws_account, ws_ingestor).await;
         });
 
         // Wait for either task to complete
@@ -75,7 +71,6 @@ impl Worker {
 
     async fn run_writer(
         writer: EventWriter,
-        _pool: PgPool,
         account_id: String,
     ) {
         info!(account = %account_id, "Event writer starting");
@@ -98,9 +93,7 @@ impl Worker {
 
     async fn run_websocket(
         account_id: String,
-        pool: PgPool,
-        _ingestor: Arc<EventIngestor>,
-        mut rx: mpsc::Receiver<EventEnvelope>,
+        ingestor: Arc<EventIngestor>,
     ) {
         info!(account = %account_id, "WebSocket connection starting");
 
@@ -108,76 +101,12 @@ impl Worker {
         // 1. Load account credentials from database
         // 2. Connect to DZMM.ai WebSocket
         // 3. Handle Socket.IO protocol
-        // 4. Process incoming events
+        // 4. Receive events and enqueue them via ingestor.accept_event()
 
-        // For now, simulate processing events from the queue
-        while let Some(event) = rx.recv().await {
-            info!(
-                account = %account_id,
-                event_type = %event.event_type,
-                "Processing event"
-            );
+        // For now, simulate receiving events
+        // In production, this would be a real WebSocket connection
+        // that calls ingestor.accept_event() for each received event
 
-            // Process event based on type
-            match event.event_type.as_str() {
-                "message:new" => {
-                    if let Err(e) = Self::process_message_new(&pool, &event).await {
-                        error!(account = %account_id, error = %e, "Failed to process message:new");
-                    }
-                }
-                "message:updated" => {
-                    if let Err(e) = Self::process_message_updated(&pool, &event).await {
-                        error!(account = %account_id, error = %e, "Failed to process message:updated");
-                    }
-                }
-                "message:deleted" => {
-                    if let Err(e) = Self::process_message_deleted(&pool, &event).await {
-                        error!(account = %account_id, error = %e, "Failed to process message:deleted");
-                    }
-                }
-                "message:recalled" => {
-                    if let Err(e) = Self::process_message_recalled(&pool, &event).await {
-                        error!(account = %account_id, error = %e, "Failed to process message:recalled");
-                    }
-                }
-                _ => {
-                    // Unknown event type, skip
-                }
-            }
-        }
-    }
-
-    async fn process_message_new(pool: &PgPool, event: &EventEnvelope) -> Result<()> {
-        let message = lilium_models::dzmm::message::Message::from_websocket(&event.payload);
-        if let Some(msg) = message {
-            lilium_database::queries::messages::create_message_if_missing(pool, &msg).await?;
-        }
-        Ok(())
-    }
-
-    async fn process_message_updated(pool: &PgPool, event: &EventEnvelope) -> Result<()> {
-        if let Some(message_id) = event.payload.get("messageId").and_then(|v| v.as_str()) {
-            // Check if this is a recall
-            if let Some(content) = event.payload.get("message").and_then(|m| m.get("content")) {
-                if content.get("type").and_then(|v| v.as_str()) == Some("recalled") {
-                    lilium_database::queries::messages::mark_recalled(pool, message_id).await?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn process_message_deleted(pool: &PgPool, event: &EventEnvelope) -> Result<()> {
-        if let Some(message_id) = event.payload.get("messageId").and_then(|v| v.as_str()) {
-            lilium_database::queries::messages::mark_deleted(pool, message_id).await?;
-        }
-        Ok(())
-    }
-
-    async fn process_message_recalled(pool: &PgPool, event: &EventEnvelope) -> Result<()> {
-        if let Some(message_id) = event.payload.get("messageId").and_then(|v| v.as_str()) {
-            lilium_database::queries::messages::mark_recalled(pool, message_id).await?;
-        }
-        Ok(())
+        info!(account = %account_id, "WebSocket connection established (simulated)");
     }
 }
