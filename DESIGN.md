@@ -1,4 +1,4 @@
-# DZMM Rust 重写设计文档
+# Lilium 设计文档
 
 ## [S1] 问题
 
@@ -61,17 +61,17 @@ Presentation (cli/, archive_ui/, toolbear_ui/, bots/, telegram_bot.py)
 ### 5.1 Crate 依赖关系
 
 ```
-dzmm-common (工具、错误类型、常量)
+lilium-common (工具、错误类型、常量)
     ↓
-dzmm-models (数据模型、枚举、schema)
+lilium-models (数据模型、枚举、schema)
     ↓
-dzmm-database (连接池、迁移、通知)
+lilium-database (连接池、迁移、通知)
     ↓
-dzmm-api-client (HTTP/WebSocket 客户端)
+lilium-api-client (HTTP/WebSocket 客户端)
     ↓
-dzmm-core (纯业务逻辑、计算公式)
+lilium-core (纯业务逻辑、计算公式)
     ↓
-dzmm-services (服务编排、业务流程)
+lilium-services (服务编排、业务流程)
     ↓
 binaries (spider, bot, web, cli)
 ```
@@ -79,17 +79,17 @@ binaries (spider, bot, web, cli)
 ### 5.2 目录结构
 
 ```
-dzmm-rust/
+lilium/
 ├── Cargo.toml              # Workspace 配置
 ├── crates/
-│   ├── dzmm-common/
+│   ├── lilium-common/
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs
 │   │       ├── error.rs    # 统一错误类型
 │   │       ├── constants.rs
 │   │       └── utils.rs
-│   ├── dzmm-models/
+│   ├── lilium-models/
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs
@@ -103,7 +103,7 @@ dzmm-rust/
 │   │       ├── futures.rs
 │   │       ├── game.rs
 │   │       └── ingestion.rs
-│   ├── dzmm-database/
+│   ├── lilium-database/
 │   │   ├── Cargo.toml
 │   │   ├── migrations/
 │   │   └── src/
@@ -111,7 +111,7 @@ dzmm-rust/
 │   │       ├── pool.rs
 │   │       ├── notifications.rs
 │   │       └── queries/
-│   ├── dzmm-api-client/
+│   ├── lilium-api-client/
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs
@@ -120,7 +120,7 @@ dzmm-rust/
 │   │       ├── websocket.rs
 │   │       ├── rate_limiter.rs
 │   │       └── anti_detection.rs
-│   ├── dzmm-core/
+│   ├── lilium-core/
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs
@@ -144,7 +144,7 @@ dzmm-rust/
 │   │           ├── types.rs
 │   │           ├── mapgen.rs
 │   │           └── dice.rs
-│   └── dzmm-services/
+│   └── lilium-services/
 │       ├── Cargo.toml
 │       └── src/
 │           ├── lib.rs
@@ -163,7 +163,7 @@ dzmm-rust/
 │               ├── turnip_tick.rs
 │               └── futures_tick.rs
 ├── binaries/
-│   ├── dzmm-spider/
+│   ├── lilium-spider/
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── main.rs
@@ -171,17 +171,17 @@ dzmm-rust/
 │   │       ├── worker/
 │   │       ├── processor/
 │   │       └── control/
-│   ├── dzmm-bot/
+│   ├── lilium-bot/
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       └── main.rs
-│   ├── dzmm-web/
+│   ├── lilium-web/
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── main.rs
 │   │       ├── api/
 │   │       └── graphql/
-│   └── dzmm-cli/
+│   └── lilium-cli/
 │       ├── Cargo.toml
 │       └── src/
 │           └── main.rs
@@ -192,7 +192,7 @@ dzmm-rust/
 
 ## [S6] 各 Crate 详细设计
 
-### 6.1 dzmm-common
+### 6.1 lilium-common
 
 ```rust
 // 错误类型
@@ -218,7 +218,7 @@ pub fn utc_now() -> DateTime<Utc> { ... }
 pub fn quantize_decimal(d: Decimal, scale: Decimal) -> Decimal { ... }
 ```
 
-### 6.2 dzmm-models
+### 6.2 lilium-models
 
 按领域组织，每个领域一个模块：
 
@@ -293,7 +293,7 @@ pub mod ingestion {
 }
 ```
 
-### 6.3 dzmm-database
+### 6.3 lilium-database
 
 ```rust
 pub struct DbPool {
@@ -341,7 +341,7 @@ pub mod queries {
 }
 ```
 
-### 6.4 dzmm-api-client
+### 6.4 lilium-api-client
 
 ```rust
 pub struct DzmmClient {
@@ -387,7 +387,7 @@ impl WsConnection {
 }
 ```
 
-### 6.5 dzmm-core
+### 6.5 lilium-core
 
 纯函数，无 async，无 DB：
 
@@ -466,7 +466,7 @@ pub mod raid {
 }
 ```
 
-### 6.6 dzmm-services
+### 6.6 lilium-services
 
 ```rust
 // 服务 trait 定义
@@ -530,7 +530,7 @@ pub mod tick {
 
 ## [S7] Binaries 设计
 
-### 7.1 dzmm-spider
+### 7.1 lilium-spider
 
 ```rust
 #[tokio::main]
@@ -544,7 +544,7 @@ async fn main() -> Result<()> {
 }
 ```
 
-### 7.2 dzmm-bot
+### 7.2 lilium-bot
 
 ```rust
 #[tokio::main]
@@ -558,7 +558,7 @@ async fn main() -> Result<()> {
 }
 ```
 
-### 7.3 dzmm-web
+### 7.3 lilium-web
 
 ```rust
 #[tokio::main]
@@ -657,16 +657,16 @@ socket_path = "runtime/spider/control.sock"
 ```toml
 [workspace]
 members = [
-    "crates/dzmm-common",
-    "crates/dzmm-models",
-    "crates/dzmm-database",
-    "crates/dzmm-api-client",
-    "crates/dzmm-core",
-    "crates/dzmm-services",
-    "binaries/dzmm-spider",
-    "binaries/dzmm-bot",
-    "binaries/dzmm-web",
-    "binaries/dzmm-cli",
+    "crates/lilium-common",
+    "crates/lilium-models",
+    "crates/lilium-database",
+    "crates/lilium-api-client",
+    "crates/lilium-core",
+    "crates/lilium-services",
+    "binaries/lilium-spider",
+    "binaries/lilium-bot",
+    "binaries/lilium-web",
+    "binaries/lilium-cli",
 ]
 resolver = "2"
 

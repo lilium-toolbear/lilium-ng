@@ -1,6 +1,6 @@
-# DZMM Rust
+# Lilium
 
-DZMM.ai 系统的 Rust 重写版本。
+DZMM.ai 监控和归档系统的 Rust 重写版本。
 
 ## 目标
 
@@ -16,18 +16,18 @@ DZMM.ai 系统的 Rust 重写版本。
 
 ```
 crates/
-├── dzmm-common/       # 共享工具、错误类型、常量
-├── dzmm-models/       # 数据模型
-├── dzmm-database/     # 数据库层
-├── dzmm-api-client/   # API 客户端
-├── dzmm-core/         # 纯业务逻辑
-└── dzmm-services/     # 服务层
+├── lilium-common/       # 共享工具、错误类型、常量
+├── lilium-models/       # 数据模型
+├── lilium-database/     # 数据库层
+├── lilium-api-client/   # API 客户端
+├── lilium-core/         # 纯业务逻辑
+└── lilium-services/     # 服务层
 
 binaries/
-├── dzmm-spider/       # WebSocket 摄入服务
-├── dzmm-bot/          # 聊天机器人
-├── dzmm-web/          # Web UI 后端
-└── dzmm-cli/          # 命令行工具
+├── lilium-spider/       # WebSocket 摄入服务
+├── lilium-bot/          # 聊天机器人
+├── lilium-web/          # Web UI 后端
+└── lilium-cli/          # 命令行工具
 ```
 
 ## 技术栈
@@ -54,10 +54,10 @@ cargo build
 cargo test
 
 # 运行 spider
-cargo run --bin dzmm-spider
+cargo run --bin lilium-spider
 
 # 运行 bot
-cargo run --bin dzmm-bot
+cargo run --bin lilium-bot
 ```
 
 ## 文档
