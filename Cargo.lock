@@ -973,6 +973,7 @@ dependencies = [
  "lilium-common",
  "lilium-database",
  "lilium-models",
+ "lilium-services",
  "rand",
  "serde",
  "serde_json",
@@ -997,6 +998,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "lilium-services"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "lilium-common",
+ "lilium-database",
+ "lilium-models",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "lilium-spider"
 version = "0.1.0"
 dependencies = [
@@ -1007,6 +1025,7 @@ dependencies = [
  "lilium-core",
  "lilium-database",
  "lilium-models",
+ "lilium-services",
  "rand",
  "serde",
  "serde_json",
