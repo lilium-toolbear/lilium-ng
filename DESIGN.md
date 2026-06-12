@@ -1,4 +1,4 @@
-# Lilium 设计文档
+# Lilium NG 设计文档
 
 ## [S1] 问题
 
@@ -79,7 +79,7 @@ binaries (spider, bot, web, cli)
 ### 5.2 目录结构
 
 ```
-lilium/
+lilium-ng/
 ├── Cargo.toml              # Workspace 配置
 ├── crates/
 │   ├── lilium-common/

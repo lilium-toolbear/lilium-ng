@@ -1,4 +1,4 @@
-# Lilium
+# Lilium NG
 
 DZMM.ai 监控和归档系统的 Rust 重写版本。
 
