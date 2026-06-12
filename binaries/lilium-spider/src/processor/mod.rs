@@ -1,15 +1,17 @@
 use anyhow::Result;
-use sqlx::postgres::{PgListener, PgPool};
+use sqlx::PgPool;
 use tracing::{info, error, warn};
 use chrono::{DateTime, Utc};
 use tokio::time::{interval, Duration};
-use tokio::sync::mpsc;
 
-use lilium_models::ingestion::{WebSocketEvent, EventProcessorOffset};
+use lilium_models::ingestion::WebSocketEvent;
+use lilium_services::message::MessageService;
+use lilium_services::event::EventService;
 
 pub struct EventProcessor {
     processor_id: String,
-    pool: PgPool,
+    message_service: MessageService,
+    event_service: EventService,
     batch_size: usize,
     polling_interval: Duration,
     max_retries: u32,
@@ -27,7 +29,8 @@ impl EventProcessor {
     ) -> Self {
         Self {
             processor_id,
-            pool,
+            message_service: MessageService::new(pool.clone()),
+            event_service: EventService::new(pool),
             batch_size,
             polling_interval: Duration::from_secs(polling_interval_secs),
             max_retries: 3,
@@ -45,83 +48,30 @@ impl EventProcessor {
             "Event processor starting"
         );
 
-        let mut cursor = self.load_cursor().await?;
+        let (mut last_id, mut last_timestamp) = self.event_service.load_cursor(&self.processor_id).await?;
         info!(
             processor_id = %self.processor_id,
-            cursor_id = cursor.last_processed_id,
+            cursor_id = last_id,
             "Loaded initial cursor"
         );
 
-        // Try to use LISTEN/NOTIFY with polling fallback
-        match self.run_with_notify(&mut cursor).await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                warn!(error = %e, "LISTEN/NOTIFY failed, falling back to polling only");
-                self.run_with_polling_only(&mut cursor).await
-            }
-        }
-    }
-
-    async fn run_with_notify(&self, cursor: &mut CursorPosition) -> Result<()> {
-        let mut listener = PgListener::connect_with(&self.pool).await?;
-        listener.listen("websocket_event_inserted").await?;
-
-        info!("Subscribed to websocket_event_inserted channel");
-
-        let (notify_tx, mut notify_rx) = mpsc::channel(100);
-
-        // Spawn NOTIFY listener task
-        let pool_clone = self.pool.clone();
-        let notify_task = tokio::spawn(async move {
-            loop {
-                match listener.recv().await {
-                    Ok(notification) => {
-                        let _ = notify_tx.send(()).await;
-                    }
-                    Err(e) => {
-                        error!(error = %e, "NOTIFY listener error");
-                        break;
-                    }
-                }
-            }
-        });
-
-        // Initial poll
-        self.poll_and_process(cursor).await?;
-
-        // Main loop with NOTIFY + polling fallback
-        let mut poll_interval = interval(self.polling_interval);
-
-        loop {
-            tokio::select! {
-                _ = notify_rx.recv() => {
-                    // NOTIFY received, poll immediately
-                    self.poll_and_process(cursor).await?;
-                }
-                _ = poll_interval.tick() => {
-                    // Polling fallback
-                    self.poll_and_process(cursor).await?;
-                }
-                _ = tokio::signal::ctrl_c() => {
-                    info!("Shutting down event processor");
-                    break;
-                }
-            }
-        }
-
-        notify_task.abort();
-        Ok(())
-    }
-
-    async fn run_with_polling_only(&self, cursor: &mut CursorPosition) -> Result<()> {
-        info!("Running with polling only (no LISTEN/NOTIFY)");
-
         let mut poll_interval = interval(self.polling_interval);
 
         loop {
             tokio::select! {
                 _ = poll_interval.tick() => {
-                    self.poll_and_process(cursor).await?;
+                    match self.event_service.poll_events(last_timestamp, last_id, self.batch_size as i64).await {
+                        Ok(events) => {
+                            if events.is_empty() {
+                                continue;
+                            }
+                            info!(count = events.len(), "Processing batch");
+                            self.process_batch_with_retry(&events, &mut last_id, &mut last_timestamp).await?;
+                        }
+                        Err(e) => {
+                            error!(error = %e, "Failed to poll events");
+                        }
+                    }
                 }
                 _ = tokio::signal::ctrl_c() => {
                     info!("Shutting down event processor");
@@ -131,99 +81,17 @@ impl EventProcessor {
         }
 
         Ok(())
-    }
-
-    async fn poll_and_process(&self, cursor: &mut CursorPosition) -> Result<()> {
-        match self.poll_new_events(cursor).await {
-            Ok(events) => {
-                if events.is_empty() {
-                    return Ok(());
-                }
-                info!(count = events.len(), "Processing batch");
-                self.process_batch_with_retry(&events, cursor).await?;
-            }
-            Err(e) => {
-                error!(error = %e, "Failed to poll events");
-            }
-        }
-        Ok(())
-    }
-
-    async fn load_cursor(&self) -> Result<CursorPosition> {
-        let offset = sqlx::query_as::<_, EventProcessorOffset>(
-            "SELECT * FROM event_processor_offsets WHERE processor_id = $1"
-        )
-        .bind(&self.processor_id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(match offset {
-            Some(o) => CursorPosition {
-                last_processed_id: o.last_processed_id,
-                last_processed_timestamp: o.last_processed_timestamp,
-            },
-            None => CursorPosition {
-                last_processed_id: 0,
-                last_processed_timestamp: None,
-            },
-        })
-    }
-
-    async fn save_cursor(&self, cursor: &CursorPosition) -> Result<()> {
-        sqlx::query(
-            r#"INSERT INTO event_processor_offsets (processor_id, last_processed_id, last_processed_timestamp, updated_at)
-               VALUES ($1, $2, $3, NOW())
-               ON CONFLICT (processor_id) DO UPDATE SET
-                   last_processed_id = $2,
-                   last_processed_timestamp = $3,
-                   updated_at = NOW()"#,
-        )
-        .bind(&self.processor_id)
-        .bind(cursor.last_processed_id)
-        .bind(cursor.last_processed_timestamp)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    async fn poll_new_events(&self, cursor: &CursorPosition) -> Result<Vec<WebSocketEvent>> {
-        let events = if let Some(ts) = cursor.last_processed_timestamp {
-            sqlx::query_as::<_, WebSocketEvent>(
-                r#"SELECT id, event, data, user_id, timestamp
-                   FROM websocket_events
-                   WHERE (timestamp > $1) OR (timestamp = $1 AND id > $2)
-                   ORDER BY timestamp ASC, id ASC
-                   LIMIT $3"#,
-            )
-            .bind(ts)
-            .bind(cursor.last_processed_id)
-            .bind(self.batch_size as i64)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query_as::<_, WebSocketEvent>(
-                r#"SELECT id, event, data, user_id, timestamp
-                   FROM websocket_events
-                   WHERE id > $1
-                   ORDER BY id ASC
-                   LIMIT $2"#,
-            )
-            .bind(cursor.last_processed_id)
-            .bind(self.batch_size as i64)
-            .fetch_all(&self.pool)
-            .await?
-        };
-        Ok(events)
     }
 
     async fn process_batch_with_retry(
         &self,
         events: &[WebSocketEvent],
-        cursor: &mut CursorPosition,
+        last_id: &mut i64,
+        last_timestamp: &mut Option<DateTime<Utc>>,
     ) -> Result<()> {
         let mut attempt = 0;
         loop {
-            match self.process_batch_transactional(events, cursor).await {
+            match self.process_batch(events, last_id, last_timestamp).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     attempt += 1;
@@ -233,7 +101,7 @@ impl EventProcessor {
                             error = %e,
                             "Max retries exceeded, skipping batch"
                         );
-                        self.skip_batch(events, cursor).await?;
+                        self.skip_batch(events, last_id, last_timestamp).await?;
                         return Ok(());
                     }
 
@@ -252,57 +120,33 @@ impl EventProcessor {
     }
 
     fn calculate_retry_delay(&self, attempt: u32) -> Duration {
-        let base_delay: f64 = self.initial_retry_delay.as_secs_f64();
+        let initial_delay: f64 = self.initial_retry_delay.as_secs_f64();
         let backoff_factor: f64 = self.retry_backoff_factor;
-        let delay = base_delay * backoff_factor.powi(attempt as i32 - 1);
+        let delay = initial_delay * backoff_factor.powi(attempt as i32 - 1);
         let capped_delay = delay.min(self.max_retry_delay.as_secs_f64());
         let jitter = 0.5 + rand::random::<f64>();
         Duration::from_secs_f64(capped_delay * jitter)
     }
 
-    async fn process_batch_transactional(
+    async fn process_batch(
         &self,
         events: &[WebSocketEvent],
-        cursor: &mut CursorPosition,
+        last_id: &mut i64,
+        last_timestamp: &mut Option<DateTime<Utc>>,
     ) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-
-        let mut last_id = cursor.last_processed_id;
-        let mut last_timestamp = cursor.last_processed_timestamp;
-
         for event in events {
-            match self.process_event(&mut tx, event).await {
-                Ok(()) => {
-                    if let Some(id) = event.id {
-                        last_id = id;
-                    }
-                    last_timestamp = Some(event.timestamp);
-                }
-                Err(e) => {
-                    tx.rollback().await?;
-                    return Err(e);
-                }
+            self.process_event(event).await?;
+            if let Some(id) = event.id {
+                *last_id = id;
             }
+            *last_timestamp = Some(event.timestamp);
         }
 
-        sqlx::query(
-            r#"INSERT INTO event_processor_offsets (processor_id, last_processed_id, last_processed_timestamp, updated_at)
-               VALUES ($1, $2, $3, NOW())
-               ON CONFLICT (processor_id) DO UPDATE SET
-                   last_processed_id = $2,
-                   last_processed_timestamp = $3,
-                   updated_at = NOW()"#,
-        )
-        .bind(&self.processor_id)
-        .bind(last_id)
-        .bind(last_timestamp)
-        .execute(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-
-        cursor.last_processed_id = last_id;
-        cursor.last_processed_timestamp = last_timestamp;
+        self.event_service.save_cursor(
+            &self.processor_id,
+            *last_id,
+            *last_timestamp,
+        ).await?;
 
         Ok(())
     }
@@ -310,96 +154,45 @@ impl EventProcessor {
     async fn skip_batch(
         &self,
         events: &[WebSocketEvent],
-        cursor: &mut CursorPosition,
+        last_id: &mut i64,
+        last_timestamp: &mut Option<DateTime<Utc>>,
     ) -> Result<()> {
-        let mut last_id = cursor.last_processed_id;
-        let mut last_timestamp = cursor.last_processed_timestamp;
-
         for event in events {
             if let Some(id) = event.id {
-                last_id = id;
+                *last_id = id;
             }
-            last_timestamp = Some(event.timestamp);
+            *last_timestamp = Some(event.timestamp);
         }
 
-        cursor.last_processed_id = last_id;
-        cursor.last_processed_timestamp = last_timestamp;
-        self.save_cursor(cursor).await?;
+        self.event_service.save_cursor(
+            &self.processor_id,
+            *last_id,
+            *last_timestamp,
+        ).await?;
 
         Ok(())
     }
 
-    async fn process_event(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        event: &WebSocketEvent,
-    ) -> Result<()> {
+    async fn process_event(&self, event: &WebSocketEvent) -> Result<()> {
         match event.event.as_str() {
             "message:new" => {
                 if let Some(msg) = lilium_models::dzmm::message::Message::from_websocket(&event.data) {
-                    sqlx::query(
-                        r#"INSERT INTO messages (message_id, room_id, sent_by, content_text, content_type,
-                           sent_at, is_deleted, is_recalled, is_edited, history, raw_data, source)
-                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-                           ON CONFLICT DO NOTHING"#,
-                    )
-                    .bind(&msg.message_id)
-                    .bind(&msg.room_id)
-                    .bind(&msg.sent_by)
-                    .bind(&msg.content_text)
-                    .bind(&msg.content_type)
-                    .bind(msg.sent_at)
-                    .bind(msg.is_deleted)
-                    .bind(msg.is_recalled)
-                    .bind(msg.is_edited)
-                    .bind(&msg.history)
-                    .bind(&msg.raw_data)
-                    .bind(&msg.source)
-                    .execute(&mut **tx)
-                    .await?;
+                    self.message_service.create_message(&msg).await?;
                 }
             }
             "message:updated" => {
                 if let Some(message_id) = event.data.get("messageId").and_then(|v| v.as_str()) {
-                    if let Some(content) = event.data.get("message").and_then(|m| m.get("content")) {
-                        if content.get("type").and_then(|v| v.as_str()) == Some("recalled") {
-                            sqlx::query("UPDATE messages SET is_recalled = true WHERE message_id = $1")
-                                .bind(message_id)
-                                .execute(&mut **tx)
-                                .await?;
-                        } else if let Some(text) = content.get("text").and_then(|v| v.as_str()) {
-                            sqlx::query(
-                                r#"UPDATE messages SET
-                                   content_text = $1,
-                                   is_edited = true,
-                                   history = COALESCE(history, '[]'::jsonb) || jsonb_build_object(
-                                       'content', content_text,
-                                       'edited_at', NOW()
-                                   )
-                                   WHERE message_id = $2"#,
-                            )
-                            .bind(text)
-                            .bind(message_id)
-                            .execute(&mut **tx)
-                            .await?;
-                        }
-                    }
+                    self.message_service.update_message(message_id, &event.data).await?;
                 }
             }
             "message:deleted" => {
                 if let Some(message_id) = event.data.get("messageId").and_then(|v| v.as_str()) {
-                    sqlx::query("UPDATE messages SET is_deleted = true WHERE message_id = $1")
-                        .bind(message_id)
-                        .execute(&mut **tx)
-                        .await?;
+                    self.message_service.mark_deleted(message_id).await?;
                 }
             }
             "message:recalled" => {
                 if let Some(message_id) = event.data.get("messageId").and_then(|v| v.as_str()) {
-                    sqlx::query("UPDATE messages SET is_recalled = true WHERE message_id = $1")
-                        .bind(message_id)
-                        .execute(&mut **tx)
-                        .await?;
+                    self.message_service.mark_recalled(message_id).await?;
                 }
             }
             "presence:user-online" | "group:member-joined" | "group:member-left" => {

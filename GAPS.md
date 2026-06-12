@@ -33,6 +33,11 @@
 - 数据库迁移由 Python Alembic 管理
 - Rust 启动时不运行迁移
 
+### 8. ✅ LISTEN/NOTIFY 支持
+- 实现了 PostgreSQL LISTEN/NOTIFY
+- NOTIFY 作为唤醒信号，轮询获取数据
+- 符合 Python 的 stream_with_polling 模式
+
 ## 仍存在的差距
 
 ### 1. Processor 高级功能

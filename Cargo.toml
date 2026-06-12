@@ -4,6 +4,7 @@ members = [
     "crates/lilium-models",
     "crates/lilium-database",
     "crates/lilium-core",
+    "crates/lilium-services",
     "binaries/lilium-spider",
     "binaries/lilium-event-processor",
 ]
@@ -15,6 +16,7 @@ lilium-common = { path = "crates/lilium-common" }
 lilium-models = { path = "crates/lilium-models" }
 lilium-database = { path = "crates/lilium-database" }
 lilium-core = { path = "crates/lilium-core" }
+lilium-services = { path = "crates/lilium-services" }
 
 # 异步运行时
 tokio = { version = "1", features = ["full"] }
