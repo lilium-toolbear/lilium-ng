@@ -7,6 +7,7 @@ mod arbiter;
 mod worker;
 mod processor;
 mod control;
+mod ingestion;
 
 #[derive(Parser)]
 #[command(name = "lilium-spider")]
