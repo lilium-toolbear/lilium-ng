@@ -73,7 +73,13 @@ impl Arbiter {
 
         tokio::spawn(async move {
             info!(account = %account, "Worker starting");
-            let worker = super::worker::Worker::new(account.clone(), pool);
+            let worker = super::worker::Worker::new(
+                account.clone(),
+                pool.clone(),
+                5000,  // queue_size
+                100,   // batch_size
+                std::path::PathBuf::from("data/event/buffer"),
+            );
             tokio::select! {
                 result = worker.run() => {
                     if let Err(e) = result {

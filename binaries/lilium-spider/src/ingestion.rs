@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -46,14 +46,19 @@ impl SpillRecord {
 
 pub struct DiskSpillBuffer {
     path: PathBuf,
+    _lock: Mutex<()>,
 }
 
 impl DiskSpillBuffer {
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self { path, _lock: Mutex::new(()) }
     }
 
     pub async fn append(&self, event: &EventEnvelope) -> Result<()> {
+        let _guard = self._lock.lock().await;
+        if let Some(parent) = self.path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
         let record = SpillRecord::from(event);
         let mut line = serde_json::to_string(&record)?;
         line.push('\n');
@@ -68,27 +73,29 @@ impl DiskSpillBuffer {
     }
 
     pub async fn read_replay_batch(&self, limit: usize) -> Result<Vec<EventEnvelope>> {
-        if !self.path.exists() {
+        if limit == 0 || !self.path.exists() {
             return Ok(vec![]);
         }
+        let _guard = self._lock.lock().await;
         let file = tokio::fs::File::open(&self.path).await?;
         let reader = BufReader::new(file);
         let mut lines = reader.lines();
         let mut events = Vec::new();
-        let mut checked_legacy = false;
 
         while let Some(line) = lines.next_line().await? {
             if line.trim().is_empty() {
                 continue;
             }
             let record: SpillRecord = serde_json::from_str(&line)?;
-            if !checked_legacy {
-                if record.schema_version != 2 {
-                    return Err(anyhow::anyhow!("LegacySpillBufferError: expected schema_version 2, got {}", record.schema_version));
-                }
-                checked_legacy = true;
+            if record.schema_version != 2 {
+                return Err(anyhow::anyhow!(
+                    "LegacySpillBufferError: expected schema_version 2, got {}",
+                    record.schema_version
+                ));
             }
-            events.push(record.to_event_envelope());
+            let mut env = record.to_event_envelope();
+            env.source = "disk_replay".to_string();
+            events.push(env);
             if events.len() >= limit {
                 break;
             }
@@ -97,9 +104,10 @@ impl DiskSpillBuffer {
     }
 
     pub async fn discard_replay_batch(&self, count: usize) -> Result<()> {
-        if !self.path.exists() || count == 0 {
+        if count == 0 || !self.path.exists() {
             return Ok(());
         }
+        let _guard = self._lock.lock().await;
         let file = tokio::fs::File::open(&self.path).await?;
         let reader = BufReader::new(file);
         let mut lines = reader.lines();
@@ -138,6 +146,7 @@ impl DiskSpillBuffer {
 }
 
 pub struct EventIngestor {
+    #[allow(dead_code)]
     account_user_id: String,
     queue: mpsc::Sender<EventEnvelope>,
     spill: DiskSpillBuffer,
@@ -222,22 +231,58 @@ impl EventWriter {
         }
     }
 
+    pub async fn run(&self, stop_event: &Arc<AtomicBool>) {
+        loop {
+            let inserted = self.drain_once().await.unwrap_or(0);
+            let spill_pending = self.ingestor.spill().has_pending().await;
+
+            if stop_event.load(Ordering::Relaxed)
+                && self.ingestor.queue_depth() == 0
+                && !spill_pending
+            {
+                break;
+            }
+
+            if stop_event.load(Ordering::Relaxed) && inserted == 0 && spill_pending {
+                self.spill_memory_queue().await;
+                break;
+            }
+
+            if inserted == 0 {
+                if stop_event.load(Ordering::Relaxed) && spill_pending {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                } else {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                }
+            }
+        }
+    }
+
     pub async fn drain_once(&self) -> Result<usize> {
         // First try disk spill replay
         if self.ingestor.spill().has_pending().await {
             let events = self.ingestor.spill().read_replay_batch(self.batch_size).await?;
             if !events.is_empty() {
-                let count = events.len();
-                // In real implementation, would batch insert to DB
-                self.ingestor.spill().discard_replay_batch(count).await?;
-                self.inserted_count.fetch_add(count as u64, Ordering::Relaxed);
-                return Ok(count);
+                return self.insert_replay_batch(&events).await;
             }
         }
 
         // Then drain from memory queue
-        // This would need a receiver, but for now return 0
+        // This would need access to the receiver
         Ok(0)
+    }
+
+    async fn insert_replay_batch(&self, events: &[EventEnvelope]) -> Result<usize> {
+        let count = events.len();
+        // In real implementation, would batch insert to DB
+        self.ingestor.spill().discard_replay_batch(count).await?;
+        self.inserted_count.fetch_add(count as u64, Ordering::Relaxed);
+        Ok(count)
+    }
+
+    async fn spill_memory_queue(&self) {
+        // Spill remaining memory queue to disk on shutdown
+        // This would need access to the receiver, which is complex with the current architecture
     }
 
     pub fn inserted_count(&self) -> u64 {
@@ -332,19 +377,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_event_writer_flushes_batch() {
+    async fn test_event_writer_drains_disk_before_memory() {
         let tmp = TempDir::new().unwrap();
         let spill = DiskSpillBuffer::new(tmp.path().join("ws_buffer_user_a.jsonl"));
         let (ingestor, _rx) = EventIngestor::new("user_a".to_string(), 10, spill);
         let ingestor = Arc::new(ingestor);
 
-        for i in 0..3 {
-            ingestor.accept_event(make_event(i)).await;
-        }
+        // Write events to disk
+        ingestor.spill().append(&make_event(1)).await.unwrap();
+        ingestor.spill().append(&make_event(2)).await.unwrap();
 
         let writer = EventWriter::new(ingestor.clone(), 100);
         let count = writer.drain_once().await.unwrap();
-        assert_eq!(count, 0); // No disk spill, so nothing to drain
+        assert_eq!(count, 2); // Should drain disk first
     }
 
     #[tokio::test]
@@ -359,5 +404,27 @@ mod tests {
         let accepted = ingestor.accept_event(make_event(1)).await;
         assert!(!accepted);
         assert_eq!(ingestor.spilled_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_spill_buffer_concurrent_appends() {
+        let tmp = TempDir::new().unwrap();
+        let spill = DiskSpillBuffer::new(tmp.path().join("ws_buffer_user_a.jsonl"));
+        let spill = Arc::new(spill);
+
+        let mut handles = Vec::new();
+        for i in 0..10 {
+            let spill = spill.clone();
+            handles.push(tokio::spawn(async move {
+                spill.append(&make_event(i)).await.unwrap();
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let events = spill.read_replay_batch(100).await.unwrap();
+        assert_eq!(events.len(), 10);
     }
 }
