@@ -67,7 +67,7 @@ impl UserService {
 
     /// Fetch user profile from external API
     /// This is a placeholder - in production, call DZMM tRPC API
-    pub async fn fetch_user_profile(&self, user_id: &str, room_id: &str) -> Result<Option<UserProfile>> {
+    pub async fn fetch_user_profile(&self, user_id: &str, _room_id: &str) -> Result<Option<UserProfile>> {
         // In production, this would call:
         // api.batch_get_user_info([(user_id, room_id)])
         

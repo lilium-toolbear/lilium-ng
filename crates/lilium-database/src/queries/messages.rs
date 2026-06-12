@@ -42,6 +42,24 @@ pub async fn mark_recalled(pool: &PgPool, message_id: &str) -> Result<()> {
     Ok(())
 }
 
+pub async fn get_by_id_at(
+    pool: &PgPool,
+    message_id: &str,
+    sent_at: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<Message>> {
+    sqlx::query_as::<_, Message>(
+        r#"SELECT message_id, room_id, sent_by, content_text, content_type,
+           sent_at, is_deleted, is_recalled, is_edited, history, raw_data, source
+           FROM messages
+           WHERE message_id = $1 AND sent_at = $2"#,
+    )
+    .bind(message_id)
+    .bind(sent_at)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.into())
+}
+
 pub async fn update_content(pool: &PgPool, message_id: &str, text: &str) -> Result<()> {
     sqlx::query(
         r#"UPDATE messages SET

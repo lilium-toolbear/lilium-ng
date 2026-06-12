@@ -36,7 +36,7 @@ sqlx = { version = "0.8", features = [
 tungstenite = { version = "0.21", features = ["native-tls"] }
 
 # HTTP
-reqwest = { version = "0.12", features = ["json", "cookies"] }
+reqwest = { version = "0.12", features = ["json"] }
 
 # 序列化
 serde = { version = "1", features = ["derive"] }

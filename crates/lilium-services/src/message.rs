@@ -1,4 +1,5 @@
 use anyhow::Result;
+use chrono::Utc;
 use lilium_database::queries::messages as msg_queries;
 use lilium_models::dzmm::message::Message;
 use crate::room_member::RoomMemberService;
@@ -62,12 +63,38 @@ impl MessageService {
     }
 
     /// Process a message:updated event
-    pub async fn update_message(&self, pool: &sqlx::PgPool, message_id: &str, payload: &serde_json::Value) -> Result<()> {
+    /// Verifies message existence before updating
+    pub async fn update_message(
+        &self,
+        pool: &sqlx::PgPool,
+        message_id: &str,
+        payload: &serde_json::Value,
+    ) -> Result<()> {
         if let Some(content) = payload.get("message").and_then(|m| m.get("content")) {
             if content.get("type").and_then(|v| v.as_str()) == Some("recalled") {
                 msg_queries::mark_recalled(pool, message_id).await?;
-            } else if let Some(text) = content.get("text").and_then(|v| v.as_str()) {
-                msg_queries::update_content(pool, message_id, text).await?;
+            } else {
+                // Parse sent_at to verify message exists
+                let sent_at = payload
+                    .get("message")
+                    .and_then(|m| m.get("sent_at").or_else(|| m.get("sentAt")))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&Utc));
+
+                if let Some(sent_at) = sent_at {
+                    // Verify message exists
+                    let existing = msg_queries::get_by_id_at(pool, message_id, sent_at).await?;
+                    if existing.is_none() {
+                        // Message not found, skip update
+                        return Ok(());
+                    }
+
+                    // Update content and preserve history
+                    if let Some(text) = content.get("text").and_then(|v| v.as_str()) {
+                        msg_queries::update_content(pool, message_id, text).await?;
+                    }
+                }
             }
         }
         Ok(())
@@ -81,5 +108,15 @@ impl MessageService {
     /// Process a message:recalled event
     pub async fn mark_recalled(&self, pool: &sqlx::PgPool, message_id: &str) -> Result<()> {
         msg_queries::mark_recalled(pool, message_id).await
+    }
+
+    /// Get a message by its composite key to hit a single partition
+    pub async fn get_by_id_at(
+        &self,
+        pool: &sqlx::PgPool,
+        message_id: &str,
+        sent_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<Message>> {
+        msg_queries::get_by_id_at(pool, message_id, sent_at).await
     }
 }
