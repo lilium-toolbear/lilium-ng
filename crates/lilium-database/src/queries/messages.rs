@@ -41,3 +41,21 @@ pub async fn mark_recalled(pool: &PgPool, message_id: &str) -> Result<()> {
         .await?;
     Ok(())
 }
+
+pub async fn update_content(pool: &PgPool, message_id: &str, text: &str) -> Result<()> {
+    sqlx::query(
+        r#"UPDATE messages SET
+           content_text = $1,
+           is_edited = true,
+           history = COALESCE(history, '[]'::jsonb) || jsonb_build_object(
+               'content', content_text,
+               'edited_at', NOW()
+           )
+           WHERE message_id = $2"#,
+    )
+    .bind(text)
+    .bind(message_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}

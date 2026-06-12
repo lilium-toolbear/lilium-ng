@@ -10,6 +10,7 @@ use lilium_services::event::EventService;
 
 pub struct EventProcessor {
     processor_id: String,
+    pool: PgPool,
     message_service: MessageService,
     event_service: EventService,
     batch_size: usize,
@@ -29,8 +30,9 @@ impl EventProcessor {
     ) -> Self {
         Self {
             processor_id,
-            message_service: MessageService::new(pool.clone()),
-            event_service: EventService::new(pool),
+            message_service: MessageService::new(),
+            event_service: EventService::new(pool.clone()),
+            pool,
             batch_size,
             polling_interval: Duration::from_secs(polling_interval_secs),
             max_retries: 3,
@@ -177,22 +179,22 @@ impl EventProcessor {
         match event.event.as_str() {
             "message:new" => {
                 if let Some(msg) = lilium_models::dzmm::message::Message::from_websocket(&event.data) {
-                    self.message_service.create_message(&msg).await?;
+                    self.message_service.create_message(&self.pool, &msg).await?;
                 }
             }
             "message:updated" => {
                 if let Some(message_id) = event.data.get("messageId").and_then(|v| v.as_str()) {
-                    self.message_service.update_message(message_id, &event.data).await?;
+                    self.message_service.update_message(&self.pool, message_id, &event.data).await?;
                 }
             }
             "message:deleted" => {
                 if let Some(message_id) = event.data.get("messageId").and_then(|v| v.as_str()) {
-                    self.message_service.mark_deleted(message_id).await?;
+                    self.message_service.mark_deleted(&self.pool, message_id).await?;
                 }
             }
             "message:recalled" => {
                 if let Some(message_id) = event.data.get("messageId").and_then(|v| v.as_str()) {
-                    self.message_service.mark_recalled(message_id).await?;
+                    self.message_service.mark_recalled(&self.pool, message_id).await?;
                 }
             }
             "presence:user-online" | "group:member-joined" | "group:member-left" => {
