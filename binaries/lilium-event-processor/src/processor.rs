@@ -7,12 +7,16 @@ use tokio::time::{interval, Duration};
 use lilium_models::ingestion::WebSocketEvent;
 use lilium_services::message::MessageService;
 use lilium_services::event::EventService;
+use lilium_services::user::UserService;
+use lilium_services::media::MediaService;
 
 pub struct EventProcessor {
     processor_id: String,
     pool: PgPool,
     message_service: MessageService,
     event_service: EventService,
+    user_service: UserService,
+    media_service: MediaService,
     batch_size: usize,
     polling_interval: Duration,
     max_retries: u32,
@@ -32,6 +36,8 @@ impl EventProcessor {
             processor_id,
             message_service: MessageService::new(),
             event_service: EventService::new(pool.clone()),
+            user_service: UserService::new(pool.clone()),
+            media_service: MediaService::new(pool.clone()),
             pool,
             batch_size,
             polling_interval: Duration::from_secs(polling_interval_secs),
@@ -136,12 +142,30 @@ impl EventProcessor {
         last_id: &mut i64,
         last_timestamp: &mut Option<DateTime<Utc>>,
     ) -> Result<()> {
+        let mut user_fetch_collector = Vec::new();
+        let mut media_message_ids = Vec::new();
+
         for event in events {
-            self.process_event(event).await?;
+            if let Some(msg_id) = self.process_event(event, &mut user_fetch_collector).await? {
+                media_message_ids.push(msg_id);
+            }
             if let Some(id) = event.id {
                 *last_id = id;
             }
             *last_timestamp = Some(event.timestamp);
+        }
+
+        // Batch fetch users
+        if !user_fetch_collector.is_empty() {
+            self.user_service.batch_fetch_and_update(&user_fetch_collector).await?;
+        }
+
+        // Download media (non-blocking)
+        if !media_message_ids.is_empty() {
+            let media_service = self.media_service.clone();
+            tokio::spawn(async move {
+                let _ = media_service.download_media_batch(&media_message_ids).await;
+            });
         }
 
         self.event_service.save_cursor(
@@ -175,11 +199,22 @@ impl EventProcessor {
         Ok(())
     }
 
-    async fn process_event(&self, event: &WebSocketEvent) -> Result<()> {
+    async fn process_event(
+        &self,
+        event: &WebSocketEvent,
+        user_fetch_collector: &mut Vec<(String, String)>,
+    ) -> Result<Option<String>> {
         match event.event.as_str() {
             "message:new" => {
                 if let Some(msg) = lilium_models::dzmm::message::Message::from_websocket(&event.data) {
-                    self.message_service.create_message(&self.pool, &msg, &event.data).await?;
+                    // Collect user for batch fetching
+                    if let Some(sent_by) = &msg.sent_by {
+                        user_fetch_collector.push((sent_by.clone(), msg.room_id.clone()));
+                    }
+
+                    // Process message and check for media
+                    let media_msg_id = self.message_service.create_message(&self.pool, &msg, &event.data).await?;
+                    return Ok(media_msg_id);
                 }
             }
             "message:updated" => {
@@ -198,19 +233,21 @@ impl EventProcessor {
                 }
             }
             "presence:user-online" => {
-                // User online - no action needed for now
+                // User online - collect for batch fetching
+                if let Some(user_id) = event.data.get("userId").and_then(|v| v.as_str()) {
+                    if let Some(room_id) = event.data.get("chatroomId").and_then(|v| v.as_str()) {
+                        user_fetch_collector.push((user_id.to_string(), room_id.to_string()));
+                    }
+                }
             }
-            "group:member-joined" => {
-                // Room member joined - handled by system message detection
-            }
-            "group:member-left" => {
-                // Room member left - handled by system message detection
+            "group:member-joined" | "group:member-left" => {
+                // Handled by system message detection in message:new
             }
             _ => {
                 // Unknown event type
             }
         }
-        Ok(())
+        Ok(None)
     }
 }
 
@@ -443,6 +480,22 @@ mod tests {
         }));
         let content_type = event.data["message"]["content"]["type"].as_str();
         assert!(matches!(content_type, Some("image" | "video" | "voice" | "sticker")));
+    }
+
+    #[test]
+    fn test_user_fetch_collection() {
+        let event = make_event("message:new", serde_json::json!({
+            "chatroomId": "room1",
+            "message": {
+                "messageId": "msg1",
+                "sentBy": "user1",
+                "content": {"type": "text", "text": "hello"}
+            }
+        }));
+        // Verify that sent_by is extracted for user fetching
+        let msg = lilium_models::dzmm::message::Message::from_websocket(&event.data).unwrap();
+        assert!(msg.sent_by.is_some());
+        assert_eq!(msg.sent_by.as_deref(), Some("user1"));
     }
 
     #[test]
