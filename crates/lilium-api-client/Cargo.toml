@@ -1,0 +1,17 @@
+[package]
+name = "lilium-api-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+lilium-common.workspace = true
+lilium-models.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+tungstenite.workspace = true
+url = "2"
