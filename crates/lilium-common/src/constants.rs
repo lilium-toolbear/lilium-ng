@@ -1,0 +1,7 @@
+pub const TICK_INTERVAL_MINUTES: i64 = 10;
+pub const TICKS_PER_HOUR: i64 = 6;
+pub const DEFAULT_MAX_CATCHUP_TICKS: i64 = 144;
+pub const DEFAULT_BATCH_SIZE: usize = 100;
+pub const DEFAULT_POLLING_INTERVAL_SECS: u64 = 5;
+pub const DEFAULT_QUEUE_SIZE: usize = 5000;
+pub const WORKER_LOCK_CONFLICT_EXIT_CODE: i32 = 75;
