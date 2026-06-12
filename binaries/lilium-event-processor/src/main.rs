@@ -3,15 +3,11 @@ use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod config;
-mod arbiter;
-mod worker;
 mod processor;
-mod control;
-mod ingestion;
 
 #[derive(Parser)]
-#[command(name = "lilium-spider")]
-#[command(about = "Lilium Spider - WebSocket ingestion service")]
+#[command(name = "lilium-event-processor")]
+#[command(about = "Lilium Event Processor - Batch queue consumer")]
 struct Cli {
     #[arg(short, long, default_value = "config/spider.toml")]
     config: String,
@@ -27,12 +23,17 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let config = config::Config::load(&cli.config)?;
-    tracing::info!("Starting lilium-spider");
+    tracing::info!("Starting lilium-event-processor");
 
     // Connect to database - do NOT run migrations
-    // Migrations are managed separately by Alembic in the Python project
     let pool = sqlx::PgPool::connect(&config.database.url).await?;
 
-    let arbiter = arbiter::Arbiter::new(config, pool);
-    arbiter.run().await
+    let processor = processor::EventProcessor::new(
+        pool,
+        "event_processor_main".to_string(),
+        config.processor.batch_size,
+        config.processor.polling_interval_secs,
+    );
+
+    processor.run().await
 }
