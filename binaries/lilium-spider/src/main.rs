@@ -5,7 +5,6 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod config;
 mod arbiter;
 mod worker;
-mod processor;
 mod control;
 mod ingestion;
 
