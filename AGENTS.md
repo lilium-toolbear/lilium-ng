@@ -46,3 +46,4 @@ Pull requests should explain the change, reference any related issue or audit no
 ## Agent Notes
 Before changing behavior, confirm the root cause with code or runtime evidence. Avoid speculative fixes, avoid noisy reruns, and resolve PR review threads after addressing them.
 For Python parity work, read the real Python source first and treat markdown analysis as index or hints only, not as the source of truth.
+Always uses rust 2024 edition
