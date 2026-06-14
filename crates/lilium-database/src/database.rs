@@ -102,6 +102,7 @@ impl Database {
 mod tests {
     use super::*;
     use sea_orm::ConnectionTrait;
+    use crate as lilium_database;
 
     #[test]
     fn from_url_sets_connection_and_max_connections() {
@@ -138,5 +139,102 @@ mod tests {
         let _raw_conn = raw_pool.acquire().await.unwrap();
 
         assert!(sea_pool.try_acquire().is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL"]
+    async fn transaction_macro_commits_and_raw_connection_executes() {
+        dotenvy::dotenv().ok();
+        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL must be set");
+        let db = Database::create(DatabaseConfig::from_url(url, 1))
+            .await
+            .unwrap();
+        let table_name = format!(
+            "transaction_api_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+
+        {
+            let mut conn = db.raw_connection().await.unwrap();
+            sqlx::query(&format!(
+                "CREATE TABLE {table_name} (id BIGINT PRIMARY KEY, note TEXT NOT NULL)"
+            ))
+            .execute(conn.as_mut())
+            .await
+            .unwrap();
+            sqlx::query(&format!(
+                "INSERT INTO {table_name} (id, note) VALUES (1, 'raw connection row')"
+            ))
+            .execute(conn.as_mut())
+            .await
+            .unwrap();
+            let raw_count: i64 = sqlx::query_scalar(&format!(
+                "SELECT COUNT(*) FROM {table_name}"
+            ))
+            .fetch_one(conn.as_mut())
+            .await
+            .unwrap();
+            assert_eq!(raw_count, 1);
+        }
+
+        let committed_table_name = table_name.clone();
+        lilium_database::transaction!(db, |session| {
+            sqlx::query(&format!(
+                "INSERT INTO {committed_table_name} (id, note) VALUES (2, 'committed row')"
+            ))
+            .execute(session.as_mut())
+            .await
+            .unwrap();
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        {
+            let mut conn = db.raw_connection().await.unwrap();
+            let committed_count: i64 = sqlx::query_scalar(&format!(
+                "SELECT COUNT(*) FROM {table_name}"
+            ))
+            .fetch_one(conn.as_mut())
+            .await
+            .unwrap();
+            assert_eq!(committed_count, 2);
+        }
+
+        let rollback_table_name = table_name.clone();
+        let rollback_result: anyhow::Result<()> = db
+            .transaction(|session| {
+                Box::pin(async move {
+                    sqlx::query(&format!(
+                        "INSERT INTO {rollback_table_name} (id, note) VALUES (3, 'rollback row')"
+                    ))
+                    .execute(session.as_mut())
+                    .await
+                    .unwrap();
+                    Err(anyhow::anyhow!("force rollback"))
+                })
+            })
+            .await;
+        assert!(rollback_result.is_err());
+
+        {
+            let mut conn = db.raw_connection().await.unwrap();
+            let visible_count: i64 = sqlx::query_scalar(&format!(
+                "SELECT COUNT(*) FROM {table_name}"
+            ))
+            .fetch_one(conn.as_mut())
+            .await
+            .unwrap();
+            assert_eq!(visible_count, 2);
+
+            sqlx::query(&format!("DROP TABLE {table_name}"))
+                .execute(conn.as_mut())
+                .await
+                .unwrap();
+        }
     }
 }
