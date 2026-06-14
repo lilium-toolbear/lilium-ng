@@ -202,7 +202,7 @@ impl WsClient {
                             }
                         },
                         Some(Ok(WsMessage::Binary(data))) => {
-                            if let Ok(text) = String::from_utf8(data) {
+                            if let Ok(text) = String::from_utf8(data.to_vec()) {
                                 match self.handle_message(&text).await {
                                     Ok(Some(event)) => {
                                         on_event(event).await;

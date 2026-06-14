@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use rand::Rng;
+use rand::RngExt;
 use reqwest::{
     header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE, COOKIE, ORIGIN, REFERER, SET_COOKIE},
     multipart::{Form, Part},
@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 use tracing::instrument;
 use tracing::{debug, error, info, warn};
+use url::Url;
 
 const BASE_URL: &str = "https://www.dzmm.ai";
 
@@ -39,10 +40,10 @@ const GENERATE_STRING_CHARSET: &[u8] =
     b"useandomp26T198340PX75pxJACKVERYMINDBUSHWOLFoGQZbfghjklqvwyzrict";
 
 fn generate_string(length: usize) -> String {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     (0..length)
         .map(|_| {
-            let idx = rng.gen_range(0..GENERATE_STRING_CHARSET.len());
+            let idx = rng.random_range(0..GENERATE_STRING_CHARSET.len());
             GENERATE_STRING_CHARSET[idx] as char
         })
         .collect()
@@ -456,8 +457,8 @@ impl RateLimiter {
             tokio::time::sleep(Duration::from_secs_f64(self.batch_delay)).await;
         } else {
             let delay = {
-                let mut rng = rand::thread_rng();
-                rng.gen_range(self.min_delay..self.max_delay)
+                let mut rng = rand::rng();
+                rng.random_range(self.min_delay..self.max_delay)
             };
             debug!(
                 "Rate limit delay (request #{}): {:.2}s",
@@ -626,7 +627,7 @@ impl DzmmApi {
             }
         }
 
-        if let (Some(ref email), Some(ref password)) = (&self.email, &self.password) {
+        if let (Some(email), Some(password)) = (&self.email, &self.password) {
             info!("Falling back to password login...");
             return self.login_with_email_password(email, password).await;
         }
@@ -871,19 +872,18 @@ impl DzmmApi {
         extra_headers: Option<&[(&str, &str)]>,
         timeout: Option<Duration>,
     ) -> Result<(StatusCode, Vec<u8>, HeaderMap)> {
-        let url = format!("{}{}", BASE_URL, endpoint);
+        let mut url = Url::parse(&format!("{}{}", BASE_URL, endpoint))?;
+        if let Some(q) = query {
+            url.query_pairs_mut().extend_pairs(q.iter());
+        }
 
-        let mut builder = self.client.request(method, &url);
+        let mut builder = self.client.request(method, url);
 
         let mut headers = self.build_headers(extra_headers);
         if let Some(cookie_val) = self.build_cookie_header_value().await {
             headers.insert(COOKIE, HeaderValue::from_str(&cookie_val).unwrap());
         }
         builder = builder.headers(headers);
-
-        if let Some(q) = query {
-            builder = builder.query(q);
-        }
 
         if let Some(body) = json_body {
             builder = builder.json(body);
