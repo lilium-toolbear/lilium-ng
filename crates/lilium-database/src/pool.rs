@@ -71,6 +71,10 @@ impl<'a> DerefMut for DbSessionContext<'a> {
 }
 
 impl DbPool {
+    pub(crate) fn from_pg_pool(inner: PgPool) -> Self {
+        Self { inner }
+    }
+
     fn normalize_database_url(url: &str) -> String {
         let url = url.trim();
         if let Some(rest) = url.strip_prefix("postgresql://") {
