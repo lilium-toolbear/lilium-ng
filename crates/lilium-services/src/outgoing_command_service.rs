@@ -534,7 +534,7 @@ mod tests {
         #[tokio::test]
         async fn test_create_command_defaults() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
+                lilium_test_fixtures::FixtureProfile::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);
@@ -565,7 +565,7 @@ mod tests {
         #[tokio::test]
         async fn test_create_command_non_message_send_uses_standard_retry_budget() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
+                lilium_test_fixtures::FixtureProfile::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);
@@ -591,7 +591,7 @@ mod tests {
         #[tokio::test]
         async fn test_create_command_custom_params() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
+                lilium_test_fixtures::FixtureProfile::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);
@@ -618,7 +618,7 @@ mod tests {
         #[tokio::test]
         async fn test_create_command_returns_with_id() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
+                lilium_test_fixtures::FixtureProfile::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);
@@ -644,7 +644,7 @@ mod tests {
         #[tokio::test]
         async fn test_create_multiple_commands_increments_id() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
+                lilium_test_fixtures::FixtureProfile::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);
@@ -695,7 +695,7 @@ mod tests {
         #[tokio::test]
         async fn test_get_pending_commands_fifo_order() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
+                lilium_test_fixtures::FixtureProfile::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);
@@ -745,7 +745,7 @@ mod tests {
         #[tokio::test]
         async fn test_get_pending_commands_filters_by_account() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
+                lilium_test_fixtures::FixtureProfile::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);
@@ -776,7 +776,7 @@ mod tests {
         #[tokio::test]
         async fn test_get_pending_commands_respects_limit() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
+                lilium_test_fixtures::FixtureProfile::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);
@@ -805,7 +805,7 @@ mod tests {
         #[tokio::test]
         async fn test_get_pending_commands_empty() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
+                lilium_test_fixtures::FixtureProfile::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);
@@ -829,7 +829,7 @@ mod tests {
         #[tokio::test]
         async fn test_get_command_missing() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
+                lilium_test_fixtures::FixtureProfile::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);
@@ -850,7 +850,7 @@ mod tests {
         #[tokio::test]
         async fn test_mark_processing_nonexistent_command() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
+                lilium_test_fixtures::FixtureProfile::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);
@@ -870,7 +870,7 @@ mod tests {
         #[tokio::test]
         async fn test_mark_success_nonexistent_command() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
+                lilium_test_fixtures::FixtureProfile::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);
@@ -890,7 +890,7 @@ mod tests {
         #[tokio::test]
         async fn test_mark_failed_nonexistent_command() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
+                lilium_test_fixtures::FixtureProfile::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);
@@ -910,7 +910,7 @@ mod tests {
         #[tokio::test]
         async fn test_mark_timeout_nonexistent_command() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
+                lilium_test_fixtures::FixtureProfile::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);
@@ -930,7 +930,7 @@ mod tests {
         #[tokio::test]
         async fn test_retry_or_fail_nonexistent_command_returns_false() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
+                lilium_test_fixtures::FixtureProfile::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);
@@ -951,7 +951,7 @@ mod tests {
         #[tokio::test]
         async fn test_get_command_result_missing() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
+                lilium_test_fixtures::FixtureProfile::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);
@@ -972,7 +972,7 @@ mod tests {
         #[tokio::test]
         async fn test_prune_processed_before_returns_count() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
+                lilium_test_fixtures::FixtureProfile::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);

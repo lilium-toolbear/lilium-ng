@@ -298,7 +298,7 @@ mod tests {
     #[tokio::test]
     async fn test_acquire_connection_lock_creates_connection_record() {
         lilium_test_fixtures::with_db_session(
-            lilium_test_fixtures::TestServiceFixture::WebsocketConnection,
+            lilium_test_fixtures::FixtureProfile::WebsocketConnection,
             |session| {
                 Box::pin(async move {
                     let mut service = WebsocketConnectionService::new(session);
@@ -318,7 +318,7 @@ mod tests {
     #[tokio::test]
     async fn test_release_connection_lock_deletes_record() {
         lilium_test_fixtures::with_db_session(
-            lilium_test_fixtures::TestServiceFixture::WebsocketConnection,
+            lilium_test_fixtures::FixtureProfile::WebsocketConnection,
             |session| {
                 Box::pin(async move {
                     let mut service = WebsocketConnectionService::new(session);
@@ -338,7 +338,7 @@ mod tests {
     #[tokio::test]
     async fn test_update_heartbeat_updates_timestamp() {
         lilium_test_fixtures::with_db_session(
-            lilium_test_fixtures::TestServiceFixture::WebsocketConnection,
+            lilium_test_fixtures::FixtureProfile::WebsocketConnection,
             |session| {
                 Box::pin(async move {
                     let mut service = WebsocketConnectionService::new(session);
@@ -358,7 +358,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_active_connections_returns_all_connections() {
         lilium_test_fixtures::with_db_session(
-            lilium_test_fixtures::TestServiceFixture::WebsocketConnection,
+            lilium_test_fixtures::FixtureProfile::WebsocketConnection,
             |session| {
                 Box::pin(async move {
                     let mut service = WebsocketConnectionService::new(session);
@@ -386,7 +386,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_active_connections_filters_by_credential() {
         lilium_test_fixtures::with_db_session(
-            lilium_test_fixtures::TestServiceFixture::WebsocketConnection,
+            lilium_test_fixtures::FixtureProfile::WebsocketConnection,
             |session| {
                 Box::pin(async move {
                     let mut service = WebsocketConnectionService::new(session);
@@ -415,7 +415,7 @@ mod tests {
     #[tokio::test]
     async fn test_is_credential_in_use_returns_true_when_locked() {
         lilium_test_fixtures::with_db_session(
-            lilium_test_fixtures::TestServiceFixture::WebsocketConnection,
+            lilium_test_fixtures::FixtureProfile::WebsocketConnection,
             |session| {
                 Box::pin(async move {
                     let mut service = WebsocketConnectionService::new(session);
@@ -442,7 +442,7 @@ mod tests {
     #[tokio::test]
     async fn test_is_credential_in_use_returns_false_when_not_locked() {
         lilium_test_fixtures::with_db_session(
-            lilium_test_fixtures::TestServiceFixture::WebsocketConnection,
+            lilium_test_fixtures::FixtureProfile::WebsocketConnection,
             |session| {
                 Box::pin(async move {
                     let mut service = WebsocketConnectionService::new(session);
@@ -461,7 +461,7 @@ mod tests {
     #[tokio::test]
     async fn test_cleanup_stale_connections_removes_old_records() {
         lilium_test_fixtures::with_db_session(
-            lilium_test_fixtures::TestServiceFixture::WebsocketConnection,
+            lilium_test_fixtures::FixtureProfile::WebsocketConnection,
             |session| {
                 Box::pin(async move {
                     let mut service = WebsocketConnectionService::new(session);
@@ -478,7 +478,7 @@ mod tests {
     #[tokio::test]
     async fn test_cleanup_stale_connections_preserves_fresh_records() {
         lilium_test_fixtures::with_db_session(
-            lilium_test_fixtures::TestServiceFixture::WebsocketConnection,
+            lilium_test_fixtures::FixtureProfile::WebsocketConnection,
             |session| {
                 Box::pin(async move {
                     let mut service = WebsocketConnectionService::new(session);
@@ -506,7 +506,7 @@ mod tests {
     #[tokio::test]
     async fn test_acquire_cleans_up_stale_record() {
         lilium_test_fixtures::with_db_session(
-            lilium_test_fixtures::TestServiceFixture::WebsocketConnection,
+            lilium_test_fixtures::FixtureProfile::WebsocketConnection,
             |session| {
                 Box::pin(async move {
                     let mut service = WebsocketConnectionService::new(session);

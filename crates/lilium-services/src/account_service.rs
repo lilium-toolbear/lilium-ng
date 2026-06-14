@@ -343,7 +343,7 @@ mod tests {
     #[tokio::test]
     async fn service_struct_can_be_created() {
         lilium_test_fixtures::with_db_session(
-            lilium_test_fixtures::TestServiceFixture::Account,
+            lilium_test_fixtures::FixtureProfile::Account,
             |session| {
                 Box::pin(async move {
                     let _svc = AccountService::new(session);
@@ -358,7 +358,7 @@ mod tests {
     #[tokio::test]
     async fn create_and_get_account_roundtrip() {
         lilium_test_fixtures::with_db_session(
-            lilium_test_fixtures::TestServiceFixture::Account,
+            lilium_test_fixtures::FixtureProfile::Account,
             |session| {
                 Box::pin(async move {
                     let mut session = session;

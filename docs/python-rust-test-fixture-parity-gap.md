@@ -17,18 +17,17 @@ This document records the current Rust fixture state relative to that Python mod
 
 ## What Rust Has Today
 
-1. `crates/lilium-database/src/test_fixtures.rs` loads `.env` lazily for helpers and requires `TEST_DATABASE_URL`.
-2. `crates/lilium-database/src/test_fixtures.rs` provisions a process-scoped temporary PostgreSQL database from the live schema bootstrap in `crates/lilium-database/testdata/live_schema_bootstrap/0001_live_schema.sql`.
+1. `crates/lilium-test-fixtures` loads `.env` lazily for helpers and requires `TEST_DATABASE_URL`.
+2. `crates/lilium-test-fixtures` provisions pooled temporary PostgreSQL databases from the live schema bootstrap in `crates/lilium-database/testdata/live_schema_bootstrap/0001_live_schema.sql`.
 3. The bootstrap file is now pure SQL and recreates the live table / trigger layout without depending on a local TOML config or the unavailable `zhparser` extension.
-4. Per-test reset now deletes rows from the live tables and recreates the partitions exercised by tests.
-5. The temporary test database is cleaned up at process exit, and startup sweeps stale `lilium_test_*` databases that are no longer in use.
+4. Per-test reset truncates live tables, restarts identities, unlocks advisory locks, and recreates the partitions exercised by tests.
+5. Leased test databases are returned to an in-process pool after each test unit, and startup sweeps stale `lilium_test_*` databases that are no longer in use.
 6. The event processor offset model now matches the live schema `integer` column instead of assuming `bigint`.
 
 ## Remaining Gaps
 
-1. Rust still uses a service-fixture reset path rather than one metadata-driven canonical schema reset helper.
-2. No CI-only `UNLOGGED` table optimization.
-3. Rust does not mirror Python's worker naming or lifecycle exactly; it uses one temp DB per process.
+1. No CI-only `UNLOGGED` table optimization.
+2. Rust does not mirror Python's worker naming or lifecycle exactly; it uses a process-local database pool rather than pytest worker names.
 
 ## Executable Repair List
 
@@ -39,15 +38,15 @@ This document records the current Rust fixture state relative to that Python mod
 - [x] Pure SQL bootstrap file without `pg_dump` control commands.
 - [x] Test-time `zhparser` compatibility layer that does not require the extension.
 - [x] Per-test table reset and partition repair.
-- [x] Automatic cleanup for the temporary test database at process exit.
+- [x] Pooled test database lease / return lifecycle.
 - [x] Startup sweep for stale `lilium_test_*` databases with no active connections.
 - [x] `event_processor_offsets.last_processed_id` schema/type alignment.
+- [x] Fixture responsibilities split into database lease, reset, seed, and profile layers.
 
 ### Still Open
 
-- [ ] If strict parity is desired, replace the current fixture-specific reset with a metadata-driven schema reset layer.
 - [ ] Add optional CI-only `UNLOGGED` mode if performance becomes a bottleneck.
 
 ## Current Recommendation
 
-If the goal is Python parity rather than just green tests, the next step is optional teardown plus a metadata-driven reset layer. The current implementation is already closer to the Python model than the prior shared-lock fixture approach.
+If the goal is Python parity rather than just green tests, the next step is optional CI-only performance tuning. The current implementation follows the important isolation rule: concurrent test units lease separate databases, and reuse relies on truncate/reset rather than drop/recreate.

@@ -613,7 +613,7 @@ mod tests {
         #[tokio::test]
         async fn service_struct_can_be_created() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::User,
+                lilium_test_fixtures::FixtureProfile::User,
                 |session| {
                     Box::pin(async move {
                         let _svc = UserService::new(session);
@@ -628,7 +628,7 @@ mod tests {
         #[tokio::test]
         async fn get_by_id_existing() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::User,
+                lilium_test_fixtures::FixtureProfile::User,
                 |session| {
                     Box::pin(async move {
                         let mut svc = UserService::new(session);
@@ -647,7 +647,7 @@ mod tests {
         #[tokio::test]
         async fn get_by_id_nonexistent() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::User,
+                lilium_test_fixtures::FixtureProfile::User,
                 |session| {
                     Box::pin(async move {
                         let mut svc = UserService::new(session);
@@ -664,7 +664,7 @@ mod tests {
         #[tokio::test]
         async fn get_by_ids_multiple() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::User,
+                lilium_test_fixtures::FixtureProfile::User,
                 |session| {
                     Box::pin(async move {
                         let mut svc = UserService::new(session);
@@ -686,7 +686,7 @@ mod tests {
         #[tokio::test]
         async fn get_by_ids_empty() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::User,
+                lilium_test_fixtures::FixtureProfile::User,
                 |session| {
                     Box::pin(async move {
                         let mut svc = UserService::new(session);
@@ -703,7 +703,7 @@ mod tests {
         #[tokio::test]
         async fn get_by_ids_with_nonexistent() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::User,
+                lilium_test_fixtures::FixtureProfile::User,
                 |session| {
                     Box::pin(async move {
                         let mut svc = UserService::new(session);
@@ -723,7 +723,7 @@ mod tests {
         #[tokio::test]
         async fn search_users_no_filters() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::User,
+                lilium_test_fixtures::FixtureProfile::User,
                 |session| {
                     Box::pin(async move {
                         let mut svc = UserService::new(session);
@@ -745,7 +745,7 @@ mod tests {
         #[tokio::test]
         async fn search_users_by_name() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::User,
+                lilium_test_fixtures::FixtureProfile::User,
                 |session| {
                     Box::pin(async move {
                         let mut svc = UserService::new(session);
@@ -767,7 +767,7 @@ mod tests {
         #[tokio::test]
         async fn search_users_with_empty_query() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::User,
+                lilium_test_fixtures::FixtureProfile::User,
                 |session| {
                     Box::pin(async move {
                         let mut svc = UserService::new(session);
@@ -789,7 +789,7 @@ mod tests {
         #[tokio::test]
         async fn search_users_pagination() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::User,
+                lilium_test_fixtures::FixtureProfile::User,
                 |session| {
                     Box::pin(async move {
                         let mut svc = UserService::new(session);
@@ -821,7 +821,7 @@ mod tests {
         #[tokio::test]
         async fn upsert_new_user() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::User,
+                lilium_test_fixtures::FixtureProfile::User,
                 |session| {
                     Box::pin(async move {
                         let mut svc = UserService::new(session);
@@ -844,7 +844,7 @@ mod tests {
         #[tokio::test]
         async fn upsert_existing_user() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::User,
+                lilium_test_fixtures::FixtureProfile::User,
                 |session| {
                     Box::pin(async move {
                         let mut svc = UserService::new(session);
@@ -866,7 +866,7 @@ mod tests {
         #[tokio::test]
         async fn increment_message_count() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::User,
+                lilium_test_fixtures::FixtureProfile::User,
                 |session| {
                     Box::pin(async move {
                         let mut svc = UserService::new(session);
@@ -884,7 +884,7 @@ mod tests {
         #[tokio::test]
         async fn increment_deleted_count() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::User,
+                lilium_test_fixtures::FixtureProfile::User,
                 |session| {
                     Box::pin(async move {
                         let mut svc = UserService::new(session);
@@ -902,7 +902,7 @@ mod tests {
         #[tokio::test]
         async fn increment_recalled_count() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::User,
+                lilium_test_fixtures::FixtureProfile::User,
                 |session| {
                     Box::pin(async move {
                         let mut svc = UserService::new(session);
@@ -920,7 +920,7 @@ mod tests {
         #[tokio::test]
         async fn increment_nonexistent_user() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::User,
+                lilium_test_fixtures::FixtureProfile::User,
                 |session| {
                     Box::pin(async move {
                         let mut svc = UserService::new(session);
@@ -937,7 +937,7 @@ mod tests {
         #[tokio::test]
         async fn fetch_user_profile_existing() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::User,
+                lilium_test_fixtures::FixtureProfile::User,
                 |session| {
                     Box::pin(async move {
                         let mut svc = UserService::new(session);
@@ -956,7 +956,7 @@ mod tests {
         #[tokio::test]
         async fn fetch_user_profile_nonexistent() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::User,
+                lilium_test_fixtures::FixtureProfile::User,
                 |session| {
                     Box::pin(async move {
                         let mut svc = UserService::new(session);
@@ -976,7 +976,7 @@ mod tests {
         #[tokio::test]
         async fn batch_fetch_and_update() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::User,
+                lilium_test_fixtures::FixtureProfile::User,
                 |session| {
                     Box::pin(async move {
                         let mut svc = UserService::new(session);

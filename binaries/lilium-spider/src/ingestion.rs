@@ -497,11 +497,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_event_writer_drains_disk_before_memory() {
-        let pool = lilium_test_fixtures::connect_test_db().await;
+        let pool = lilium_test_fixtures::connect_test_database().await;
         pool.with_session_context(|session| {
             Box::pin(async move {
                 let mut session = session;
-                lilium_test_fixtures::init_event_service_db(&mut session).await;
+                lilium_test_fixtures::prepare_database(
+                    &mut session,
+                    lilium_test_fixtures::FixtureProfile::Event,
+                )
+                .await?;
                 Ok(())
             })
         })

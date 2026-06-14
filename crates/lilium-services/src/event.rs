@@ -400,7 +400,7 @@ mod tests {
     #[tokio::test]
     async fn websocket_event_service_struct_can_be_created() {
         lilium_test_fixtures::with_db_session(
-            lilium_test_fixtures::TestServiceFixture::Event,
+            lilium_test_fixtures::FixtureProfile::Event,
             |session| {
                 Box::pin(async move {
                     let _svc = WebSocketEventService::new(session);
@@ -415,7 +415,7 @@ mod tests {
     #[tokio::test]
     async fn websocket_event_service_roundtrip() {
         lilium_test_fixtures::with_db_session(
-            lilium_test_fixtures::TestServiceFixture::Event,
+            lilium_test_fixtures::FixtureProfile::Event,
             |session| {
                 Box::pin(async move {
                     let mut svc = WebSocketEventService::new(session);
@@ -441,7 +441,7 @@ mod tests {
     #[tokio::test]
     async fn event_processor_offset_service_roundtrip() {
         lilium_test_fixtures::with_db_session(
-            lilium_test_fixtures::TestServiceFixture::Event,
+            lilium_test_fixtures::FixtureProfile::Event,
             |session| {
                 Box::pin(async move {
                     let mut svc = EventProcessorOffsetService::new(session);

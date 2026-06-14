@@ -2136,7 +2136,7 @@ mod tests {
         #[tokio::test]
         async fn service_struct_can_be_created() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut _svc = MessageService::new(session);
@@ -2151,7 +2151,7 @@ mod tests {
         #[tokio::test]
         async fn get_messages_no_filters() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
@@ -2180,7 +2180,7 @@ mod tests {
         #[tokio::test]
         async fn get_messages_ordered_newest_first() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
@@ -2211,7 +2211,7 @@ mod tests {
         #[tokio::test]
         async fn get_messages_reverse_order() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
@@ -2242,7 +2242,7 @@ mod tests {
         #[tokio::test]
         async fn filter_by_room() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
@@ -2274,7 +2274,7 @@ mod tests {
         #[tokio::test]
         async fn filter_by_user() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
@@ -2306,7 +2306,7 @@ mod tests {
         #[tokio::test]
         async fn filter_by_content_types() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
@@ -2338,7 +2338,7 @@ mod tests {
         #[tokio::test]
         async fn filter_deleted_messages() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
@@ -2370,7 +2370,7 @@ mod tests {
         #[tokio::test]
         async fn filter_recalled_messages() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
@@ -2402,7 +2402,7 @@ mod tests {
         #[tokio::test]
         async fn filter_by_time_range() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
@@ -2440,7 +2440,7 @@ mod tests {
         #[tokio::test]
         async fn filter_has_attachment() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
@@ -2472,7 +2472,7 @@ mod tests {
         #[tokio::test]
         async fn filter_has_reference() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
@@ -2504,7 +2504,7 @@ mod tests {
         #[tokio::test]
         async fn filter_combined() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
@@ -2542,7 +2542,7 @@ mod tests {
         #[tokio::test]
         async fn pagination_first_page() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
@@ -2571,7 +2571,7 @@ mod tests {
         #[tokio::test]
         async fn pagination_with_cursor_no_overlap() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
@@ -2612,7 +2612,7 @@ mod tests {
         #[tokio::test]
         async fn empty_database_returns_none() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
@@ -2645,7 +2645,7 @@ mod tests {
         #[tokio::test]
         async fn get_by_id_nonexistent() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
@@ -2662,7 +2662,7 @@ mod tests {
         #[tokio::test]
         async fn message_exists_false() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
@@ -2679,7 +2679,7 @@ mod tests {
         #[tokio::test]
         async fn get_before_nonexistent_returns_empty() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
@@ -2696,7 +2696,7 @@ mod tests {
         #[tokio::test]
         async fn get_after_nonexistent_returns_empty() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
@@ -2713,7 +2713,7 @@ mod tests {
         #[tokio::test]
         async fn get_context_nonexistent_returns_none() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
@@ -2733,7 +2733,7 @@ mod tests {
         #[tokio::test]
         async fn get_latest_message_time_empty_room() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
@@ -2753,7 +2753,7 @@ mod tests {
         #[tokio::test]
         async fn get_earliest_message_time_empty_room() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
@@ -2773,7 +2773,7 @@ mod tests {
         #[tokio::test]
         async fn batch_create_empty_list_returns_zero() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
@@ -2790,7 +2790,7 @@ mod tests {
         #[tokio::test]
         async fn batch_create_if_missing_empty() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
@@ -2807,7 +2807,7 @@ mod tests {
         #[tokio::test]
         async fn enrich_batch_empty() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
@@ -2824,7 +2824,7 @@ mod tests {
         #[tokio::test]
         async fn mark_deleted_batch_empty_returns_zero() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
@@ -2844,7 +2844,7 @@ mod tests {
         #[tokio::test]
         async fn mark_recalled_batch_empty_returns_zero() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
@@ -2861,7 +2861,7 @@ mod tests {
         #[tokio::test]
         async fn get_deleted_messages() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
@@ -2880,7 +2880,7 @@ mod tests {
         #[tokio::test]
         async fn get_deleted_messages_with_room() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
@@ -2902,7 +2902,7 @@ mod tests {
         #[tokio::test]
         async fn get_room_stats_returns_stats() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
@@ -2919,7 +2919,7 @@ mod tests {
         #[tokio::test]
         async fn get_user_stats_returns_stats() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
@@ -2936,7 +2936,7 @@ mod tests {
         #[tokio::test]
         async fn count_messages_with_filters() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
@@ -2957,7 +2957,7 @@ mod tests {
         #[tokio::test]
         async fn count_messages_no_filters_uses_rooms_table() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
@@ -2977,7 +2977,7 @@ mod tests {
         #[tokio::test]
         async fn create_message_if_missing_duplicate() {
             lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::TestServiceFixture::Message,
+                lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
                         let mut svc = MessageService::new(session);
