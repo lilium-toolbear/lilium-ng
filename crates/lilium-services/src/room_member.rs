@@ -1,20 +1,23 @@
 use std::collections::HashMap;
 
-use anyhow::Result;
+use crate::Result;
 use chrono::{DateTime, Utc};
 use lilium_database::DbSessionContext;
 
 use lilium_models::dzmm::room_member::RoomMember;
+use tracing::instrument;
 
 pub struct RoomMemberService<'a> {
     session: DbSessionContext<'a>,
 }
 
 impl<'a> RoomMemberService<'a> {
+    #[instrument(skip(session))]
     pub fn new(session: DbSessionContext<'a>) -> Self {
         Self { session }
     }
 
+    #[instrument(skip(self), fields(room_id = %room_id, user_id = %user_id))]
     pub async fn get_member_info(
         &mut self,
         room_id: &str,
@@ -32,6 +35,7 @@ impl<'a> RoomMemberService<'a> {
         Ok(member)
     }
 
+    #[instrument(skip(self), fields(room_id = %room_id, user_id = %user_id))]
     pub async fn is_member(&mut self, room_id: &str, user_id: &str) -> Result<bool> {
         let count: i64 = sqlx::query_scalar(
             r#"SELECT COUNT(*) FROM room_members
@@ -44,6 +48,7 @@ impl<'a> RoomMemberService<'a> {
         Ok(count > 0)
     }
 
+    #[instrument(skip(self, user_ids), fields(room_id = %room_id, user_count = user_ids.len(), has_account_user_id = _account_user_id.is_some()))]
     pub async fn get_active_members_by_ids(
         &mut self,
         room_id: &str,
@@ -69,6 +74,7 @@ impl<'a> RoomMemberService<'a> {
         Ok(map)
     }
 
+    #[instrument(skip(self), fields(room_id = %room_id, user_id = %user_id, role = %role, has_joined_at = joined_at.is_some()))]
     pub async fn upsert_member(
         &mut self,
         room_id: &str,
@@ -76,23 +82,27 @@ impl<'a> RoomMemberService<'a> {
         role: &str,
         joined_at: Option<DateTime<Utc>>,
     ) -> Result<()> {
+        let now = Utc::now();
         sqlx::query(
-            r#"INSERT INTO room_members (room_id, user_id, role, joined_at)
-               VALUES ($1, $2, $3, $4)
+            r#"INSERT INTO room_members (room_id, user_id, role, joined_at, created_at, updated_at)
+               VALUES ($1, $2, $3, $4, $5, $5)
                ON CONFLICT (room_id, user_id) DO UPDATE SET
                    role = $3,
                    joined_at = $4,
-                   left_at = NULL"#,
+                   left_at = NULL,
+                   updated_at = EXCLUDED.updated_at"#,
         )
         .bind(room_id)
         .bind(user_id)
         .bind(role)
         .bind(joined_at)
+        .bind(now)
         .execute(self.session.as_mut())
         .await?;
         Ok(())
     }
 
+    #[instrument(skip(self), fields(room_id = %room_id, user_id = %user_id, role = %role, has_joined_at = joined_at.is_some()))]
     pub async fn upsert_member_simple(
         &mut self,
         room_id: &str,
@@ -103,6 +113,7 @@ impl<'a> RoomMemberService<'a> {
         self.upsert_member(room_id, user_id, role, joined_at).await
     }
 
+    #[instrument(skip(self), fields(room_id = %room_id, user_id = %user_id, has_left_at = left_at.is_some()))]
     pub async fn mark_member_left(
         &mut self,
         room_id: &str,
@@ -121,6 +132,7 @@ impl<'a> RoomMemberService<'a> {
         Ok(result.rows_affected() > 0)
     }
 
+    #[instrument(skip(self), fields(room_id = %room_id))]
     pub async fn get_member_count(&mut self, room_id: &str) -> Result<i64> {
         let count: i64 = sqlx::query_scalar(
             r#"SELECT COUNT(*) FROM room_members
@@ -132,6 +144,7 @@ impl<'a> RoomMemberService<'a> {
         Ok(count)
     }
 
+    #[instrument(skip(self), fields(room_id = %room_id, limit, offset))]
     pub async fn get_room_members(
         &mut self,
         room_id: &str,
@@ -237,8 +250,8 @@ mod tests {
 
         #[tokio::test]
         async fn service_struct_can_be_created() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::RoomMember,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::RoomMember,
                 |session| {
                     Box::pin(async move {
                         let mut _svc = RoomMemberService::new(session);
@@ -252,8 +265,8 @@ mod tests {
 
         #[tokio::test]
         async fn get_member_info_existing() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::RoomMember,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::RoomMember,
                 |session| {
                     Box::pin(async move {
                         let mut svc = RoomMemberService::new(session);
@@ -281,8 +294,8 @@ mod tests {
 
         #[tokio::test]
         async fn get_member_info_nonexistent() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::RoomMember,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::RoomMember,
                 |session| {
                     Box::pin(async move {
                         let mut svc = RoomMemberService::new(session);
@@ -301,8 +314,8 @@ mod tests {
 
         #[tokio::test]
         async fn get_member_info_wrong_room() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::RoomMember,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::RoomMember,
                 |session| {
                     Box::pin(async move {
                         let mut svc = RoomMemberService::new(session);
@@ -325,8 +338,8 @@ mod tests {
 
         #[tokio::test]
         async fn is_member_true() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::RoomMember,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::RoomMember,
                 |session| {
                     Box::pin(async move {
                         let mut svc = RoomMemberService::new(session);
@@ -348,8 +361,8 @@ mod tests {
 
         #[tokio::test]
         async fn is_member_false() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::RoomMember,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::RoomMember,
                 |session| {
                     Box::pin(async move {
                         let mut svc = RoomMemberService::new(session);
@@ -367,8 +380,8 @@ mod tests {
 
         #[tokio::test]
         async fn get_active_members_by_ids_deduplicates() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::RoomMember,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::RoomMember,
                 |session| {
                     Box::pin(async move {
                         let mut svc = RoomMemberService::new(session);
@@ -396,8 +409,8 @@ mod tests {
 
         #[tokio::test]
         async fn get_active_members_by_ids_empty() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::RoomMember,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::RoomMember,
                 |session| {
                     Box::pin(async move {
                         let mut svc = RoomMemberService::new(session);
@@ -416,8 +429,8 @@ mod tests {
 
         #[tokio::test]
         async fn upsert_new_member() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::RoomMember,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::RoomMember,
                 |session| {
                     Box::pin(async move {
                         let mut svc = RoomMemberService::new(session);
@@ -440,8 +453,8 @@ mod tests {
 
         #[tokio::test]
         async fn upsert_existing_member_updates_role() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::RoomMember,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::RoomMember,
                 |session| {
                     Box::pin(async move {
                         let mut svc = RoomMemberService::new(session);
@@ -467,8 +480,8 @@ mod tests {
 
         #[tokio::test]
         async fn upsert_member_simple_new() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::RoomMember,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::RoomMember,
                 |session| {
                     Box::pin(async move {
                         let mut svc = RoomMemberService::new(session);
@@ -496,8 +509,8 @@ mod tests {
 
         #[tokio::test]
         async fn upsert_member_simple_reactivates_left_member() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::RoomMember,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::RoomMember,
                 |session| {
                     Box::pin(async move {
                         let mut svc = RoomMemberService::new(session);
@@ -531,8 +544,8 @@ mod tests {
 
         #[tokio::test]
         async fn mark_member_left_sets_left_at() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::RoomMember,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::RoomMember,
                 |session| {
                     Box::pin(async move {
                         let mut svc = RoomMemberService::new(session);
@@ -561,8 +574,8 @@ mod tests {
 
         #[tokio::test]
         async fn mark_member_left_nonexistent_returns_false() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::RoomMember,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::RoomMember,
                 |session| {
                     Box::pin(async move {
                         let mut svc = RoomMemberService::new(session);
@@ -581,8 +594,8 @@ mod tests {
 
         #[tokio::test]
         async fn get_member_count_zero_empty_room() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::RoomMember,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::RoomMember,
                 |session| {
                     Box::pin(async move {
                         let mut svc = RoomMemberService::new(session);
@@ -598,8 +611,8 @@ mod tests {
 
         #[tokio::test]
         async fn get_member_count_correct() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::RoomMember,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::RoomMember,
                 |session| {
                     Box::pin(async move {
                         let mut svc = RoomMemberService::new(session);
@@ -625,8 +638,8 @@ mod tests {
 
         #[tokio::test]
         async fn get_room_members_all() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::RoomMember,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::RoomMember,
                 |session| {
                     Box::pin(async move {
                         let mut svc = RoomMemberService::new(session);
@@ -656,8 +669,8 @@ mod tests {
 
         #[tokio::test]
         async fn get_room_members_empty_room() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::RoomMember,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::RoomMember,
                 |session| {
                     Box::pin(async move {
                         let mut svc = RoomMemberService::new(session);
@@ -676,8 +689,8 @@ mod tests {
 
         #[tokio::test]
         async fn get_room_members_does_not_cross_rooms() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::RoomMember,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::RoomMember,
                 |session| {
                     Box::pin(async move {
                         let mut svc = RoomMemberService::new(session);

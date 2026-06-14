@@ -1,17 +1,20 @@
 # Services 模块分析
 
-## 待分析文件
+## 说明
 
-| # | 文件 | 功能 | 状态 |
-|---|------|------|------|
-| 1 | services/base.py | 基类 | 待分析 |
-| 2 | services/errors.py | 错误定义 | 待分析 |
-| 3 | services/websocket_event_service.py | WebSocket 事件队列 | 待分析 |
-| 4 | services/event_processor_offset_service.py | 偏移量追踪 | 待分析 |
-| 5 | services/notification_service.py | LISTEN/NOTIFY | 待分析 |
-| 6 | services/account_service.py | 账户管理 | 待分析 |
-| 7 | services/websocket_connection_service.py | 连接管理 | 待分析 |
-| 8 | services/outgoing_command_service.py | 命令服务 | 待分析 |
-| 9 | services/message_service.py | 消息服务 | 待分析 |
-| 10 | services/room_member_service.py | 房间成员 | 待分析 |
-| 11 | services/user_service.py | 用户服务 | 待分析 |
+这是 services 目录的历史分析索引，不再维护“待分析文件”队列。
+各服务的详细分析已经拆到单文件文档中，新的补充分析应该直接新增对应文档，而不是回填这里的状态表。
+
+## 详细文档
+
+- `docs/python-analysis/02-services/01-base.md`
+- `docs/python-analysis/02-services/02-errors.md`
+- `docs/python-analysis/02-services/03-websocket-event-service.md`
+- `docs/python-analysis/02-services/04-event-processor-offset-service.md`
+- `docs/python-analysis/02-services/05-notification-service.md`
+- `docs/python-analysis/02-services/06-account-service.md`
+- `docs/python-analysis/02-services/07-websocket-connection-service.md`
+- `docs/python-analysis/02-services/08-outgoing-command-service.md`
+- `docs/python-analysis/02-services/09-message-service.md`
+- `docs/python-analysis/02-services/10-room-member-service.md`
+- `docs/python-analysis/02-services/11-user-service.md`

@@ -5,9 +5,14 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{mpsc, Mutex};
+use tracing::{info, warn};
 
+use lilium_common::LiliumError;
+use lilium_database::{DbPool, DbSessionContext};
 use lilium_models::ingestion::EventEnvelope;
+use lilium_services::event::{WebSocketEventInsert, WebSocketEventService};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpillRecord {
@@ -91,10 +96,11 @@ impl DiskSpillBuffer {
             }
             let record: SpillRecord = serde_json::from_str(&line)?;
             if record.schema_version != 2 {
-                return Err(anyhow::anyhow!(
-                    "LegacySpillBufferError: expected schema_version 2, got {}",
-                    record.schema_version
-                ));
+                return Err(LiliumError::service(
+                    "SPILL_BUFFER_INVALID_SCHEMA",
+                    format!("expected schema_version 2, got {}", record.schema_version),
+                )
+                .into());
             }
             let mut env = record.to_event_envelope();
             env.source = "disk_replay".to_string();
@@ -149,7 +155,6 @@ impl DiskSpillBuffer {
 }
 
 pub struct EventIngestor {
-    #[allow(dead_code)]
     account_user_id: String,
     queue: mpsc::Sender<EventEnvelope>,
     spill: DiskSpillBuffer,
@@ -179,6 +184,17 @@ impl EventIngestor {
     }
 
     pub async fn accept_event(&self, event: EventEnvelope) -> bool {
+        if event.account_user_id != self.account_user_id {
+            self.spilled_count.fetch_add(1, Ordering::Relaxed);
+            let _ = self.spill.append(&event).await;
+            warn!(
+                expected_account = %self.account_user_id,
+                actual_account = %event.account_user_id,
+                "Rejected event for unexpected account"
+            );
+            return false;
+        }
+
         if !self.is_accepting.load(Ordering::Relaxed) {
             self.spilled_count.fetch_add(1, Ordering::Relaxed);
             let _ = self.spill.append(&event).await;
@@ -224,15 +240,24 @@ impl EventIngestor {
 }
 
 pub struct EventWriter {
+    pool: DbPool,
     ingestor: Arc<EventIngestor>,
+    receiver: Arc<Mutex<mpsc::Receiver<EventEnvelope>>>,
     batch_size: usize,
     inserted_count: AtomicU64,
 }
 
 impl EventWriter {
-    pub fn new(ingestor: Arc<EventIngestor>, batch_size: usize) -> Self {
+    pub fn new(
+        pool: DbPool,
+        ingestor: Arc<EventIngestor>,
+        receiver: mpsc::Receiver<EventEnvelope>,
+        batch_size: usize,
+    ) -> Self {
         Self {
+            pool,
             ingestor,
+            receiver: Arc::new(Mutex::new(receiver)),
             batch_size,
             inserted_count: AtomicU64::new(0),
         }
@@ -240,18 +265,25 @@ impl EventWriter {
 
     pub async fn run(&self, stop_event: &Arc<AtomicBool>) {
         loop {
-            let inserted = self.drain_once().await.unwrap_or(0);
+            let inserted = match self.drain_once().await {
+                Ok(inserted) => inserted,
+                Err(e) => {
+                    warn!(error = %e, "Event writer batch failed");
+                    0
+                }
+            };
             let spill_pending = self.ingestor.spill().has_pending().await;
 
             if stop_event.load(Ordering::Relaxed)
-                && self.ingestor.queue_depth() == 0
+                && inserted == 0
                 && !spill_pending
+                && self.receiver.lock().await.is_empty()
             {
                 break;
             }
 
             if stop_event.load(Ordering::Relaxed) && inserted == 0 && spill_pending {
-                self.spill_memory_queue().await;
+                let _ = self.spill_memory_queue().await;
                 break;
             }
 
@@ -274,23 +306,97 @@ impl EventWriter {
             }
         }
 
-        // Then drain from memory queue
-        // This would need access to the receiver
-        Ok(0)
+        let events = self.drain_memory_batch().await?;
+        if events.is_empty() {
+            return Ok(0);
+        }
+
+        match self.insert_event_batch(&events).await {
+            Ok(inserted) => Ok(inserted),
+            Err(error) => {
+                self.spill_memory_events(&events).await?;
+                Err(error)
+            }
+        }
     }
 
     async fn insert_replay_batch(&self, events: &[EventEnvelope]) -> Result<usize> {
-        let count = events.len();
-        // In real implementation, would batch insert to DB
-        self.ingestor.spill().discard_replay_batch(count).await?;
-        self.inserted_count
-            .fetch_add(count as u64, Ordering::Relaxed);
-        Ok(count)
+        let inserted = self.insert_event_batch(events).await?;
+        self.ingestor.spill().discard_replay_batch(inserted).await?;
+        Ok(inserted)
     }
 
-    async fn spill_memory_queue(&self) {
-        // Spill remaining memory queue to disk on shutdown
-        // This would need access to the receiver, which is complex with the current architecture
+    async fn insert_event_batch(&self, events: &[EventEnvelope]) -> Result<usize> {
+        if events.is_empty() {
+            return Ok(0);
+        }
+
+        let insert_rows: Vec<WebSocketEventInsert> = events
+            .iter()
+            .map(|event| WebSocketEventInsert {
+                user_id: event.account_user_id.clone(),
+                event: event.event_type.clone(),
+                data: event.payload.clone(),
+                timestamp: event.received_at,
+            })
+            .collect();
+
+        let inserted = self
+            .pool
+            .with_session_context(|mut session| {
+                let insert_rows = insert_rows.clone();
+                Box::pin(async move {
+                    let mut service =
+                        WebSocketEventService::new(DbSessionContext::new(&mut session));
+                    service
+                        .insert_events(&insert_rows)
+                        .await
+                        .map_err(Into::into)
+                })
+            })
+            .await?;
+
+        self.inserted_count
+            .fetch_add(inserted as u64, Ordering::Relaxed);
+        info!(count = inserted, "Inserted websocket event batch");
+        Ok(inserted as usize)
+    }
+
+    async fn drain_memory_batch(&self) -> Result<Vec<EventEnvelope>> {
+        let mut receiver = self.receiver.lock().await;
+        let mut events = Vec::with_capacity(self.batch_size);
+
+        loop {
+            match receiver.try_recv() {
+                Ok(event) => {
+                    events.push(event);
+                    if events.len() >= self.batch_size {
+                        break;
+                    }
+                }
+                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+            }
+        }
+
+        Ok(events)
+    }
+
+    async fn spill_memory_events(&self, events: &[EventEnvelope]) -> Result<()> {
+        for event in events {
+            self.ingestor.spill().append(event).await?;
+        }
+        Ok(())
+    }
+
+    async fn spill_memory_queue(&self) -> Result<()> {
+        loop {
+            let events = self.drain_memory_batch().await?;
+            if events.is_empty() {
+                break;
+            }
+            self.spill_memory_events(&events).await?;
+        }
+        Ok(())
     }
 
     pub fn inserted_count(&self) -> u64 {
@@ -370,7 +476,7 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("LegacySpillBufferError"));
+            .contains("SPILL_BUFFER_INVALID_SCHEMA"));
     }
 
     #[tokio::test]
@@ -391,16 +497,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_event_writer_drains_disk_before_memory() {
+        let pool = lilium_test_fixtures::connect_test_db().await;
+        pool.with_session_context(|session| {
+            Box::pin(async move {
+                let mut session = session;
+                lilium_test_fixtures::init_event_service_db(&mut session).await;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
         let tmp = TempDir::new().unwrap();
         let spill = DiskSpillBuffer::new(tmp.path().join("ws_buffer_user_a.jsonl"));
-        let (ingestor, _rx) = EventIngestor::new("user_a".to_string(), 10, spill);
+        let (ingestor, rx) = EventIngestor::new("user_a".to_string(), 10, spill);
         let ingestor = Arc::new(ingestor);
 
         // Write events to disk
         ingestor.spill().append(&make_event(1)).await.unwrap();
         ingestor.spill().append(&make_event(2)).await.unwrap();
 
-        let writer = EventWriter::new(ingestor.clone(), 100);
+        let writer = EventWriter::new(pool.inner().clone(), ingestor.clone(), rx, 100);
         let count = writer.drain_once().await.unwrap();
         assert_eq!(count, 2); // Should drain disk first
     }

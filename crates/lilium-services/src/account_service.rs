@@ -1,18 +1,69 @@
-use anyhow::{bail, Result};
+use crate::Result;
 use chrono::Utc;
+use lilium_api_client::http::DzmmApi;
 use lilium_database::DbSessionContext;
 
+use lilium_common::LiliumError;
 use lilium_models::dzmm::account::DzmmAccount;
+use tracing::instrument;
 
 pub struct AccountService<'a> {
     session: DbSessionContext<'a>,
 }
 
 impl<'a> AccountService<'a> {
+    #[instrument(skip(session))]
     pub fn new(session: DbSessionContext<'a>) -> Self {
         Self { session }
     }
 
+    #[instrument(
+        skip(account),
+        fields(
+            user_id = %account.user_id,
+            has_email = account.email.is_some(),
+            has_password = account.password.is_some(),
+            has_signin_code = account.signin_code.is_some(),
+            has_signin_code_image = account.signin_code_image.is_some(),
+            has_cookies = account.cookies.is_some()
+        )
+    )]
+    pub fn create_auth_client(account: &DzmmAccount) -> Result<DzmmApi> {
+        DzmmApi::new(
+            account.email.clone(),
+            account.password.clone(),
+            account.signin_code.clone(),
+            account.signin_code_image.clone(),
+            account.signin_code_image_mime.clone(),
+            account.cookies.clone(),
+            Some(account.user_id.clone()),
+            true,
+            None,
+        )
+        .map_err(|e| LiliumError::service("ACCOUNT_AUTH_CLIENT_BUILD_FAILED", e.to_string()))
+    }
+
+    #[instrument(
+        skip(
+            self,
+            user_profile,
+            email,
+            password,
+            signin_code,
+            signin_code_image,
+            signin_code_image_mime,
+            cookies
+        ),
+        fields(
+            user_id = %user_id,
+            has_email = email.is_some(),
+            has_password = password.is_some(),
+            has_signin_code = signin_code.is_some(),
+            has_signin_code_image = signin_code_image.is_some(),
+            has_signin_code_image_mime = signin_code_image_mime.is_some(),
+            has_cookies = cookies.is_some()
+        )
+    )]
     pub async fn create_account(
         &mut self,
         user_id: &str,
@@ -26,27 +77,30 @@ impl<'a> AccountService<'a> {
     ) -> Result<DzmmAccount> {
         let existing = self.get_account(user_id).await?;
         if existing.is_some() {
-            bail!(lilium_common::error::LiliumError::domain_service(format!(
-                "Account with user_id '{}' already exists",
-                user_id
-            )));
+            return Err(LiliumError::domain_service_with_code(
+                "ACCOUNT_INVALID_REQUEST",
+                format!("Account with user_id '{}' already exists", user_id),
+            ));
         }
 
         if email.is_none() && signin_code.is_none() && signin_code_image.is_none() {
-            bail!(lilium_common::error::LiliumError::domain_service(
-                "Must provide either email/password, signin_code, or signin_code_image".to_string()
+            return Err(LiliumError::domain_service_with_code(
+                "ACCOUNT_INVALID_REQUEST",
+                "Must provide either email/password, signin_code, or signin_code_image".to_string(),
             ));
         }
 
         if email.is_some() && password.is_none() {
-            bail!(lilium_common::error::LiliumError::domain_service(
-                "Password required when email is provided".to_string()
+            return Err(LiliumError::domain_service_with_code(
+                "ACCOUNT_INVALID_REQUEST",
+                "Password required when email is provided".to_string(),
             ));
         }
 
         if signin_code_image.is_some() && signin_code_image_mime.is_none() {
-            bail!(lilium_common::error::LiliumError::domain_service(
-                "signin_code_image_mime required when signin_code_image is provided".to_string()
+            return Err(LiliumError::domain_service_with_code(
+                "ACCOUNT_INVALID_REQUEST",
+                "signin_code_image_mime required when signin_code_image is provided".to_string(),
             ));
         }
 
@@ -72,6 +126,7 @@ impl<'a> AccountService<'a> {
         Ok(account)
     }
 
+    #[instrument(skip(self), fields(user_id = %user_id))]
     pub async fn get_account(&mut self, user_id: &str) -> Result<Option<DzmmAccount>> {
         let account =
             sqlx::query_as::<_, DzmmAccount>("SELECT * FROM dzmm_account WHERE user_id = $1")
@@ -82,6 +137,7 @@ impl<'a> AccountService<'a> {
         Ok(account)
     }
 
+    #[instrument(skip(self), fields(enabled_only))]
     pub async fn list_accounts(&mut self, enabled_only: bool) -> Result<Vec<DzmmAccount>> {
         let accounts = if enabled_only {
             sqlx::query_as::<_, DzmmAccount>(
@@ -98,6 +154,7 @@ impl<'a> AccountService<'a> {
         Ok(accounts)
     }
 
+    #[instrument(skip(self, new_password), fields(user_id = %user_id))]
     pub async fn update_password(
         &mut self,
         user_id: &str,
@@ -106,17 +163,22 @@ impl<'a> AccountService<'a> {
         let account = self.get_account(user_id).await?;
         let account = match account {
             Some(a) => a,
-            None => bail!(lilium_common::error::LiliumError::domain_service(format!(
-                "Account '{}' not found",
-                user_id
-            ))),
+            None => {
+                return Err(LiliumError::domain_service_with_code(
+                    "ACCOUNT_INVALID_REQUEST",
+                    format!("Account '{}' not found", user_id),
+                ))
+            }
         };
 
         if account.email.is_none() {
-            bail!(lilium_common::error::LiliumError::domain_service(format!(
-                "Cannot update password for QR code signin account '{}'",
-                user_id
-            )));
+            return Err(LiliumError::domain_service_with_code(
+                "ACCOUNT_INVALID_REQUEST",
+                format!(
+                    "Cannot update password for QR code signin account '{}'",
+                    user_id
+                ),
+            ));
         }
 
         let now = Utc::now();
@@ -132,13 +194,14 @@ impl<'a> AccountService<'a> {
         Ok(updated)
     }
 
+    #[instrument(skip(self, cookies), fields(user_id = %user_id))]
     pub async fn update_cookies(&mut self, user_id: &str, cookies: &str) -> Result<()> {
         let account = self.get_account(user_id).await?;
         if account.is_none() {
-            bail!(lilium_common::error::LiliumError::domain_service(format!(
-                "Account '{}' not found",
-                user_id
-            )));
+            return Err(LiliumError::domain_service_with_code(
+                "ACCOUNT_INVALID_REQUEST",
+                format!("Account '{}' not found", user_id),
+            ));
         }
 
         let now = Utc::now();
@@ -152,6 +215,7 @@ impl<'a> AccountService<'a> {
         Ok(())
     }
 
+    #[instrument(skip(self, user_profile), fields(user_id = %user_id))]
     pub async fn update_user_profile(
         &mut self,
         user_id: &str,
@@ -159,10 +223,10 @@ impl<'a> AccountService<'a> {
     ) -> Result<DzmmAccount> {
         let account = self.get_account(user_id).await?;
         if account.is_none() {
-            bail!(lilium_common::error::LiliumError::domain_service(format!(
-                "Account '{}' not found",
-                user_id
-            )));
+            return Err(LiliumError::domain_service_with_code(
+                "ACCOUNT_INVALID_REQUEST",
+                format!("Account '{}' not found", user_id),
+            ));
         }
 
         let now = Utc::now();
@@ -178,13 +242,14 @@ impl<'a> AccountService<'a> {
         Ok(updated)
     }
 
+    #[instrument(skip(self), fields(user_id = %user_id))]
     pub async fn activate_account(&mut self, user_id: &str) -> Result<DzmmAccount> {
         let account = self.get_account(user_id).await?;
         if account.is_none() {
-            bail!(lilium_common::error::LiliumError::domain_service(format!(
-                "Account '{}' not found",
-                user_id
-            )));
+            return Err(LiliumError::domain_service_with_code(
+                "ACCOUNT_INVALID_REQUEST",
+                format!("Account '{}' not found", user_id),
+            ));
         }
 
         let now = Utc::now();
@@ -199,13 +264,14 @@ impl<'a> AccountService<'a> {
         Ok(updated)
     }
 
+    #[instrument(skip(self), fields(user_id = %user_id))]
     pub async fn deactivate_account(&mut self, user_id: &str) -> Result<DzmmAccount> {
         let account = self.get_account(user_id).await?;
         if account.is_none() {
-            bail!(lilium_common::error::LiliumError::domain_service(format!(
-                "Account '{}' not found",
-                user_id
-            )));
+            return Err(LiliumError::domain_service_with_code(
+                "ACCOUNT_INVALID_REQUEST",
+                format!("Account '{}' not found", user_id),
+            ));
         }
 
         let now = Utc::now();
@@ -220,13 +286,14 @@ impl<'a> AccountService<'a> {
         Ok(updated)
     }
 
+    #[instrument(skip(self), fields(user_id = %user_id))]
     pub async fn delete_account(&mut self, user_id: &str) -> Result<()> {
         let account = self.get_account(user_id).await?;
         if account.is_none() {
-            bail!(lilium_common::error::LiliumError::domain_service(format!(
-                "Account '{}' not found",
-                user_id
-            )));
+            return Err(LiliumError::domain_service_with_code(
+                "ACCOUNT_INVALID_REQUEST",
+                format!("Account '{}' not found", user_id),
+            ));
         }
 
         let has_active = sqlx::query_scalar::<_, bool>(
@@ -237,13 +304,13 @@ impl<'a> AccountService<'a> {
         .await?;
 
         if has_active {
-            bail!(lilium_common::error::LiliumError::service(
+            return Err(LiliumError::service(
                 "ACCOUNT_HAS_ACTIVE_CONNECTIONS",
                 format!(
                     "Cannot delete account '{}': Account has active WebSocket connections. \
                          Deactivate the account and wait for connections to close before deletion.",
                     user_id
-                )
+                ),
             ));
         }
 
@@ -255,6 +322,7 @@ impl<'a> AccountService<'a> {
         Ok(())
     }
 
+    #[instrument(skip(self))]
     pub async fn get_next_available_account(&mut self) -> Result<Option<DzmmAccount>> {
         let account = sqlx::query_as::<_, DzmmAccount>(
             "SELECT * FROM dzmm_account WHERE is_enabled = true ORDER BY created_at ASC LIMIT 1",
@@ -274,8 +342,8 @@ mod tests {
 
     #[tokio::test]
     async fn service_struct_can_be_created() {
-        lilium_database::test_fixtures::with_db_session(
-            lilium_database::test_fixtures::TestServiceFixture::Account,
+        lilium_test_fixtures::with_db_session(
+            lilium_test_fixtures::TestServiceFixture::Account,
             |session| {
                 Box::pin(async move {
                     let _svc = AccountService::new(session);
@@ -289,16 +357,20 @@ mod tests {
 
     #[tokio::test]
     async fn create_and_get_account_roundtrip() {
-        lilium_database::test_fixtures::with_db_session(
-            lilium_database::test_fixtures::TestServiceFixture::Account,
+        lilium_test_fixtures::with_db_session(
+            lilium_test_fixtures::TestServiceFixture::Account,
             |session| {
                 Box::pin(async move {
-                    let mut svc = AccountService::new(session);
+                    let mut session = session;
                     let user_id = format!(
                         "account_{}_{}",
                         Utc::now().timestamp_micros(),
                         std::process::id()
                     );
+                    lilium_test_fixtures::seed_test_users(&mut session, &[&user_id])
+                        .await
+                        .expect("seed account user");
+                    let mut svc = AccountService::new(session);
                     let profile = json!({"nickname": "test_account"});
                     let created = svc
                         .create_account(

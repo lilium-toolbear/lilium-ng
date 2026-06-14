@@ -1,10 +1,19 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
-use futures::StreamExt;
+use futures::{future::BoxFuture, StreamExt};
 use lilium_models::dzmm::message::Message;
 use lilium_models::ingestion::EventEnvelope;
-use tokio::sync::mpsc;
-use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tokio::sync::Notify;
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{
+        http::{header::COOKIE, Request},
+        Message as WsMessage,
+    },
+};
+use tracing::instrument;
 use tracing::{debug, error, info, warn};
 
 pub struct WebSocketEventDecoder;
@@ -119,22 +128,46 @@ impl WebSocketEventDecoder {
 pub struct WsClient {
     account_id: String,
     url: String,
+    cookie_header: Option<String>,
     session_id: Option<String>,
 }
 
 impl WsClient {
-    pub fn new(account_id: String, url: String) -> Self {
+    #[instrument(fields(account_id = %account_id, has_cookie_header = cookie_header.is_some()))]
+    pub fn new(account_id: String, url: String, cookie_header: Option<String>) -> Self {
         Self {
             account_id,
             url,
+            cookie_header,
             session_id: None,
         }
     }
 
-    pub async fn run(&mut self, sender: mpsc::Sender<EventEnvelope>) -> Result<()> {
+    fn build_request(&self) -> Result<Request<()>> {
+        let mut builder = Request::builder().uri(&self.url);
+        if let Some(cookie_header) = &self.cookie_header {
+            builder = builder.header(COOKIE, cookie_header);
+        }
+        builder
+            .body(())
+            .context("Failed to build WebSocket request")
+    }
+
+    #[instrument(skip(self, on_event, shutdown, shutdown_notify, reconnect_notify), fields(account_id = %self.account_id, url = %self.url))]
+    pub async fn run<F>(
+        &mut self,
+        mut on_event: F,
+        shutdown: Arc<AtomicBool>,
+        shutdown_notify: Arc<Notify>,
+        reconnect_notify: Arc<Notify>,
+    ) -> Result<()>
+    where
+        F: FnMut(EventEnvelope) -> BoxFuture<'static, ()> + Send,
+    {
         info!(account = %self.account_id, url = %self.url, "Connecting to WebSocket");
 
-        let (ws_stream, _) = connect_async(&self.url)
+        let request = self.build_request()?;
+        let (ws_stream, _) = connect_async(request)
             .await
             .context("Failed to connect to WebSocket")?;
 
@@ -142,57 +175,69 @@ impl WsClient {
 
         info!(account = %self.account_id, "WebSocket connected");
 
-        while let Some(msg) = read.next().await {
-            match msg {
-                Ok(WsMessage::Text(text)) => match self.handle_message(&text).await {
-                    Ok(Some(event)) => {
-                        if sender.send(event).await.is_err() {
-                            warn!(account = %self.account_id, "Event channel closed");
-                            break;
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        warn!(account = %self.account_id, error = %e, "Failed to handle message");
-                    }
-                },
-                Ok(WsMessage::Binary(data)) => {
-                    if let Ok(text) = String::from_utf8(data) {
-                        match self.handle_message(&text).await {
+        loop {
+            if shutdown.load(Ordering::Relaxed) {
+                info!(account = %self.account_id, "Shutdown requested");
+                break;
+            }
+
+            tokio::select! {
+                _ = shutdown_notify.notified() => {
+                    info!(account = %self.account_id, "WebSocket shutdown signalled");
+                    break;
+                }
+                _ = reconnect_notify.notified() => {
+                    info!(account = %self.account_id, "WebSocket reconnect requested");
+                    break;
+                }
+                msg = read.next() => {
+                    match msg {
+                        Some(Ok(WsMessage::Text(text))) => match self.handle_message(&text).await {
                             Ok(Some(event)) => {
-                                if sender.send(event).await.is_err() {
-                                    warn!(account = %self.account_id, "Event channel closed");
-                                    break;
-                                }
+                                on_event(event).await;
                             }
                             Ok(None) => {}
                             Err(e) => {
-                                warn!(account = %self.account_id, error = %e, "Failed to handle binary message");
+                                warn!(account = %self.account_id, error = %e, "Failed to handle message");
+                            }
+                        },
+                        Some(Ok(WsMessage::Binary(data))) => {
+                            if let Ok(text) = String::from_utf8(data) {
+                                match self.handle_message(&text).await {
+                                    Ok(Some(event)) => {
+                                        on_event(event).await;
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        warn!(account = %self.account_id, error = %e, "Failed to handle binary message");
+                                    }
+                                }
                             }
                         }
+                        Some(Ok(WsMessage::Ping(data))) => {
+                            debug!(account = %self.account_id, len = data.len(), "Received ping");
+                        }
+                        Some(Ok(WsMessage::Pong(_))) => {
+                            debug!(account = %self.account_id, "Received pong");
+                        }
+                        Some(Ok(WsMessage::Close(_))) => {
+                            info!(account = %self.account_id, "WebSocket closed");
+                            break;
+                        }
+                        Some(Err(e)) => {
+                            error!(account = %self.account_id, error = %e, "WebSocket error");
+                            break;
+                        }
+                        None => break,
+                        _ => {}
                     }
                 }
-                Ok(WsMessage::Ping(data)) => {
-                    debug!(account = %self.account_id, len = data.len(), "Received ping");
-                }
-                Ok(WsMessage::Pong(_)) => {
-                    debug!(account = %self.account_id, "Received pong");
-                }
-                Ok(WsMessage::Close(_)) => {
-                    info!(account = %self.account_id, "WebSocket closed");
-                    break;
-                }
-                Err(e) => {
-                    error!(account = %self.account_id, error = %e, "WebSocket error");
-                    break;
-                }
-                _ => {}
             }
         }
-
         Ok(())
     }
 
+    #[instrument(skip(self, raw), fields(account_id = %self.account_id, raw_len = raw.len()))]
     async fn handle_message(&mut self, raw: &str) -> Result<Option<EventEnvelope>> {
         let trimmed = raw.trim();
 
@@ -260,7 +305,7 @@ impl WsClient {
                                 payload: serde_json::to_value(&message)
                                     .unwrap_or(serde_json::Value::Null),
                                 received_at: Utc::now(),
-                                source: "websocket".to_string(),
+                                source: "socket".to_string(),
                             }));
                         }
                     }
@@ -270,7 +315,7 @@ impl WsClient {
                         event_type: event_name,
                         payload: decoded,
                         received_at: Utc::now(),
-                        source: "websocket".to_string(),
+                        source: "socket".to_string(),
                     }));
                 }
             }
@@ -285,7 +330,7 @@ impl WsClient {
                 event_type,
                 payload: val,
                 received_at: Utc::now(),
-                source: "websocket".to_string(),
+                source: "socket".to_string(),
             }));
         }
 

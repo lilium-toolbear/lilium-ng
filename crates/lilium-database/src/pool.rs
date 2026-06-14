@@ -1,12 +1,13 @@
 use anyhow::{Context, Result};
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{pool::PoolConnection, PgPool, Postgres};
 use std::borrow::Borrow;
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
+use tracing::instrument;
 
-pub type SessionFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + 'a>>;
+pub type SessionFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
 #[derive(Debug, Clone)]
 pub struct DbPool {
@@ -73,10 +74,12 @@ impl DbPool {
         }
     }
 
+    #[instrument(skip(url), fields(pool_size))]
     pub async fn connect_with_session(url: &str, pool_size: u32) -> Result<Self> {
         Self::connect(url, pool_size).await
     }
 
+    #[instrument(skip(url), fields(pool_size))]
     pub async fn connect(url: &str, pool_size: u32) -> Result<Self> {
         let normalized_url = Self::normalize_database_url(url);
         let pool = PgPoolOptions::new()
@@ -87,12 +90,24 @@ impl DbPool {
         Ok(Self { inner: pool })
     }
 
+    #[instrument(skip(options), fields(pool_size))]
+    pub async fn connect_with_options(options: PgConnectOptions, pool_size: u32) -> Result<Self> {
+        let pool = PgPoolOptions::new()
+            .max_connections(pool_size)
+            .connect_with(options)
+            .await
+            .with_context(|| "failed to connect database with explicit options")?;
+        Ok(Self { inner: pool })
+    }
+
+    #[instrument(fields(env_var = var_name, pool_size))]
     pub async fn connect_from_env(var_name: &str, pool_size: u32) -> Result<Self> {
         let db_url = std::env::var(var_name)
             .with_context(|| format!("required env var '{var_name}' is missing"))?;
         Self::connect(&db_url, pool_size).await
     }
 
+    #[instrument(skip(url))]
     pub async fn connect_lazy(url: &str) -> Result<Self> {
         let normalized_url = Self::normalize_database_url(url);
         let pool = PgPool::connect_lazy(&normalized_url)
@@ -100,14 +115,17 @@ impl DbPool {
         Ok(Self { inner: pool })
     }
 
-    pub async fn connect_for_tests(pool_size: u32) -> Result<Self> {
-        Self::connect_from_env("TEST_DATABASE_URL", pool_size).await
+    #[instrument(skip(options))]
+    pub async fn connect_lazy_with_options(options: PgConnectOptions) -> Result<Self> {
+        let pool = PgPoolOptions::new().connect_lazy_with(options);
+        Ok(Self { inner: pool })
     }
 
     pub fn inner(&self) -> &PgPool {
         &self.inner
     }
 
+    #[instrument(skip(self))]
     pub async fn begin_session(&self) -> Result<DbSession> {
         let mut conn = self
             .inner
@@ -137,6 +155,7 @@ impl DbPool {
         Ok(())
     }
 
+    #[instrument(skip(self, f))]
     pub async fn with_session<T, F>(&self, f: F) -> Result<T>
     where
         F: for<'a> FnOnce(&'a mut DbSession) -> SessionFuture<'a, T>,
@@ -155,6 +174,7 @@ impl DbPool {
         }
     }
 
+    #[instrument(skip(self, f))]
     pub async fn with_session_context<T, F>(&self, f: F) -> Result<T>
     where
         F: for<'a> FnOnce(DbSessionContext<'a>) -> SessionFuture<'a, T>,
@@ -176,6 +196,7 @@ impl DbPool {
         }
     }
 
+    #[instrument(skip(self, f))]
     pub async fn with_rollback_session<T, F>(&self, f: F) -> Result<T>
     where
         F: for<'a> FnOnce(&'a mut DbSession) -> SessionFuture<'a, T>,
@@ -194,6 +215,7 @@ impl DbPool {
         }
     }
 
+    #[instrument(skip(self, f))]
     pub async fn with_rollback_session_context<T, F>(&self, f: F) -> Result<T>
     where
         F: for<'a> FnOnce(DbSessionContext<'a>) -> SessionFuture<'a, T>,
@@ -215,6 +237,7 @@ impl DbPool {
         }
     }
 
+    #[instrument(skip(self, f))]
     pub async fn with_session_boxed<T, F>(&self, f: F) -> Result<T>
     where
         F: for<'a> FnOnce(&'a mut DbSession) -> SessionFuture<'a, T>,
@@ -222,6 +245,7 @@ impl DbPool {
         self.with_session(f).await
     }
 
+    #[instrument(skip(self, f))]
     pub async fn with_rollback_session_boxed<T, F>(&self, f: F) -> Result<T>
     where
         F: for<'a> FnOnce(&'a mut DbSession) -> SessionFuture<'a, T>,

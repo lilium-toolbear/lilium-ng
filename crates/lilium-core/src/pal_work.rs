@@ -1,6 +1,8 @@
 use crate::pal_work_constants::*;
 use std::collections::HashMap;
+use tracing::instrument;
 
+#[instrument(fields(level, suitability, matched, rarity))]
 pub fn calculate_efficiency(level: i32, suitability: i32, matched: bool, rarity: i32) -> f64 {
     let role_match = if matched {
         ROLE_MATCH_BONUS
@@ -13,23 +15,28 @@ pub fn calculate_efficiency(level: i32, suitability: i32, matched: bool, rarity:
         * role_match
 }
 
+#[instrument(fields(level))]
 pub fn calculate_exp_needed(level: i32) -> i64 {
     (PAL_EXP_BASE * (level as f64).powf(PAL_EXP_POWER)) as i64
 }
 
+#[instrument(fields(efficiency))]
 pub fn calculate_exp_gain_per_hour(efficiency: f64) -> f64 {
     efficiency * PAL_EXP_RATE
 }
 
+#[instrument(fields(food, level, role = %role))]
 pub fn calculate_turnip_consumption_per_hour(food: i32, level: i32, role: &str) -> f64 {
     food as f64 * (1.0 + CONSUMPTION_LEVEL_FACTOR * level as f64) * role_cost(role)
 }
 
+#[instrument(fields(role = %role, suitabilities_len = suitabilities.len()))]
 pub fn get_work_score(suitabilities: &HashMap<String, i32>, role: &str) -> i32 {
     let matching = role_suitabilities(role);
     matching.iter().filter_map(|t| suitabilities.get(*t)).sum()
 }
 
+#[instrument(fields(role = %role, suitabilities_len = suitabilities.len()))]
 pub fn is_role_matched(suitabilities: &HashMap<String, i32>, role: &str) -> bool {
     let matching = role_suitabilities(role);
     matching

@@ -13,6 +13,7 @@ use reqwest::{
 };
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
+use tracing::instrument;
 use tracing::{debug, error, info, warn};
 
 const BASE_URL: &str = "https://www.dzmm.ai";
@@ -486,6 +487,18 @@ pub struct DzmmApi {
 }
 
 impl DzmmApi {
+    #[instrument(
+        skip(
+            email,
+            password,
+            signin_code,
+            signin_code_image,
+            signin_code_image_mime,
+            cookies,
+            on_cookies_refreshed
+        ),
+        fields(user_id = ?user_id.as_deref(), auto_refresh)
+    )]
     pub fn new(
         email: Option<String>,
         password: Option<String>,
@@ -536,6 +549,7 @@ impl DzmmApi {
         })
     }
 
+    #[instrument(skip(self))]
     pub async fn get_cookie_string(&self) -> String {
         let map = self.cookie_map.lock().await;
         let mut pairs: Vec<String> = map.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
@@ -564,12 +578,14 @@ impl DzmmApi {
         }
     }
 
+    #[instrument(skip(self))]
     pub async fn authenticate(&self) -> Result<()> {
         info!("Authenticating...");
         self.get_my_info(false).await?;
         Ok(())
     }
 
+    #[instrument(skip(self))]
     pub async fn refresh_cookies(&self) -> Result<bool> {
         let _guard = self.refresh_lock.lock().await;
         info!("Refreshing authentication cookies...");
@@ -632,6 +648,7 @@ impl DzmmApi {
         Ok(false)
     }
 
+    #[instrument(skip(self, email, password))]
     pub async fn login_with_email_password(&self, email: &str, password: &str) -> Result<bool> {
         info!("Logging in with email and password...");
 
@@ -692,6 +709,7 @@ impl DzmmApi {
         Ok(true)
     }
 
+    #[instrument(skip(self, encrypted_token), fields(token_len = encrypted_token.len()))]
     pub async fn login_with_qr_code(&self, encrypted_token: &str) -> Result<bool> {
         info!("Logging in with QR code token...");
 
@@ -725,6 +743,7 @@ impl DzmmApi {
         Ok(false)
     }
 
+    #[instrument(skip(self, image, mime_type), fields(image_len = image.len(), mime_type = %mime_type))]
     pub async fn login_with_qr_image(&self, image: &[u8], mime_type: &str) -> Result<bool> {
         info!("Logging in with QR code image (server-side scan)...");
 
@@ -838,6 +857,10 @@ impl DzmmApi {
         Some(pairs.join("; "))
     }
 
+    #[instrument(
+        skip(self, query, json_body, multipart_form, extra_headers, timeout),
+        fields(method = ?method, endpoint = %endpoint, user_id = ?self.user_id.as_deref())
+    )]
     async fn _request_inner(
         &self,
         method: Method,
@@ -885,6 +908,7 @@ impl DzmmApi {
         Ok((status, body_bytes.to_vec(), resp_headers))
     }
 
+    #[instrument(skip(self, query, json_body, multipart_form, extra_headers, timeout), fields(method = ?method, endpoint = %endpoint))]
     async fn _request(
         &self,
         method: Method,
@@ -959,6 +983,7 @@ impl DzmmApi {
         }
     }
 
+    #[instrument(skip(self), fields(retried))]
     pub async fn get_my_info(&self, retried: bool) -> Result<Value> {
         let input_data = json!({"0": {"json": Value::Null}});
         let response = self
@@ -989,6 +1014,7 @@ impl DzmmApi {
         Ok(parsed)
     }
 
+    #[instrument(skip(self), fields(user_id = %user_id, room_id = %room_id))]
     pub async fn get_user_info(&self, user_id: &str, room_id: &str) -> Result<Value> {
         let input_data = json!({"0": {"json": {"userId": user_id, "chatroomId": room_id}}});
         let response = self
@@ -1015,6 +1041,7 @@ impl DzmmApi {
         Ok(Value::Object(serde_json::Map::new()))
     }
 
+    #[instrument(skip(self), fields(user_id = %user_id))]
     pub async fn get_public_user_profile(&self, user_id: &str) -> Result<Value> {
         let input_data = json!({"0": {"json": {"userid": user_id}}});
         let response = self
@@ -1083,6 +1110,7 @@ impl DzmmApi {
         Ok(Value::Object(data))
     }
 
+    #[instrument(skip(self, user_room_pairs), fields(pair_count = user_room_pairs.len()))]
     pub async fn batch_get_user_info(
         &self,
         user_room_pairs: &[(String, String)],
@@ -1134,6 +1162,7 @@ impl DzmmApi {
         Ok(results)
     }
 
+    #[instrument(skip(self), fields(room_id = %room_id))]
     pub async fn get_room_info(&self, room_id: &str) -> Result<Option<Value>> {
         let input_data = json!({"0": {"json": {"chatroomId": room_id}}});
         let response = self
@@ -1168,6 +1197,7 @@ impl DzmmApi {
         }
     }
 
+    #[instrument(skip(self, invite_code), fields(invite_code_len = invite_code.len()))]
     pub async fn preview_invite(&self, invite_code: &str) -> Result<Value> {
         let input_data = json!({"0": {"json": {"code": invite_code}}});
         let response = self
@@ -1190,6 +1220,7 @@ impl DzmmApi {
         bail!("Invalid tRPC response for preview_invite: {}", response);
     }
 
+    #[instrument(skip(self, invite_code), fields(invite_code_len = invite_code.len()))]
     pub async fn join_room_by_invite(&self, invite_code: &str) -> Result<Value> {
         let body = json!({"0": {"json": {"inviteCode": invite_code, "gender": "male"}}});
         let response = self
@@ -1215,6 +1246,7 @@ impl DzmmApi {
         );
     }
 
+    #[instrument(skip(self, tags), fields(title = %title, is_public, tag_count = tags.map(|t| t.len()).unwrap_or(0)))]
     pub async fn create_group_chat(
         &self,
         title: &str,
@@ -1265,6 +1297,7 @@ impl DzmmApi {
         Ok(response)
     }
 
+    #[instrument(skip(self), fields(chatroom_id = %chatroom_id))]
     pub async fn generate_invite(&self, chatroom_id: &str) -> Result<String> {
         let payload = json!({"0": {"json": {"chatroomId": chatroom_id}}});
         let result = self
@@ -1287,6 +1320,7 @@ impl DzmmApi {
             .to_string())
     }
 
+    #[instrument(skip(self), fields(chatroom_id = %chatroom_id, member_id = %member_id))]
     pub async fn remove_group_member(&self, chatroom_id: &str, member_id: &str) -> Result<()> {
         let payload = json!({"0": {"json": {"chatroomId": chatroom_id, "memberId": member_id}}});
         self._request(
@@ -1302,6 +1336,7 @@ impl DzmmApi {
         Ok(())
     }
 
+    #[instrument(skip(self), fields(chatroom_id = %chatroom_id, target_user_id = %target_user_id))]
     pub async fn set_group_admin(&self, chatroom_id: &str, target_user_id: &str) -> Result<()> {
         let payload =
             json!({"0": {"json": {"chatroomId": chatroom_id, "targetUserId": target_user_id}}});
@@ -1318,6 +1353,7 @@ impl DzmmApi {
         Ok(())
     }
 
+    #[instrument(skip(self, image_data), fields(chatroom_id = %chatroom_id, filename = %filename, content_type = %content_type, image_len = image_data.len()))]
     pub async fn update_room_avatar(
         &self,
         chatroom_id: &str,
@@ -1352,6 +1388,7 @@ impl DzmmApi {
         Ok(())
     }
 
+    #[instrument(skip(self), fields(chatroom_id = %chatroom_id, title = %title))]
     pub async fn rename_room(&self, chatroom_id: &str, title: &str) -> Result<()> {
         let body = json!({"json": {"chatroomId": chatroom_id, "title": title}});
         self._request(
@@ -1367,6 +1404,7 @@ impl DzmmApi {
         Ok(())
     }
 
+    #[instrument(skip(self, resource_id), fields(share_type = share_type.unwrap_or("group_invite")))]
     pub async fn get_share_resource_preview(
         &self,
         resource_id: &str,
@@ -1402,6 +1440,7 @@ impl DzmmApi {
         }
     }
 
+    #[instrument(skip(self))]
     pub async fn send_heartbeat(&self) -> Result<bool> {
         match self
             ._request(

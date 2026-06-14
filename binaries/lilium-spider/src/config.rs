@@ -1,53 +1,104 @@
-use anyhow::Result;
-use serde::Deserialize;
+use anyhow::{Context, Result};
+use lilium_api_client::config::ApiClientConfig;
+use std::path::PathBuf;
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Clone)]
 pub struct Config {
     pub database: DatabaseConfig,
     pub worker: WorkerConfig,
-    pub processor: ProcessorConfig,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Clone)]
 pub struct DatabaseConfig {
-    pub url: String,
-    #[serde(default = "default_pool_size")]
     pub pool_size: u32,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Clone)]
 pub struct WorkerConfig {
-    #[serde(default = "default_queue_size")]
     pub queue_size: usize,
-    #[serde(default = "default_batch_size")]
     pub batch_size: usize,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct ProcessorConfig {
-    #[serde(default = "default_polling_interval")]
-    pub polling_interval_secs: u64,
-    #[serde(default = "default_batch_size")]
-    pub batch_size: usize,
+    pub buffer_dir: PathBuf,
+    pub runtime_dir: PathBuf,
+    pub websocket_url: String,
+    pub reconnect_delay_ms: u64,
 }
 
 fn default_pool_size() -> u32 {
     5
 }
+
 fn default_queue_size() -> usize {
-    5000
+    5_000
 }
-fn default_batch_size() -> usize {
-    100
+
+fn default_buffer_dir() -> PathBuf {
+    PathBuf::from("data/event/buffer")
 }
-fn default_polling_interval() -> u64 {
-    5
+
+fn default_runtime_dir() -> PathBuf {
+    PathBuf::from("runtime/spider")
+}
+
+fn default_ws_url() -> String {
+    ApiClientConfig::default().ws_url
+}
+
+fn default_reconnect_delay_ms() -> u64 {
+    5_000
+}
+
+fn env_string(name: &str, default: String) -> String {
+    std::env::var(name).unwrap_or(default)
+}
+
+fn env_usize(name: &str, default: usize) -> Result<usize> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse::<usize>()
+            .with_context(|| format!("failed to parse {name} as usize")),
+        Err(_) => Ok(default),
+    }
+}
+
+fn env_u32(name: &str, default: u32) -> Result<u32> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse::<u32>()
+            .with_context(|| format!("failed to parse {name} as u32")),
+        Err(_) => Ok(default),
+    }
+}
+
+fn env_u64(name: &str, default: u64) -> Result<u64> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse::<u64>()
+            .with_context(|| format!("failed to parse {name} as u64")),
+        Err(_) => Ok(default),
+    }
+}
+
+fn env_path(name: &str, default: PathBuf) -> PathBuf {
+    std::env::var(name).map(PathBuf::from).unwrap_or(default)
 }
 
 impl Config {
-    pub fn load(path: &str) -> Result<Self> {
-        let content = std::fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&content)?;
-        Ok(config)
+    pub fn load() -> Result<Self> {
+        Ok(Self {
+            database: DatabaseConfig {
+                pool_size: env_u32("DATABASE_POOL_SIZE", default_pool_size())?,
+            },
+            worker: WorkerConfig {
+                queue_size: env_usize("SPIDER_QUEUE_SIZE", default_queue_size())?,
+                batch_size: env_usize("SPIDER_BATCH_SIZE", 100)?,
+                buffer_dir: env_path("SPIDER_BUFFER_DIR", default_buffer_dir()),
+                runtime_dir: env_path("SPIDER_RUNTIME_DIR", default_runtime_dir()),
+                websocket_url: env_string("SPIDER_WEBSOCKET_URL", default_ws_url()),
+                reconnect_delay_ms: env_u64(
+                    "SPIDER_RECONNECT_DELAY_MS",
+                    default_reconnect_delay_ms(),
+                )?,
+            },
+        })
     }
 }

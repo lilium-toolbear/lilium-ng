@@ -8,5 +8,4 @@ pub mod room_member;
 pub mod user;
 pub mod websocket_connection_service;
 
-#[cfg(test)]
-pub use lilium_database::test_fixtures;
+pub type Result<T> = std::result::Result<T, lilium_common::LiliumError>;

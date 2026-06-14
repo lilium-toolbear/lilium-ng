@@ -40,7 +40,7 @@ binaries/
 | HTTP | reqwest |
 | Web | axum |
 | 序列化 | serde + serde_json |
-| 配置 | toml + dotenvy |
+| 配置 | dotenvy + 环境变量 |
 | 日志 | tracing |
 | CLI | clap |
 
@@ -62,5 +62,8 @@ cargo run --bin lilium-bot
 
 ## 文档
 
-- [设计文档](DESIGN.md)
-- [实现计划](PLAN.md)
+- [交接文档](docs/HANDOFF.md)
+- [测试迁移目标](docs/TEST_MIGRATION_GOAL.md)
+- [Rust 代码审计最新状态](docs/rust-code-audit.md)
+- [Python 入口点 parity 审计](docs/python-parity-entrypoint-audit.md)
+- [Python 代码库逐文件分析](docs/python-analysis/README.md)

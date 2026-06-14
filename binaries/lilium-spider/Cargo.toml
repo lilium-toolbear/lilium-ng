@@ -11,16 +11,18 @@ path = "src/main.rs"
 lilium-common.workspace = true
 lilium-models.workspace = true
 lilium-database.workspace = true
+lilium-api-client.workspace = true
 lilium-core.workspace = true
 lilium-services.workspace = true
 tokio.workspace = true
 sqlx.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-toml.workspace = true
+dotenvy.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-clap.workspace = true
+sentry.workspace = true
+sentry-tracing.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 rand.workspace = true
@@ -28,3 +30,4 @@ rand.workspace = true
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
+lilium-test-fixtures.workspace = true

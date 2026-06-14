@@ -1,4 +1,17 @@
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+pub fn runtime_path_id(account_user_id: &str) -> String {
+    account_user_id.to_string()
+}
+
+pub fn arbiter_socket_path(runtime_dir: &Path) -> PathBuf {
+    runtime_dir.join("arbiter.sock")
+}
+
+pub fn worker_socket_path(runtime_dir: &Path, account_user_id: &str) -> PathBuf {
+    runtime_dir.join(format!("worker-{}.sock", runtime_path_id(account_user_id)))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -78,6 +91,11 @@ impl ControlCommand {
             .to_string();
 
         let data = payload.get("data").cloned();
+        if let Some(ref value) = data {
+            if !value.is_object() {
+                return Err("Control command data must be a JSON object".to_string());
+            }
+        }
 
         Ok(Self {
             action,
@@ -107,6 +125,51 @@ pub fn validate_account_user_id(account_user_id: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+pub fn remove_stale_or_refuse_unix_socket(socket_path: &Path) -> bool {
+    if !socket_path.exists() {
+        return true;
+    }
+
+    match std::os::unix::net::UnixStream::connect(socket_path) {
+        Ok(_) => false,
+        Err(_) => std::fs::remove_file(socket_path).is_ok() || !socket_path.exists(),
+    }
+}
+
+pub async fn bind_unix_control_socket(
+    socket_path: &Path,
+) -> Result<(tokio::net::UnixListener, UnixSocketIdentity), std::io::Error> {
+    if let Some(parent) = socket_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    if socket_path.exists() && !remove_stale_or_refuse_unix_socket(socket_path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            format!(
+                "control socket is already active: {}",
+                socket_path.display()
+            ),
+        ));
+    }
+
+    let listener = tokio::net::UnixListener::bind(socket_path)?;
+    let metadata = std::fs::metadata(socket_path)?;
+    let identity = UnixSocketIdentity::from_metadata(&metadata);
+    Ok((listener, identity))
+}
+
+pub fn unlink_bound_unix_socket(socket_path: &Path, identity: UnixSocketIdentity) {
+    let Ok(metadata) = std::fs::metadata(socket_path) else {
+        return;
+    };
+
+    let current = UnixSocketIdentity::from_metadata(&metadata);
+    if current.dev == identity.dev && current.ino == identity.ino {
+        let _ = std::fs::remove_file(socket_path);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
