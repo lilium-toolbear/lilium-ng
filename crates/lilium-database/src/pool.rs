@@ -70,20 +70,21 @@ impl<'a> DerefMut for DbSessionContext<'a> {
     }
 }
 
+pub(crate) fn normalize_database_url(url: &str) -> String {
+    let url = url.trim();
+    if let Some(rest) = url.strip_prefix("postgresql://") {
+        format!("postgres://{rest}")
+    } else {
+        url.to_string()
+    }
+}
+
 impl DbPool {
     pub(crate) fn from_pg_pool(inner: PgPool) -> Self {
         Self { inner }
     }
 
-    fn normalize_database_url(url: &str) -> String {
-        let url = url.trim();
-        if let Some(rest) = url.strip_prefix("postgresql://") {
-            format!("postgres://{rest}")
-        } else {
-            url.to_string()
-        }
-    }
-
+    #[deprecated(note = "compatibility shim; migrate callers to Database::transaction and remove after session API migration")]
     #[instrument(skip(url), fields(pool_size))]
     pub async fn connect_with_session(url: &str, pool_size: u32) -> Result<Self> {
         Self::connect(url, pool_size).await
@@ -91,7 +92,7 @@ impl DbPool {
 
     #[instrument(skip(url), fields(pool_size))]
     pub async fn connect(url: &str, pool_size: u32) -> Result<Self> {
-        let normalized_url = Self::normalize_database_url(url);
+        let normalized_url = normalize_database_url(url);
         let pool = PgPoolOptions::new()
             .max_connections(pool_size)
             .connect(&normalized_url)
@@ -119,7 +120,7 @@ impl DbPool {
 
     #[instrument(skip(url))]
     pub async fn connect_lazy(url: &str) -> Result<Self> {
-        let normalized_url = Self::normalize_database_url(url);
+        let normalized_url = normalize_database_url(url);
         let pool = PgPool::connect_lazy(&normalized_url)
             .with_context(|| "failed to create lazy database pool")?;
         Ok(Self { inner: pool })
@@ -233,6 +234,7 @@ impl DbPool {
         self.run_session_context(SessionFinish::Rollback, f).await
     }
 
+    #[deprecated(note = "compatibility shim; migrate callers to Database::transaction and remove after session API migration")]
     #[instrument(skip(self, f))]
     pub async fn with_session_boxed<T, F>(&self, f: F) -> Result<T>
     where
@@ -241,6 +243,7 @@ impl DbPool {
         self.with_session(f).await
     }
 
+    #[deprecated(note = "compatibility shim; migrate callers to Database::transaction and remove after session API migration")]
     #[instrument(skip(self, f))]
     pub async fn with_rollback_session_boxed<T, F>(&self, f: F) -> Result<T>
     where
