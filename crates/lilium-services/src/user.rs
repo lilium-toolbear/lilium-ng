@@ -298,8 +298,6 @@ mod tests {
     use super::*;
 
     mod user_struct {
-        use super::*;
-
         #[test]
         fn test_user() {
             let user = lilium_models::dzmm::user::User {

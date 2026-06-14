@@ -85,7 +85,9 @@ fn build_query_parts(filters: &MessageFilters, include_visible_only: bool) -> Qu
         ));
         p.params.push(BindVal::Text(v.clone()));
     } else if filters.user_or_account_id.is_some() {
-        let id = filters.user_or_account_id.as_ref().unwrap();
+        let Some(id) = filters.user_or_account_id.as_ref() else {
+            unreachable!("checked is_some above")
+        };
         needs_room_join = true;
         p.joins
             .push_str(" LEFT JOIN rooms r ON m.room_id = r.room_id");
@@ -175,21 +177,18 @@ fn build_query_parts(filters: &MessageFilters, include_visible_only: bool) -> Qu
 
     if let Some(v) = filters.has_attachment {
         if v {
-            p.conditions
-                .push_str(&" AND m.attachment_file IS NOT NULL".to_string());
+            p.conditions.push_str(" AND m.attachment_file IS NOT NULL");
         } else {
-            p.conditions
-                .push_str(&" AND m.attachment_file IS NULL".to_string());
+            p.conditions.push_str(" AND m.attachment_file IS NULL");
         }
     }
 
     if let Some(v) = filters.has_reference {
         if v {
             p.conditions
-                .push_str(&" AND m.reference_message_id IS NOT NULL".to_string());
+                .push_str(" AND m.reference_message_id IS NOT NULL");
         } else {
-            p.conditions
-                .push_str(&" AND m.reference_message_id IS NULL".to_string());
+            p.conditions.push_str(" AND m.reference_message_id IS NULL");
         }
     }
 
@@ -461,7 +460,7 @@ impl<'a> MessageService<'a> {
                         " AND ((m.sent_at, m.created_at, m.message_id) {cmp} (${p1}, ${p2}, ${p3}))"
                     ));
                 }
-                (Cursor::TwoPart(..), _) | _ => {
+                _ => {
                     let p1 = param_idx;
                     param_idx += 1;
                     let p2 = param_idx;

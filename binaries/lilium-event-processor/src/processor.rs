@@ -216,8 +216,7 @@ impl EventProcessor {
         Self::sync_users(session, &user_fetch_collector).await?;
         Self::sync_media(session, &media_message_ids).await?;
 
-        let mut offset_svc =
-            EventProcessorOffsetService::new(DbSessionContext::new(session));
+        let mut offset_svc = EventProcessorOffsetService::new(DbSessionContext::new(session));
         offset_svc
             .update_offset(&processor_id, last_id, last_timestamp, Some(Utc::now()))
             .await?;
@@ -231,8 +230,7 @@ impl EventProcessor {
         last_id: i64,
         last_timestamp: Option<DateTime<Utc>>,
     ) -> Result<()> {
-        let mut offset_svc =
-            EventProcessorOffsetService::new(DbSessionContext::new(session));
+        let mut offset_svc = EventProcessorOffsetService::new(DbSessionContext::new(session));
         offset_svc
             .update_offset(&processor_id, last_id, last_timestamp, Some(Utc::now()))
             .await?;
@@ -243,8 +241,7 @@ impl EventProcessor {
         session: &mut DbSessionContext<'_>,
         processor_id: String,
     ) -> Result<(i64, Option<DateTime<Utc>>)> {
-        let mut offset_svc =
-            EventProcessorOffsetService::new(DbSessionContext::new(session));
+        let mut offset_svc = EventProcessorOffsetService::new(DbSessionContext::new(session));
         let cursor = offset_svc.get_cursor(&processor_id).await?;
         Ok(cursor
             .map(|c| (c.last_processed_id, c.last_processed_timestamp))
@@ -384,10 +381,4 @@ impl EventProcessor {
             _ => Ok(None),
         }
     }
-}
-
-#[derive(Debug)]
-pub struct CursorPosition {
-    pub last_processed_id: i64,
-    pub last_processed_timestamp: Option<DateTime<Utc>>,
 }

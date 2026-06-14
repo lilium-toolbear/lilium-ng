@@ -14,14 +14,14 @@ struct Subscriber {
 }
 
 pub struct NotificationService<'a> {
-    session: DbSessionContext<'a>,
+    _session: DbSessionContext<'a>,
     subscribers: Arc<RwLock<Vec<Subscriber>>>,
 }
 
 impl<'a> NotificationService<'a> {
     pub fn new(session: DbSessionContext<'a>) -> Self {
         Self {
-            session,
+            _session: session,
             subscribers: Arc::new(RwLock::new(Vec::new())),
         }
     }

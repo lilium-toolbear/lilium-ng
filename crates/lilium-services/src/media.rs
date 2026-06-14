@@ -1,6 +1,6 @@
 use anyhow::Result;
 use lilium_database::DbSessionContext;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
@@ -63,9 +63,6 @@ impl<'a> MediaService<'a> {
         for (message_id, attachment_url, ext) in to_download {
             let permit = semaphore.clone().acquire_owned().await?;
             let data_path = self.data_path.clone();
-            let message_id = message_id;
-            let attachment_url = attachment_url;
-            let ext = ext;
 
             let handle = tokio::spawn(async move {
                 let result =
@@ -137,7 +134,7 @@ impl<'a> MediaService<'a> {
         message_id: &str,
         attachment_url: &str,
         ext: &str,
-        data_path: &PathBuf,
+        data_path: &Path,
     ) -> Result<String> {
         let media_dir = data_path.join("media").join(message_id);
         tokio::fs::create_dir_all(&media_dir).await?;
