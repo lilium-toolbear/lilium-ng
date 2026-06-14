@@ -15,7 +15,6 @@ serde_json.workspace = true
 rust_decimal.workspace = true
 dotenvy.workspace = true
 sea-orm.workspace = true
-sea-orm-migration.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
