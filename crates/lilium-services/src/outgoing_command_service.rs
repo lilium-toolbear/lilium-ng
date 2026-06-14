@@ -1,8 +1,9 @@
-use anyhow::Result;
+use crate::Result;
 use chrono::{Duration, Utc};
 use lilium_database::DbSessionContext;
 
 use lilium_models::dzmm::outgoing_command::{status, OutgoingCommand};
+use tracing::instrument;
 
 const STANDARD_MAX_ATTEMPTS: i32 = 3;
 const MESSAGE_SEND_RATE_LIMIT_MAX_ATTEMPTS: i32 = 6;
@@ -21,10 +22,12 @@ pub struct OutgoingCommandService<'a> {
 }
 
 impl<'a> OutgoingCommandService<'a> {
+    #[instrument(skip(session))]
     pub fn new(session: DbSessionContext<'a>) -> Self {
         Self { session }
     }
 
+    #[instrument(fields(event = %event))]
     pub(crate) fn default_max_attempts_for_event(event: &str) -> i32 {
         if event == "message:send" {
             MESSAGE_SEND_RATE_LIMIT_MAX_ATTEMPTS
@@ -33,6 +36,7 @@ impl<'a> OutgoingCommandService<'a> {
         }
     }
 
+    #[instrument(fields(has_error = error_message.is_some()))]
     pub(crate) fn is_rate_limited_error(error_message: Option<&str>) -> bool {
         let msg = match error_message {
             Some(m) => m,
@@ -44,11 +48,13 @@ impl<'a> OutgoingCommandService<'a> {
             .any(|marker| normalized.contains(marker))
     }
 
+    #[instrument(skip(command), fields(event = %command.event))]
     pub(crate) fn is_rate_limited_message_send(command: &OutgoingCommand) -> bool {
         command.event == "message:send"
             && Self::is_rate_limited_error(command.error_message.as_deref())
     }
 
+    #[instrument(skip(command), fields(command_id = command.id))]
     pub(crate) fn rate_limited_retry_not_before(
         command: &OutgoingCommand,
     ) -> chrono::DateTime<Utc> {
@@ -59,6 +65,7 @@ impl<'a> OutgoingCommandService<'a> {
         command.created_at + Duration::seconds(total_delay)
     }
 
+    #[instrument(skip(command), fields(command_id = command.id, now = %now))]
     pub(crate) fn is_ready_for_processing(
         command: &OutgoingCommand,
         now: chrono::DateTime<Utc>,
@@ -72,6 +79,7 @@ impl<'a> OutgoingCommandService<'a> {
         Self::rate_limited_retry_not_before(command) <= now
     }
 
+    #[instrument(skip(self, data), fields(account_user_id = %account_user_id, event = %event, require_ack, has_max_attempts = max_attempts.is_some()))]
     pub async fn create_command(
         &mut self,
         account_user_id: &str,
@@ -101,6 +109,7 @@ impl<'a> OutgoingCommandService<'a> {
         Ok(command)
     }
 
+    #[instrument(skip(self), fields(account_user_id = %account_user_id, limit))]
     pub async fn get_pending_commands(
         &mut self,
         account_user_id: &str,
@@ -129,6 +138,7 @@ impl<'a> OutgoingCommandService<'a> {
         Ok(ready_commands)
     }
 
+    #[instrument(skip(self), fields(command_id))]
     pub async fn get_command(&mut self, command_id: i32) -> Result<Option<OutgoingCommand>> {
         let command =
             sqlx::query_as::<_, OutgoingCommand>("SELECT * FROM outgoing_commands WHERE id = $1")
@@ -139,6 +149,7 @@ impl<'a> OutgoingCommandService<'a> {
         Ok(command)
     }
 
+    #[instrument(skip(self), fields(command_id))]
     pub async fn mark_processing(&mut self, command_id: i32) -> Result<()> {
         sqlx::query(
             "UPDATE outgoing_commands SET status = $1, attempt_count = attempt_count + 1 WHERE id = $2",
@@ -150,6 +161,7 @@ impl<'a> OutgoingCommandService<'a> {
         Ok(())
     }
 
+    #[instrument(skip(self, ack_response), fields(command_id))]
     pub async fn mark_success(
         &mut self,
         command_id: i32,
@@ -167,6 +179,7 @@ impl<'a> OutgoingCommandService<'a> {
         Ok(())
     }
 
+    #[instrument(skip(self, error_message), fields(command_id))]
     pub async fn mark_failed(&mut self, command_id: i32, error_message: &str) -> Result<()> {
         sqlx::query(
             "UPDATE outgoing_commands SET status = $1, processed_at = $2, error_message = $3 WHERE id = $4",
@@ -180,6 +193,7 @@ impl<'a> OutgoingCommandService<'a> {
         Ok(())
     }
 
+    #[instrument(skip(self), fields(command_id))]
     pub async fn mark_timeout(&mut self, command_id: i32) -> Result<()> {
         sqlx::query(
             "UPDATE outgoing_commands SET status = $1, processed_at = $2, error_message = $3 WHERE id = $4",
@@ -193,6 +207,7 @@ impl<'a> OutgoingCommandService<'a> {
         Ok(())
     }
 
+    #[instrument(skip(self, error_message), fields(command_id))]
     pub async fn retry_or_fail(&mut self, command_id: i32, error_message: &str) -> Result<bool> {
         let command = match self.get_command(command_id).await? {
             Some(c) => c,
@@ -242,10 +257,12 @@ impl<'a> OutgoingCommandService<'a> {
         }
     }
 
+    #[instrument(skip(self), fields(command_id))]
     pub async fn get_command_result(&mut self, command_id: i32) -> Result<Option<OutgoingCommand>> {
         self.get_command(command_id).await
     }
 
+    #[instrument(skip(self), fields(cutoff = %cutoff))]
     pub async fn prune_processed_before(&mut self, cutoff: chrono::DateTime<Utc>) -> Result<i64> {
         let result = sqlx::query(
             "DELETE FROM outgoing_commands WHERE status = ANY($1) AND processed_at IS NOT NULL AND processed_at <= $2",
@@ -516,8 +533,8 @@ mod tests {
 
         #[tokio::test]
         async fn test_create_command_defaults() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::OutgoingCommand,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);
@@ -547,8 +564,8 @@ mod tests {
 
         #[tokio::test]
         async fn test_create_command_non_message_send_uses_standard_retry_budget() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::OutgoingCommand,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);
@@ -573,8 +590,8 @@ mod tests {
 
         #[tokio::test]
         async fn test_create_command_custom_params() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::OutgoingCommand,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);
@@ -600,8 +617,8 @@ mod tests {
 
         #[tokio::test]
         async fn test_create_command_returns_with_id() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::OutgoingCommand,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);
@@ -626,8 +643,8 @@ mod tests {
 
         #[tokio::test]
         async fn test_create_multiple_commands_increments_id() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::OutgoingCommand,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);
@@ -677,8 +694,8 @@ mod tests {
 
         #[tokio::test]
         async fn test_get_pending_commands_fifo_order() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::OutgoingCommand,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);
@@ -727,8 +744,8 @@ mod tests {
 
         #[tokio::test]
         async fn test_get_pending_commands_filters_by_account() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::OutgoingCommand,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);
@@ -758,8 +775,8 @@ mod tests {
 
         #[tokio::test]
         async fn test_get_pending_commands_respects_limit() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::OutgoingCommand,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);
@@ -787,8 +804,8 @@ mod tests {
 
         #[tokio::test]
         async fn test_get_pending_commands_empty() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::OutgoingCommand,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);
@@ -811,8 +828,8 @@ mod tests {
 
         #[tokio::test]
         async fn test_get_command_missing() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::OutgoingCommand,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);
@@ -832,8 +849,8 @@ mod tests {
 
         #[tokio::test]
         async fn test_mark_processing_nonexistent_command() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::OutgoingCommand,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);
@@ -852,8 +869,8 @@ mod tests {
 
         #[tokio::test]
         async fn test_mark_success_nonexistent_command() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::OutgoingCommand,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);
@@ -872,8 +889,8 @@ mod tests {
 
         #[tokio::test]
         async fn test_mark_failed_nonexistent_command() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::OutgoingCommand,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);
@@ -892,8 +909,8 @@ mod tests {
 
         #[tokio::test]
         async fn test_mark_timeout_nonexistent_command() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::OutgoingCommand,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);
@@ -912,8 +929,8 @@ mod tests {
 
         #[tokio::test]
         async fn test_retry_or_fail_nonexistent_command_returns_false() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::OutgoingCommand,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);
@@ -933,8 +950,8 @@ mod tests {
 
         #[tokio::test]
         async fn test_get_command_result_missing() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::OutgoingCommand,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);
@@ -954,8 +971,8 @@ mod tests {
 
         #[tokio::test]
         async fn test_prune_processed_before_returns_count() {
-            lilium_database::test_fixtures::with_db_session(
-                lilium_database::test_fixtures::TestServiceFixture::OutgoingCommand,
+            lilium_test_fixtures::with_db_session(
+                lilium_test_fixtures::TestServiceFixture::OutgoingCommand,
                 |session| {
                     Box::pin(async move {
                         let mut service = OutgoingCommandService::new(session);

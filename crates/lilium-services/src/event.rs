@@ -1,9 +1,11 @@
-use anyhow::Result;
+use crate::Result;
 use chrono::{DateTime, Utc};
 use lilium_database::DbSessionContext;
 
 use lilium_models::ingestion::{EventProcessorOffset, WebSocketEvent};
+use tracing::instrument;
 
+#[derive(Debug, Clone)]
 pub struct WebSocketEventInsert {
     pub user_id: String,
     pub event: String,
@@ -16,10 +18,12 @@ pub struct WebSocketEventService<'a> {
 }
 
 impl<'a> WebSocketEventService<'a> {
+    #[instrument(skip(session))]
     pub fn new(session: DbSessionContext<'a>) -> Self {
         Self { session }
     }
 
+    #[instrument(skip(self, data), fields(user_id = %user_id, event = %event, timestamp = %timestamp))]
     pub async fn insert_event(
         &mut self,
         user_id: &str,
@@ -41,6 +45,7 @@ impl<'a> WebSocketEventService<'a> {
         Ok(record)
     }
 
+    #[instrument(skip(self, events), fields(event_count = events.len()))]
     pub async fn insert_events(&mut self, events: &[WebSocketEventInsert]) -> Result<i64> {
         if events.is_empty() {
             return Ok(0);
@@ -73,6 +78,7 @@ impl<'a> WebSocketEventService<'a> {
         Ok(result.rows_affected() as i64)
     }
 
+    #[instrument(skip(self), fields(limit, user_id = ?user_id, event_type = ?event_type))]
     pub async fn get_pending_events(
         &mut self,
         limit: i64,
@@ -108,6 +114,7 @@ impl<'a> WebSocketEventService<'a> {
         Ok(events)
     }
 
+    #[instrument(skip(self), fields(last_processed_id, last_processed_timestamp = ?last_processed_timestamp, limit, user_id = ?user_id, event_type = ?event_type))]
     pub async fn get_events_after_offset(
         &mut self,
         last_processed_id: i64,
@@ -175,6 +182,7 @@ impl<'a> WebSocketEventService<'a> {
         Ok(events)
     }
 
+    #[instrument(skip(self), fields(event_id))]
     pub async fn delete_event(&mut self, event_id: i64) -> Result<()> {
         sqlx::query("DELETE FROM websocket_events WHERE id = $1")
             .bind(event_id)
@@ -183,6 +191,7 @@ impl<'a> WebSocketEventService<'a> {
         Ok(())
     }
 
+    #[instrument(skip(self))]
     pub async fn get_queue_depth(&mut self) -> Result<i64> {
         let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM websocket_events")
             .fetch_one(self.session.as_mut())
@@ -190,6 +199,7 @@ impl<'a> WebSocketEventService<'a> {
         Ok(count)
     }
 
+    #[instrument(skip(self))]
     pub async fn get_oldest_event_age(&mut self) -> Result<Option<std::time::Duration>> {
         let oldest = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
             "SELECT timestamp FROM websocket_events ORDER BY timestamp ASC, id ASC LIMIT 1",
@@ -199,6 +209,7 @@ impl<'a> WebSocketEventService<'a> {
         Ok(oldest.and_then(|ts| Utc::now().signed_duration_since(ts).to_std().ok()))
     }
 
+    #[instrument(skip(self))]
     pub async fn get_max_event_id(&mut self) -> Result<Option<i64>> {
         let max_id = sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(id) FROM websocket_events")
             .fetch_one(self.session.as_mut())
@@ -206,6 +217,7 @@ impl<'a> WebSocketEventService<'a> {
         Ok(max_id)
     }
 
+    #[instrument(skip(self))]
     pub async fn get_latest_event_cursor(&mut self) -> Result<(Option<DateTime<Utc>>, i64)> {
         let row = sqlx::query_as::<_, (Option<DateTime<Utc>>, i64)>(
             "SELECT timestamp, id FROM websocket_events ORDER BY timestamp DESC, id DESC LIMIT 1",
@@ -215,6 +227,7 @@ impl<'a> WebSocketEventService<'a> {
         Ok(row.unwrap_or((None, 0)))
     }
 
+    #[instrument(skip(self), fields(user_id = ?user_id, event_type = ?event_type))]
     pub async fn get_latest_event(
         &mut self,
         user_id: Option<&str>,
@@ -249,6 +262,7 @@ impl<'a> WebSocketEventService<'a> {
         Ok(event)
     }
 
+    #[instrument(skip(self), fields(event_id))]
     pub async fn get_latest_timestamp_for_id(
         &mut self,
         event_id: i64,
@@ -262,6 +276,7 @@ impl<'a> WebSocketEventService<'a> {
         Ok(ts)
     }
 
+    #[instrument(skip(self), fields(last_timestamp = ?last_timestamp, last_id, limit))]
     pub async fn poll_events(
         &mut self,
         last_timestamp: Option<DateTime<Utc>>,
@@ -303,10 +318,12 @@ pub struct EventProcessorOffsetService<'a> {
 }
 
 impl<'a> EventProcessorOffsetService<'a> {
+    #[instrument(skip(session))]
     pub fn new(session: DbSessionContext<'a>) -> Self {
         Self { session }
     }
 
+    #[instrument(skip(self), fields(processor_id = %processor_id))]
     pub async fn get_cursor(&mut self, processor_id: &str) -> Result<Option<EventProcessorOffset>> {
         let offset = sqlx::query_as::<_, EventProcessorOffset>(
             "SELECT * FROM event_processor_offsets WHERE processor_id = $1",
@@ -317,8 +334,9 @@ impl<'a> EventProcessorOffsetService<'a> {
         Ok(offset)
     }
 
-    pub async fn get_offset(&mut self, processor_id: &str) -> Result<i64> {
-        let offset = sqlx::query_scalar::<_, Option<i64>>(
+    #[instrument(skip(self), fields(processor_id = %processor_id))]
+    pub async fn get_offset(&mut self, processor_id: &str) -> Result<i32> {
+        let offset = sqlx::query_scalar::<_, Option<i32>>(
             "SELECT last_processed_id FROM event_processor_offsets WHERE processor_id = $1",
         )
         .bind(processor_id)
@@ -327,10 +345,11 @@ impl<'a> EventProcessorOffsetService<'a> {
         Ok(offset.flatten().unwrap_or(0))
     }
 
+    #[instrument(skip(self), fields(processor_id = %processor_id, last_processed_id, has_last_processed_timestamp = last_processed_timestamp.is_some(), has_last_processed_at = last_processed_at.is_some()))]
     pub async fn update_offset(
         &mut self,
         processor_id: &str,
-        last_processed_id: i64,
+        last_processed_id: i32,
         last_processed_timestamp: Option<DateTime<Utc>>,
         last_processed_at: Option<DateTime<Utc>>,
     ) -> Result<EventProcessorOffset> {
@@ -354,6 +373,7 @@ impl<'a> EventProcessorOffsetService<'a> {
         Ok(record)
     }
 
+    #[instrument(skip(self), fields(processor_id = %processor_id))]
     pub async fn delete_offset(&mut self, processor_id: &str) -> Result<()> {
         sqlx::query("DELETE FROM event_processor_offsets WHERE processor_id = $1")
             .bind(processor_id)
@@ -379,8 +399,8 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_event_service_struct_can_be_created() {
-        lilium_database::test_fixtures::with_db_session(
-            lilium_database::test_fixtures::TestServiceFixture::Event,
+        lilium_test_fixtures::with_db_session(
+            lilium_test_fixtures::TestServiceFixture::Event,
             |session| {
                 Box::pin(async move {
                     let _svc = WebSocketEventService::new(session);
@@ -394,8 +414,8 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_event_service_roundtrip() {
-        lilium_database::test_fixtures::with_db_session(
-            lilium_database::test_fixtures::TestServiceFixture::Event,
+        lilium_test_fixtures::with_db_session(
+            lilium_test_fixtures::TestServiceFixture::Event,
             |session| {
                 Box::pin(async move {
                     let mut svc = WebSocketEventService::new(session);
@@ -420,8 +440,8 @@ mod tests {
 
     #[tokio::test]
     async fn event_processor_offset_service_roundtrip() {
-        lilium_database::test_fixtures::with_db_session(
-            lilium_database::test_fixtures::TestServiceFixture::Event,
+        lilium_test_fixtures::with_db_session(
+            lilium_test_fixtures::TestServiceFixture::Event,
             |session| {
                 Box::pin(async move {
                     let mut svc = EventProcessorOffsetService::new(session);

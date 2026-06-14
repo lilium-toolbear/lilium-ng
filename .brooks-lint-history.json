@@ -9,5 +9,16 @@
       "suggestion": 2
     },
     "scope": "full repository"
+  },
+  {
+    "date": "2026-06-14",
+    "mode": "PR Review",
+    "score": 70,
+    "findings": {
+      "critical": 2,
+      "warning": 0,
+      "suggestion": 0
+    },
+    "scope": "all Rust source files"
   }
 ]

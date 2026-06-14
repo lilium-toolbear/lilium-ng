@@ -1,5 +1,4 @@
 use anyhow::Result;
-use clap::Parser;
 use lilium_database::DbPool;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -9,30 +8,24 @@ mod control;
 mod ingestion;
 mod worker;
 
-#[derive(Parser)]
-#[command(name = "lilium-spider")]
-#[command(about = "Lilium Spider - WebSocket ingestion service")]
-struct Cli {
-    #[arg(short, long, default_value = "config/spider.toml")]
-    config: String,
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
+    let _sentry_guard = lilium_common::observability::init_backend_sentry("ws_arbiter");
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
+        .with(sentry_tracing::layer())
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let cli = Cli::parse();
-    let config = config::Config::load(&cli.config)?;
+    let config = config::Config::load()?;
     tracing::info!("Starting lilium-spider");
 
     // Connect to database - do NOT run migrations
     // Migrations are managed separately by Alembic in the Python project
-    let pool = DbPool::connect(&config.database.url, config.database.pool_size).await?;
+    let pool = DbPool::connect_from_env("DATABASE_URL", config.database.pool_size).await?;
 
     let arbiter = arbiter::Arbiter::new(config, pool);
     arbiter.run().await

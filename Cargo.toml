@@ -3,6 +3,7 @@ members = [
     "crates/lilium-common",
     "crates/lilium-models",
     "crates/lilium-database",
+    "crates/lilium-test-fixtures",
     "crates/lilium-core",
     "crates/lilium-services",
     "crates/lilium-api-client",
@@ -16,6 +17,7 @@ resolver = "2"
 lilium-common = { path = "crates/lilium-common" }
 lilium-models = { path = "crates/lilium-models" }
 lilium-database = { path = "crates/lilium-database" }
+lilium-test-fixtures = { path = "crates/lilium-test-fixtures" }
 lilium-core = { path = "crates/lilium-core" }
 lilium-services = { path = "crates/lilium-services" }
 lilium-api-client = { path = "crates/lilium-api-client" }
@@ -46,12 +48,14 @@ reqwest = { version = "0.12", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# 配置
-toml = "0.8"
+# 环境变量
+dotenvy = "0.15.7"
 
 # 日志
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sentry = "0.48.2"
+sentry-tracing = "0.48.2"
 
 # CLI
 clap = { version = "4", features = ["derive"] }

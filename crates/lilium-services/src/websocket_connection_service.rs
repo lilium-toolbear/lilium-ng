@@ -1,21 +1,24 @@
 use std::hash::{Hash, Hasher};
 
-use anyhow::{bail, Result};
+use crate::Result;
 use chrono::{Duration, Utc};
 use lilium_database::DbSessionContext;
 
 use lilium_common::error::LiliumError;
 use lilium_models::dzmm::websocket_connection::WebsocketConnection;
+use tracing::instrument;
 
 pub struct WebsocketConnectionService<'a> {
     session: DbSessionContext<'a>,
 }
 
 impl<'a> WebsocketConnectionService<'a> {
+    #[instrument(skip(session))]
     pub fn new(session: DbSessionContext<'a>) -> Self {
         Self { session }
     }
 
+    #[instrument(fields(account_user_id = %account_user_id))]
     pub fn calculate_lock_id(account_user_id: &str) -> i64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         account_user_id.hash(&mut hasher);
@@ -23,11 +26,13 @@ impl<'a> WebsocketConnectionService<'a> {
         (hash & 0x7FFFFFFFFFFFFFFF) as i64
     }
 
+    #[instrument(skip(self), fields(user_id = %user_id))]
     pub async fn acquire_connection_lock(&mut self, user_id: &str) -> Result<i64> {
         let lock_id = Self::calculate_lock_id(user_id);
         self.acquire_connection_lock_inner(lock_id, user_id).await
     }
 
+    #[instrument(skip(self), fields(lock_id, user_id = %user_id))]
     async fn acquire_connection_lock_inner(&mut self, lock_id: i64, user_id: &str) -> Result<i64> {
         let lock_acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
             .bind(lock_id)
@@ -35,7 +40,7 @@ impl<'a> WebsocketConnectionService<'a> {
             .await?;
 
         if !lock_acquired {
-            bail!(LiliumError::connection_conflict(
+            return Err(LiliumError::connection_conflict(
                 format!("Account {} is already in use by another client", user_id),
                 Some(lock_id),
             ));
@@ -46,6 +51,7 @@ impl<'a> WebsocketConnectionService<'a> {
         Ok(lock_id)
     }
 
+    #[instrument(skip(self), fields(lock_id, user_id = %user_id))]
     async fn replace_connection_record(&mut self, lock_id: i64, user_id: &str) -> Result<()> {
         sqlx::query("DELETE FROM websocket_connections WHERE lock_id = $1")
             .bind(lock_id)
@@ -66,6 +72,7 @@ impl<'a> WebsocketConnectionService<'a> {
         Ok(())
     }
 
+    #[instrument(skip(self), fields(user_id = %user_id, has_expected_lock_id = expected_lock_id.is_some()))]
     pub async fn ensure_connection_lock(
         &mut self,
         user_id: &str,
@@ -75,10 +82,13 @@ impl<'a> WebsocketConnectionService<'a> {
 
         if let Some(expected) = expected_lock_id {
             if expected != lock_id {
-                bail!(LiliumError::domain_service(format!(
-                    "Expected lock_id {} does not match user_id {}",
-                    expected, user_id
-                )));
+                return Err(LiliumError::domain_service_with_code(
+                    "WEBSOCKET_CONNECTION_INVALID_REQUEST",
+                    format!(
+                        "Expected lock_id {} does not match user_id {}",
+                        expected, user_id
+                    ),
+                ));
             }
         }
 
@@ -89,6 +99,7 @@ impl<'a> WebsocketConnectionService<'a> {
         self.acquire_connection_lock_inner(lock_id, user_id).await
     }
 
+    #[instrument(skip(self), fields(lock_id))]
     async fn current_connection_holds_lock(&mut self, lock_id: i64) -> Result<bool> {
         let classid = lock_id >> 32;
         let objid = lock_id & 0xFFFFFFFF;
@@ -112,6 +123,7 @@ impl<'a> WebsocketConnectionService<'a> {
         Ok(lock_held)
     }
 
+    #[instrument(skip(self), fields(lock_id))]
     pub async fn release_connection_lock(&mut self, lock_id: i64) -> Result<()> {
         let connection = sqlx::query_as::<_, WebsocketConnection>(
             "SELECT * FROM websocket_connections WHERE lock_id = $1",
@@ -134,6 +146,7 @@ impl<'a> WebsocketConnectionService<'a> {
         Ok(())
     }
 
+    #[instrument(skip(self), fields(lock_id))]
     pub async fn update_heartbeat(&mut self, lock_id: i64) -> Result<()> {
         let now = Utc::now();
         sqlx::query("UPDATE websocket_connections SET last_heartbeat = $1 WHERE lock_id = $2")
@@ -144,6 +157,7 @@ impl<'a> WebsocketConnectionService<'a> {
         Ok(())
     }
 
+    #[instrument(skip(self), fields(account_user_id = ?account_user_id))]
     pub async fn get_active_connections(
         &mut self,
         account_user_id: Option<&str>,
@@ -179,6 +193,7 @@ impl<'a> WebsocketConnectionService<'a> {
         Ok(rows)
     }
 
+    #[instrument(skip(self), fields(account_user_id = %account_user_id))]
     pub async fn is_credential_in_use(&mut self, account_user_id: &str) -> Result<bool> {
         let lock_id = Self::calculate_lock_id(account_user_id);
 
@@ -200,6 +215,7 @@ impl<'a> WebsocketConnectionService<'a> {
         Ok(exists)
     }
 
+    #[instrument(skip(self), fields(timeout_seconds))]
     pub async fn cleanup_stale_connections(&mut self, timeout_seconds: i64) -> Result<i64> {
         let stale_lock_ids = if timeout_seconds > 0 {
             let cutoff = Utc::now() - Duration::seconds(timeout_seconds);
@@ -281,8 +297,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_acquire_connection_lock_creates_connection_record() {
-        lilium_database::test_fixtures::with_db_session(
-            lilium_database::test_fixtures::TestServiceFixture::WebsocketConnection,
+        lilium_test_fixtures::with_db_session(
+            lilium_test_fixtures::TestServiceFixture::WebsocketConnection,
             |session| {
                 Box::pin(async move {
                     let mut service = WebsocketConnectionService::new(session);
@@ -301,8 +317,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_release_connection_lock_deletes_record() {
-        lilium_database::test_fixtures::with_db_session(
-            lilium_database::test_fixtures::TestServiceFixture::WebsocketConnection,
+        lilium_test_fixtures::with_db_session(
+            lilium_test_fixtures::TestServiceFixture::WebsocketConnection,
             |session| {
                 Box::pin(async move {
                     let mut service = WebsocketConnectionService::new(session);
@@ -321,8 +337,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_heartbeat_updates_timestamp() {
-        lilium_database::test_fixtures::with_db_session(
-            lilium_database::test_fixtures::TestServiceFixture::WebsocketConnection,
+        lilium_test_fixtures::with_db_session(
+            lilium_test_fixtures::TestServiceFixture::WebsocketConnection,
             |session| {
                 Box::pin(async move {
                     let mut service = WebsocketConnectionService::new(session);
@@ -341,8 +357,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_active_connections_returns_all_connections() {
-        lilium_database::test_fixtures::with_db_session(
-            lilium_database::test_fixtures::TestServiceFixture::WebsocketConnection,
+        lilium_test_fixtures::with_db_session(
+            lilium_test_fixtures::TestServiceFixture::WebsocketConnection,
             |session| {
                 Box::pin(async move {
                     let mut service = WebsocketConnectionService::new(session);
@@ -369,8 +385,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_active_connections_filters_by_credential() {
-        lilium_database::test_fixtures::with_db_session(
-            lilium_database::test_fixtures::TestServiceFixture::WebsocketConnection,
+        lilium_test_fixtures::with_db_session(
+            lilium_test_fixtures::TestServiceFixture::WebsocketConnection,
             |session| {
                 Box::pin(async move {
                     let mut service = WebsocketConnectionService::new(session);
@@ -398,8 +414,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_is_credential_in_use_returns_true_when_locked() {
-        lilium_database::test_fixtures::with_db_session(
-            lilium_database::test_fixtures::TestServiceFixture::WebsocketConnection,
+        lilium_test_fixtures::with_db_session(
+            lilium_test_fixtures::TestServiceFixture::WebsocketConnection,
             |session| {
                 Box::pin(async move {
                     let mut service = WebsocketConnectionService::new(session);
@@ -425,8 +441,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_is_credential_in_use_returns_false_when_not_locked() {
-        lilium_database::test_fixtures::with_db_session(
-            lilium_database::test_fixtures::TestServiceFixture::WebsocketConnection,
+        lilium_test_fixtures::with_db_session(
+            lilium_test_fixtures::TestServiceFixture::WebsocketConnection,
             |session| {
                 Box::pin(async move {
                     let mut service = WebsocketConnectionService::new(session);
@@ -444,8 +460,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_cleanup_stale_connections_removes_old_records() {
-        lilium_database::test_fixtures::with_db_session(
-            lilium_database::test_fixtures::TestServiceFixture::WebsocketConnection,
+        lilium_test_fixtures::with_db_session(
+            lilium_test_fixtures::TestServiceFixture::WebsocketConnection,
             |session| {
                 Box::pin(async move {
                     let mut service = WebsocketConnectionService::new(session);
@@ -461,8 +477,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_cleanup_stale_connections_preserves_fresh_records() {
-        lilium_database::test_fixtures::with_db_session(
-            lilium_database::test_fixtures::TestServiceFixture::WebsocketConnection,
+        lilium_test_fixtures::with_db_session(
+            lilium_test_fixtures::TestServiceFixture::WebsocketConnection,
             |session| {
                 Box::pin(async move {
                     let mut service = WebsocketConnectionService::new(session);
@@ -489,8 +505,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_acquire_cleans_up_stale_record() {
-        lilium_database::test_fixtures::with_db_session(
-            lilium_database::test_fixtures::TestServiceFixture::WebsocketConnection,
+        lilium_test_fixtures::with_db_session(
+            lilium_test_fixtures::TestServiceFixture::WebsocketConnection,
             |session| {
                 Box::pin(async move {
                     let mut service = WebsocketConnectionService::new(session);

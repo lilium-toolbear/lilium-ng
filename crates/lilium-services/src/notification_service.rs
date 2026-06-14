@@ -2,10 +2,11 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use crate::Result;
 use lilium_database::DbSessionContext;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::time::timeout;
+use tracing::instrument;
 
 struct Subscriber {
     id: usize,
@@ -19,6 +20,7 @@ pub struct NotificationService<'a> {
 }
 
 impl<'a> NotificationService<'a> {
+    #[instrument(skip(session))]
     pub fn new(session: DbSessionContext<'a>) -> Self {
         Self {
             _session: session,
@@ -26,6 +28,7 @@ impl<'a> NotificationService<'a> {
         }
     }
 
+    #[instrument(skip(self), fields(channel = %channel))]
     pub async fn subscribe(
         &mut self,
         channel: &str,
@@ -47,12 +50,14 @@ impl<'a> NotificationService<'a> {
         Ok((id, receiver))
     }
 
+    #[instrument(skip(self), fields(id))]
     pub async fn unsubscribe(&mut self, id: usize) -> Result<()> {
         let mut subs = self.subscribers.write().await;
         subs.retain(|s| s.id != id);
         Ok(())
     }
 
+    #[instrument(skip(self), fields(channel = %channel, has_timeout = timeout_duration.is_some()))]
     pub async fn wait_for_notification(
         &mut self,
         channel: &str,
@@ -74,6 +79,7 @@ impl<'a> NotificationService<'a> {
         }
     }
 
+    #[instrument(skip(self), fields(channel_count = channels.len(), has_timeout = timeout_duration.is_some()))]
     pub async fn wait_for_multiple(
         &mut self,
         channels: &[&str],
@@ -126,6 +132,7 @@ impl<'a> NotificationService<'a> {
         Ok(result)
     }
 
+    #[instrument(skip(self, state, poll_callback, stop_signal), fields(channel = %channel, polling_ms = polling_interval.as_millis()))]
     pub async fn stream_with_polling<F, Fut, T, S>(
         &mut self,
         channel: &str,
@@ -200,8 +207,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscribe_returns_id_and_receiver() {
-        lilium_database::test_fixtures::with_db_session(
-            lilium_database::test_fixtures::TestServiceFixture::Notification,
+        lilium_test_fixtures::with_db_session(
+            lilium_test_fixtures::TestServiceFixture::Notification,
             |session| {
                 Box::pin(async move {
                     let mut service = NotificationService::new(session);
@@ -217,8 +224,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscribe_increments_ids() {
-        lilium_database::test_fixtures::with_db_session(
-            lilium_database::test_fixtures::TestServiceFixture::Notification,
+        lilium_test_fixtures::with_db_session(
+            lilium_test_fixtures::TestServiceFixture::Notification,
             |session| {
                 Box::pin(async move {
                     let mut service = NotificationService::new(session);
@@ -236,8 +243,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_unsubscribe_removes_subscriber() {
-        lilium_database::test_fixtures::with_db_session(
-            lilium_database::test_fixtures::TestServiceFixture::Notification,
+        lilium_test_fixtures::with_db_session(
+            lilium_test_fixtures::TestServiceFixture::Notification,
             |session| {
                 Box::pin(async move {
                     let mut service = NotificationService::new(session);
@@ -255,8 +262,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_for_notification_times_out() {
-        lilium_database::test_fixtures::with_db_session(
-            lilium_database::test_fixtures::TestServiceFixture::Notification,
+        lilium_test_fixtures::with_db_session(
+            lilium_test_fixtures::TestServiceFixture::Notification,
             |session| {
                 Box::pin(async move {
                     let mut service = NotificationService::new(session);
@@ -275,8 +282,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_for_notification_receives() {
-        lilium_database::test_fixtures::with_db_session(
-            lilium_database::test_fixtures::TestServiceFixture::Notification,
+        lilium_test_fixtures::with_db_session(
+            lilium_test_fixtures::TestServiceFixture::Notification,
             |session| {
                 Box::pin(async move {
                     let mut service = NotificationService::new(session);
@@ -305,8 +312,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_for_multiple_empty_channels_returns_none() {
-        lilium_database::test_fixtures::with_db_session(
-            lilium_database::test_fixtures::TestServiceFixture::Notification,
+        lilium_test_fixtures::with_db_session(
+            lilium_test_fixtures::TestServiceFixture::Notification,
             |session| {
                 Box::pin(async move {
                     let mut service = NotificationService::new(session);
@@ -325,8 +332,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_for_multiple_receives_channel_name() {
-        lilium_database::test_fixtures::with_db_session(
-            lilium_database::test_fixtures::TestServiceFixture::Notification,
+        lilium_test_fixtures::with_db_session(
+            lilium_test_fixtures::TestServiceFixture::Notification,
             |session| {
                 Box::pin(async move {
                     let mut service = NotificationService::new(session);
@@ -355,8 +362,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_for_multiple_times_out() {
-        lilium_database::test_fixtures::with_db_session(
-            lilium_database::test_fixtures::TestServiceFixture::Notification,
+        lilium_test_fixtures::with_db_session(
+            lilium_test_fixtures::TestServiceFixture::Notification,
             |session| {
                 Box::pin(async move {
                     let mut service = NotificationService::new(session);

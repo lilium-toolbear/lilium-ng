@@ -49,6 +49,22 @@ pub enum LiliumError {
 }
 
 impl LiliumError {
+    pub fn database(message: impl Into<String>) -> Self {
+        LiliumError::Database(message.into())
+    }
+
+    pub fn http(message: impl Into<String>) -> Self {
+        LiliumError::Http(message.into())
+    }
+
+    pub fn websocket(message: impl Into<String>) -> Self {
+        LiliumError::WebSocket(message.into())
+    }
+
+    pub fn config(message: impl Into<String>) -> Self {
+        LiliumError::Config(message.into())
+    }
+
     pub fn service(code: impl Into<String>, message: impl Into<String>) -> Self {
         LiliumError::Service {
             code: code.into(),
@@ -61,12 +77,16 @@ impl LiliumError {
         }
     }
 
-    pub fn domain_service(message: impl Into<String>) -> Self {
+    pub fn domain_service_with_code(code: impl Into<String>, message: impl Into<String>) -> Self {
         LiliumError::DomainService {
-            code: "INVALID_REQUEST".to_string(),
+            code: code.into(),
             message: message.into(),
             status_code: 400,
         }
+    }
+
+    pub fn domain_service(message: impl Into<String>) -> Self {
+        Self::domain_service_with_code("INVALID_REQUEST", message)
     }
 
     pub fn connection_conflict(message: impl Into<String>, lock_id: Option<i64>) -> Self {
@@ -100,5 +120,11 @@ impl LiliumError {
             LiliumError::ConnectionConflict { code, .. } => Some(code),
             _ => None,
         }
+    }
+}
+
+impl From<sqlx::Error> for LiliumError {
+    fn from(value: sqlx::Error) -> Self {
+        LiliumError::Database(value.to_string())
     }
 }
