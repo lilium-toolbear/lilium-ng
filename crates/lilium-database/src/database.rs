@@ -1,32 +1,26 @@
 use crate::pool::DbPool;
 use anyhow::{Context, Result};
-use sea_orm::{ConnectOptions, DatabaseConnection};
+use sea_orm::{DatabaseConnection, SqlxPostgresConnector};
+use sqlx::postgres::PgPoolOptions;
 use std::time::Duration;
 use tracing::instrument;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatabaseConfig {
-    pub connection: DatabaseConnectionConfig,
+    pub url: String,
     pub max_connections: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DatabaseConnectionConfig {
-    Url(String),
 }
 
 impl DatabaseConfig {
     pub fn from_url(url: impl Into<String>, max_connections: u32) -> Self {
         Self {
-            connection: DatabaseConnectionConfig::Url(url.into()),
+            url: url.into(),
             max_connections,
         }
     }
 
     pub fn normalized_url(&self) -> String {
-        match &self.connection {
-            DatabaseConnectionConfig::Url(url) => normalize_database_url(url),
-        }
+        normalize_database_url(&self.url)
     }
 }
 
@@ -40,15 +34,14 @@ impl Database {
     #[instrument(skip(config), fields(max_connections = config.max_connections))]
     pub async fn create(config: DatabaseConfig) -> Result<Self> {
         let normalized_url = config.normalized_url();
-
-        let mut options = ConnectOptions::new(normalized_url.clone());
-        options.max_connections(config.max_connections);
-        options.connect_timeout(Duration::from_secs(30));
-
-        let orm = sea_orm::Database::connect(options)
+        let pool = PgPoolOptions::new()
+            .max_connections(config.max_connections)
+            .acquire_timeout(Duration::from_secs(30))
+            .connect(&normalized_url)
             .await
-            .context("connect ORM database")?;
-        let raw_pool = DbPool::connect(&normalized_url, config.max_connections).await?;
+            .with_context(|| "connect database pool")?;
+        let orm = SqlxPostgresConnector::from_sqlx_postgres_pool(pool.clone());
+        let raw_pool = DbPool::from_pg_pool(pool);
 
         Ok(Self { orm, raw_pool })
     }
@@ -79,10 +72,7 @@ mod tests {
     fn from_url_sets_connection_and_max_connections() {
         let config = DatabaseConfig::from_url("postgres://localhost/db", 12);
 
-        assert_eq!(
-            config.connection,
-            DatabaseConnectionConfig::Url("postgres://localhost/db".to_string())
-        );
+        assert_eq!(config.url, "postgres://localhost/db".to_string());
         assert_eq!(config.max_connections, 12);
     }
 
