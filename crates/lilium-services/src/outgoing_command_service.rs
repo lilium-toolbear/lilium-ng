@@ -533,7 +533,7 @@ mod tests {
                             .unwrap();
                         assert_eq!(cmd.account_user_id, "user1");
                         assert_eq!(cmd.event, "message:send");
-                        assert_eq!(cmd.require_ack, true);
+                        assert!(cmd.require_ack);
                         assert_eq!(cmd.max_attempts, 6);
                         assert_eq!(cmd.status, status::PENDING);
                         assert_eq!(cmd.attempt_count, 0);

@@ -256,11 +256,7 @@ impl EventWriter {
             }
 
             if inserted == 0 {
-                if stop_event.load(Ordering::Relaxed) && spill_pending {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                } else {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             }
         }
     }

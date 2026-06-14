@@ -111,6 +111,7 @@ fn parse_trpc_response(response: &Value, index: usize, default: Option<Value>) -
     })
 }
 
+#[cfg(test)]
 fn extract_balanced_json_object(text: &str, start: usize) -> Result<Value> {
     let chars: Vec<char> = text.chars().collect();
     let mut depth = 0i32;
@@ -150,6 +151,7 @@ fn extract_balanced_json_object(text: &str, start: usize) -> Result<Value> {
     bail!("Unterminated JSON object")
 }
 
+#[cfg(test)]
 fn extract_balanced_json_array(text: &str, start: usize) -> Result<String> {
     let chars: Vec<char> = text.chars().collect();
     let mut depth = 0i32;
@@ -184,16 +186,14 @@ fn extract_balanced_json_array(text: &str, start: usize) -> Result<String> {
     bail!("Unterminated JSON array")
 }
 
+#[cfg(test)]
 fn extract_next_flight_text(html: &str) -> String {
     let mut chunks: Vec<String> = Vec::new();
     let marker = "self.__next_f.push(";
 
     let mut start = 0usize;
-    loop {
-        let call_index = match html[start..].find(marker) {
-            Some(i) => start + i,
-            None => break,
-        };
+    while let Some(i) = html[start..].find(marker) {
+        let call_index = start + i;
 
         let array_start = match html[call_index + marker.len()..].find('[') {
             Some(i) => call_index + marker.len() + i,
@@ -230,6 +230,7 @@ fn extract_next_flight_text(html: &str) -> String {
     chunks.join("")
 }
 
+#[cfg(test)]
 fn extract_next_scalar_field(text: &str, field: &str) -> Option<Value> {
     let marker = format!("\"{}\":", field);
     let index = text.find(&marker)?;
@@ -264,6 +265,7 @@ fn extract_next_scalar_field(text: &str, field: &str) -> Option<Value> {
     }
 }
 
+#[cfg(test)]
 fn extract_next_public_profile(html: &str, user_id: &str) -> Value {
     let flight = extract_next_flight_text(html).replace(r#"\""#, "\"");
     let profile_marker = "\"profile\":";
@@ -613,14 +615,12 @@ impl DzmmApi {
             return self.login_with_email_password(email, password).await;
         }
 
-        if self.signin_code_image.is_some() && self.signin_code_image_mime.is_some() {
+        if let (Some(image), Some(mime)) = (
+            self.signin_code_image.as_ref(),
+            self.signin_code_image_mime.as_ref(),
+        ) {
             info!("Falling back to QR code image login...");
-            return self
-                .login_with_qr_image(
-                    self.signin_code_image.as_ref().unwrap(),
-                    self.signin_code_image_mime.as_ref().unwrap(),
-                )
-                .await;
+            return self.login_with_qr_image(image, mime).await;
         }
 
         if let Some(ref signin_code) = self.signin_code {
