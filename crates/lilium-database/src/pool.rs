@@ -14,6 +14,12 @@ pub struct DbPool {
     inner: PgPool,
 }
 
+#[derive(Copy, Clone, Debug)]
+enum SessionFinish {
+    Commit,
+    Rollback,
+}
+
 #[derive(Debug)]
 pub struct DbSession {
     inner: PoolConnection<Postgres>,
@@ -155,8 +161,14 @@ impl DbPool {
         Ok(())
     }
 
-    #[instrument(skip(self, f))]
-    pub async fn with_session<T, F>(&self, f: F) -> Result<T>
+    async fn finish_session(session: &mut DbSession, finish: SessionFinish) -> Result<()> {
+        match finish {
+            SessionFinish::Commit => Self::commit_session(session).await,
+            SessionFinish::Rollback => Self::rollback_session(session).await,
+        }
+    }
+
+    async fn run_session<T, F>(&self, finish: SessionFinish, f: F) -> Result<T>
     where
         F: for<'a> FnOnce(&'a mut DbSession) -> SessionFuture<'a, T>,
     {
@@ -164,7 +176,7 @@ impl DbPool {
         let result = f(&mut session).await;
         match result {
             Ok(value) => {
-                Self::commit_session(&mut session).await?;
+                Self::finish_session(&mut session, finish).await?;
                 Ok(value)
             }
             Err(error) => {
@@ -172,6 +184,25 @@ impl DbPool {
                 Err(error)
             }
         }
+    }
+
+    async fn run_session_context<T, F>(&self, finish: SessionFinish, f: F) -> Result<T>
+    where
+        F: for<'a> FnOnce(DbSessionContext<'a>) -> SessionFuture<'a, T>,
+    {
+        self.run_session(finish, |session| {
+            let context = DbSessionContext::new(session);
+            f(context)
+        })
+        .await
+    }
+
+    #[instrument(skip(self, f))]
+    pub async fn with_session<T, F>(&self, f: F) -> Result<T>
+    where
+        F: for<'a> FnOnce(&'a mut DbSession) -> SessionFuture<'a, T>,
+    {
+        self.run_session(SessionFinish::Commit, f).await
     }
 
     #[instrument(skip(self, f))]
@@ -179,21 +210,7 @@ impl DbPool {
     where
         F: for<'a> FnOnce(DbSessionContext<'a>) -> SessionFuture<'a, T>,
     {
-        let mut session = self.begin_session().await?;
-        let result = {
-            let context = DbSessionContext::new(&mut session);
-            f(context).await
-        };
-        match result {
-            Ok(value) => {
-                Self::commit_session(&mut session).await?;
-                Ok(value)
-            }
-            Err(error) => {
-                Self::rollback_session(&mut session).await.ok();
-                Err(error)
-            }
-        }
+        self.run_session_context(SessionFinish::Commit, f).await
     }
 
     #[instrument(skip(self, f))]
@@ -201,18 +218,7 @@ impl DbPool {
     where
         F: for<'a> FnOnce(&'a mut DbSession) -> SessionFuture<'a, T>,
     {
-        let mut session = self.begin_session().await?;
-        let result = f(&mut session).await;
-        match result {
-            Ok(value) => {
-                Self::rollback_session(&mut session).await?;
-                Ok(value)
-            }
-            Err(error) => {
-                Self::rollback_session(&mut session).await.ok();
-                Err(error)
-            }
-        }
+        self.run_session(SessionFinish::Rollback, f).await
     }
 
     #[instrument(skip(self, f))]
@@ -220,21 +226,7 @@ impl DbPool {
     where
         F: for<'a> FnOnce(DbSessionContext<'a>) -> SessionFuture<'a, T>,
     {
-        let mut session = self.begin_session().await?;
-        let result = {
-            let context = DbSessionContext::new(&mut session);
-            f(context).await
-        };
-        match result {
-            Ok(value) => {
-                Self::rollback_session(&mut session).await?;
-                Ok(value)
-            }
-            Err(error) => {
-                Self::rollback_session(&mut session).await.ok();
-                Err(error)
-            }
-        }
+        self.run_session_context(SessionFinish::Rollback, f).await
     }
 
     #[instrument(skip(self, f))]

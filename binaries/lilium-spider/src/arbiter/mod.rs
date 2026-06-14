@@ -294,7 +294,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_arbiter_start_stop() {
-        let pool = lilium_test_fixtures::connect_test_db().await;
+        let pool = lilium_test_fixtures::connect_test_database().await;
 
         let config = Config {
             database: crate::config::DatabaseConfig { pool_size: 1 },

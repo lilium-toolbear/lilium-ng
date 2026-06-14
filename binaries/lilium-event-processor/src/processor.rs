@@ -642,7 +642,7 @@ mod tests {
     use lilium_models::dzmm::room_member::RoomMember;
     use lilium_services::event::EventProcessorOffsetService;
     use lilium_services::message::MessageService;
-    use lilium_test_fixtures::{with_db_session, TestServiceFixture};
+    use lilium_test_fixtures::{with_db_session, FixtureProfile};
     use sqlx::query_as;
 
     fn utc(ts: &str) -> DateTime<Utc> {
@@ -686,7 +686,7 @@ mod tests {
 
     #[tokio::test]
     async fn message_new_system_join_updates_room_members() {
-        with_db_session(TestServiceFixture::Shared, |session| {
+        with_db_session(FixtureProfile::Shared, |session| {
             Box::pin(async move {
                 let mut session = session;
                 let event = websocket_event(
@@ -746,7 +746,7 @@ mod tests {
 
     #[tokio::test]
     async fn group_member_left_marks_room_member_left() {
-        with_db_session(TestServiceFixture::Shared, |session| {
+        with_db_session(FixtureProfile::Shared, |session| {
             Box::pin(async move {
                 let mut session = session;
                 let mut room_member_service =
@@ -792,7 +792,7 @@ mod tests {
 
     #[tokio::test]
     async fn message_deleted_uses_deleted_by() {
-        with_db_session(TestServiceFixture::Shared, |session| {
+        with_db_session(FixtureProfile::Shared, |session| {
             Box::pin(async move {
                 let mut session = session;
                 let sent_at = utc("2026-06-01T00:00:00Z");
@@ -860,11 +860,15 @@ mod tests {
 
     #[tokio::test]
     async fn batch_retry_falls_back_to_per_event_processing() {
-        let pool = lilium_test_fixtures::connect_test_db().await;
+        let pool = lilium_test_fixtures::connect_test_database().await;
         pool.with_session_context(|session| {
             Box::pin(async move {
                 let mut session = session;
-                lilium_test_fixtures::init_event_service_db(&mut session).await;
+                lilium_test_fixtures::prepare_database(
+                    &mut session,
+                    lilium_test_fixtures::FixtureProfile::Event,
+                )
+                .await?;
                 Ok(())
             })
         })
