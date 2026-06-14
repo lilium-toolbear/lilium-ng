@@ -1,8 +1,12 @@
 use crate::pool::DbPool;
+use crate::pool::DbSession;
 use crate::pool::normalize_database_url;
+use crate::transaction::TransactionFuture;
 use anyhow::{Context, Result};
 use sea_orm::{DatabaseConnection, SqlxPostgresConnector};
+use sqlx::{pool::PoolConnection, Postgres};
 use sqlx::postgres::PgPoolOptions;
+use std::ops::{Deref, DerefMut};
 use std::time::Duration;
 use tracing::instrument;
 
@@ -31,6 +35,25 @@ pub struct Database {
     raw_pool: DbPool,
 }
 
+#[derive(Debug)]
+pub struct RawDbConnection {
+    inner: PoolConnection<Postgres>,
+}
+
+impl Deref for RawDbConnection {
+    type Target = PoolConnection<Postgres>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for RawDbConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
 impl Database {
     #[instrument(skip(config), fields(max_connections = config.max_connections))]
     pub async fn create(config: DatabaseConfig) -> Result<Self> {
@@ -53,6 +76,25 @@ impl Database {
 
     pub fn raw_pool(&self) -> &DbPool {
         &self.raw_pool
+    }
+
+    #[instrument(skip(self, f))]
+    pub async fn transaction<T, F>(&self, f: F) -> Result<T>
+    where
+        F: for<'a> FnOnce(&'a mut DbSession) -> TransactionFuture<'a, T>,
+    {
+        self.raw_pool.with_session(f).await
+    }
+
+    #[instrument(skip(self))]
+    pub async fn raw_connection(&self) -> Result<RawDbConnection> {
+        let conn = self
+            .raw_pool
+            .inner()
+            .acquire()
+            .await
+            .with_context(|| "acquire raw SQL connection")?;
+        Ok(RawDbConnection { inner: conn })
     }
 }
 
