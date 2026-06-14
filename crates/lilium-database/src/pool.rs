@@ -84,7 +84,7 @@ impl DbPool {
         Self { inner }
     }
 
-    #[deprecated(note = "compatibility shim; migrate callers to Database::transaction and remove after session API migration")]
+    #[deprecated(note = "compatibility shim; use DbPool::connect and remove after session API migration")]
     #[instrument(skip(url), fields(pool_size))]
     pub async fn connect_with_session(url: &str, pool_size: u32) -> Result<Self> {
         Self::connect(url, pool_size).await
@@ -234,7 +234,7 @@ impl DbPool {
         self.run_session_context(SessionFinish::Rollback, f).await
     }
 
-    #[deprecated(note = "compatibility shim; migrate callers to Database::transaction and remove after session API migration")]
+    #[deprecated(note = "compatibility shim; use DbPool::with_session and remove after session API migration")]
     #[instrument(skip(self, f))]
     pub async fn with_session_boxed<T, F>(&self, f: F) -> Result<T>
     where
@@ -243,7 +243,7 @@ impl DbPool {
         self.with_session(f).await
     }
 
-    #[deprecated(note = "compatibility shim; migrate callers to Database::transaction and remove after session API migration")]
+    #[deprecated(note = "compatibility shim; use DbPool::with_rollback_session and remove after session API migration")]
     #[instrument(skip(self, f))]
     pub async fn with_rollback_session_boxed<T, F>(&self, f: F) -> Result<T>
     where
