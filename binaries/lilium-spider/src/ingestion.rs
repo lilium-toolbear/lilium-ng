@@ -1,11 +1,11 @@
+use anyhow::Result;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use anyhow::Result;
+use tokio::sync::{mpsc, Mutex};
 
 use lilium_models::ingestion::EventEnvelope;
 
@@ -51,7 +51,10 @@ pub struct DiskSpillBuffer {
 
 impl DiskSpillBuffer {
     pub fn new(path: PathBuf) -> Self {
-        Self { path, _lock: Mutex::new(()) }
+        Self {
+            path,
+            _lock: Mutex::new(()),
+        }
     }
 
     pub async fn append(&self, event: &EventEnvelope) -> Result<()> {
@@ -157,7 +160,11 @@ pub struct EventIngestor {
 }
 
 impl EventIngestor {
-    pub fn new(account_user_id: String, max_queue_size: usize, spill: DiskSpillBuffer) -> (Self, mpsc::Receiver<EventEnvelope>) {
+    pub fn new(
+        account_user_id: String,
+        max_queue_size: usize,
+        spill: DiskSpillBuffer,
+    ) -> (Self, mpsc::Receiver<EventEnvelope>) {
         let (tx, rx) = mpsc::channel(max_queue_size);
         let ingestor = Self {
             account_user_id,
@@ -261,7 +268,11 @@ impl EventWriter {
     pub async fn drain_once(&self) -> Result<usize> {
         // First try disk spill replay
         if self.ingestor.spill().has_pending().await {
-            let events = self.ingestor.spill().read_replay_batch(self.batch_size).await?;
+            let events = self
+                .ingestor
+                .spill()
+                .read_replay_batch(self.batch_size)
+                .await?;
             if !events.is_empty() {
                 return self.insert_replay_batch(&events).await;
             }
@@ -276,7 +287,8 @@ impl EventWriter {
         let count = events.len();
         // In real implementation, would batch insert to DB
         self.ingestor.spill().discard_replay_batch(count).await?;
-        self.inserted_count.fetch_add(count as u64, Ordering::Relaxed);
+        self.inserted_count
+            .fetch_add(count as u64, Ordering::Relaxed);
         Ok(count)
     }
 
@@ -340,7 +352,9 @@ mod tests {
 
         spill.append(&make_event(1)).await.unwrap();
 
-        let raw = tokio::fs::read_to_string(tmp.path().join("ws_buffer_user_a.jsonl")).await.unwrap();
+        let raw = tokio::fs::read_to_string(tmp.path().join("ws_buffer_user_a.jsonl"))
+            .await
+            .unwrap();
         assert!(raw.contains("schema_version"));
         assert!(raw.contains("account_user_id"));
         assert!(raw.contains("event_type"));
@@ -357,7 +371,10 @@ mod tests {
 
         let result = spill.read_replay_batch(10).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("LegacySpillBufferError"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("LegacySpillBufferError"));
     }
 
     #[tokio::test]

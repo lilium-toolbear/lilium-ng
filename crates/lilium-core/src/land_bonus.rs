@@ -78,6 +78,17 @@ mod tests {
     }
 
     #[test]
+    fn test_capped_bonus_negative() {
+        assert_eq!(capped_bonus(-100.0, 500.0, 1.0), 0.0);
+    }
+
+    #[test]
+    fn test_capped_bonus_exact() {
+        assert_eq!(capped_bonus(500.0, 500.0, 1.0), 0.5);
+        assert_eq!(capped_bonus(2000.0, 500.0, 1.0), 2000.0 / 2500.0);
+    }
+
+    #[test]
     fn test_s_curve_zero_level() {
         assert_eq!(s_curve_multiplier(0, 4.0, 6.0, 2.0), 1.0);
     }
@@ -87,5 +98,63 @@ mod tests {
         assert!(calculate_farm_time_bonus(500.0) > 0.0);
         assert!(calculate_farm_capacity_bonus(1000.0) > 0.0);
         assert!(calculate_farm_harvest_bonus(1200.0) > 0.0);
+    }
+
+    #[test]
+    fn test_farm_time_bonus_exact() {
+        assert!((calculate_farm_time_bonus(500.0) - 0.5).abs() < 0.001);
+        assert!((calculate_farm_time_bonus(5000.0) - 5000.0 / 5500.0).abs() < 0.001);
+        assert!(calculate_farm_time_bonus(5000.0) < 1.0);
+    }
+
+    #[test]
+    fn test_farm_capacity_bonus_exact() {
+        assert!((calculate_farm_capacity_bonus(500.0) - 2.5 * 500.0 / 1500.0).abs() < 0.001);
+        assert!(calculate_farm_capacity_bonus(100_000.0) < 2.5);
+    }
+
+    #[test]
+    fn test_warehouse_capacity_bonus_exact() {
+        assert!((calculate_warehouse_capacity_bonus(333.0) - 1.0).abs() < 0.001);
+        assert_eq!(calculate_warehouse_capacity_bonus(0.0), 0.0);
+        assert_eq!(calculate_warehouse_capacity_bonus(-100.0), 0.0);
+    }
+
+    #[test]
+    fn test_credit_income_per_hour_exact() {
+        assert_eq!(calculate_credit_income_per_hour(100.0), 10000.0);
+        assert_eq!(calculate_credit_income_per_hour(500.0), 50000.0);
+    }
+
+    #[test]
+    fn test_resource_level_multiplier_exact() {
+        assert_eq!(calculate_resource_level_multiplier(0), 1.0);
+        assert!((calculate_resource_level_multiplier(1) - (1.0 + 4.0 / 37.0)).abs() < 0.001);
+        assert_eq!(calculate_resource_level_multiplier(6), 3.0);
+        assert!(calculate_resource_level_multiplier(18) < 5.0);
+        assert!(calculate_resource_level_multiplier(18) > calculate_resource_level_multiplier(10));
+    }
+
+    #[test]
+    fn test_resource_cache_hours_exact() {
+        assert_eq!(calculate_resource_cache_hours(0), 24.0);
+        assert!((calculate_resource_cache_hours(10) - 96.0).abs() < 0.001);
+        assert!(calculate_resource_cache_hours(18) < 168.0);
+        assert!(calculate_resource_cache_hours(18) > calculate_resource_cache_hours(10));
+    }
+
+    #[test]
+    fn test_resource_worker_multiplier_exact() {
+        assert_eq!(calculate_resource_worker_multiplier(0.0), 0.0);
+        assert!((calculate_resource_worker_multiplier(1200.0) - 1.5).abs() < 0.001);
+        assert!(calculate_resource_worker_multiplier(1_000_000.0) < 3.0);
+    }
+
+    #[test]
+    fn test_resource_income_per_hour_exact() {
+        let base = 200.0 * 1200.0;
+        assert_eq!(calculate_resource_income_per_hour(0.0, 10), 0.0);
+        assert!((calculate_resource_income_per_hour(1200.0, 0) - base * 1.5).abs() < 0.001);
+        assert!((calculate_resource_income_per_hour(1200.0, 6) - base * 1.5 * 3.0).abs() < 0.001);
     }
 }

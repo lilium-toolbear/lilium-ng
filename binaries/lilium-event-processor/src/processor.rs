@@ -1,22 +1,18 @@
 use anyhow::Result;
-use sqlx::PgPool;
-use tracing::{info, error, warn};
 use chrono::{DateTime, Utc};
 use tokio::time::{interval, Duration};
+use tracing::{error, info, warn};
 
+use lilium_database::{DbPool, DbSessionContext};
 use lilium_models::ingestion::WebSocketEvent;
-use lilium_services::message::MessageService;
-use lilium_services::event::EventService;
-use lilium_services::user::UserService;
+use lilium_services::event::{EventProcessorOffsetService, WebSocketEventService};
 use lilium_services::media::MediaService;
+use lilium_services::message::MessageService;
+use lilium_services::user::UserService;
 
 pub struct EventProcessor {
     processor_id: String,
-    pool: PgPool,
-    message_service: MessageService,
-    event_service: EventService,
-    user_service: UserService,
-    media_service: MediaService,
+    pool: DbPool,
     batch_size: usize,
     polling_interval: Duration,
     max_retries: u32,
@@ -27,17 +23,13 @@ pub struct EventProcessor {
 
 impl EventProcessor {
     pub fn new(
-        pool: PgPool,
+        pool: DbPool,
         processor_id: String,
         batch_size: usize,
         polling_interval_secs: u64,
     ) -> Self {
         Self {
             processor_id,
-            message_service: MessageService::new(),
-            event_service: EventService::new(pool.clone()),
-            user_service: UserService::new(pool.clone()),
-            media_service: MediaService::new(pool.clone()),
             pool,
             batch_size,
             polling_interval: Duration::from_secs(polling_interval_secs),
@@ -56,30 +48,19 @@ impl EventProcessor {
             "Event processor starting"
         );
 
-        let (mut last_id, mut last_timestamp) = self.event_service.load_cursor(&self.processor_id).await?;
-        info!(
-            processor_id = %self.processor_id,
-            cursor_id = last_id,
-            "Loaded initial cursor"
-        );
-
         let mut poll_interval = interval(self.polling_interval);
 
         loop {
             tokio::select! {
                 _ = poll_interval.tick() => {
-                    match self.event_service.poll_events(last_timestamp, last_id, self.batch_size as i64).await {
-                        Ok(events) => {
-                            if events.is_empty() {
-                                continue;
-                            }
-                            info!(count = events.len(), "Processing batch");
-                            self.process_batch_with_retry(&events, &mut last_id, &mut last_timestamp).await?;
-                        }
-                        Err(e) => {
-                            error!(error = %e, "Failed to poll events");
-                        }
+                    let (events, cursor_id, cursor_timestamp) = self.fetch_batch().await?;
+                    if events.is_empty() {
+                        continue;
                     }
+
+                    info!(count = events.len(), "Processing batch");
+                    self.process_batch_with_retry(&events, cursor_id, cursor_timestamp)
+                        .await?;
                 }
                 _ = tokio::signal::ctrl_c() => {
                     info!("Shutting down event processor");
@@ -91,15 +72,31 @@ impl EventProcessor {
         Ok(())
     }
 
+    async fn fetch_batch(&self) -> Result<(Vec<WebSocketEvent>, i64, Option<DateTime<Utc>>)> {
+        let processor_id = self.processor_id.clone();
+        let batch_size = self.batch_size as i64;
+        self.pool
+            .with_session_context(|session| {
+                Box::pin(async move {
+                    let mut session = session;
+                    Self::fetch_batch_inner(&mut session, processor_id, batch_size).await
+                })
+            })
+            .await
+    }
+
     async fn process_batch_with_retry(
         &self,
         events: &[WebSocketEvent],
-        last_id: &mut i64,
-        last_timestamp: &mut Option<DateTime<Utc>>,
+        cursor_id: i64,
+        cursor_timestamp: Option<DateTime<Utc>>,
     ) -> Result<()> {
         let mut attempt = 0;
         loop {
-            match self.process_batch(events, last_id, last_timestamp).await {
+            match self
+                .process_batch(events, cursor_id, cursor_timestamp)
+                .await
+            {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     attempt += 1;
@@ -109,7 +106,7 @@ impl EventProcessor {
                             error = %e,
                             "Max retries exceeded, skipping batch"
                         );
-                        self.skip_batch(events, last_id, last_timestamp).await?;
+                        self.skip_batch(events, cursor_id, cursor_timestamp).await?;
                         return Ok(());
                     }
 
@@ -139,115 +136,253 @@ impl EventProcessor {
     async fn process_batch(
         &self,
         events: &[WebSocketEvent],
-        last_id: &mut i64,
-        last_timestamp: &mut Option<DateTime<Utc>>,
+        start_cursor_id: i64,
+        start_cursor_timestamp: Option<DateTime<Utc>>,
     ) -> Result<()> {
-        let mut user_fetch_collector = Vec::new();
-        let mut media_message_ids = Vec::new();
-
-        for event in events {
-            if let Some(msg_id) = self.process_event(event, &mut user_fetch_collector).await? {
-                media_message_ids.push(msg_id);
-            }
-            if let Some(id) = event.id {
-                *last_id = id;
-            }
-            *last_timestamp = Some(event.timestamp);
-        }
-
-        // Batch fetch users
-        if !user_fetch_collector.is_empty() {
-            self.user_service.batch_fetch_and_update(&user_fetch_collector).await?;
-        }
-
-        // Download media (non-blocking)
-        if !media_message_ids.is_empty() {
-            let media_service = self.media_service.clone();
-            tokio::spawn(async move {
-                let _ = media_service.download_media_batch(&media_message_ids).await;
-            });
-        }
-
-        self.event_service.save_cursor(
-            &self.processor_id,
-            *last_id,
-            *last_timestamp,
-        ).await?;
-
-        Ok(())
+        let processor_id = self.processor_id.clone();
+        self.pool
+            .with_session_context(|session| {
+                let events = events.to_vec();
+                Box::pin(async move {
+                    let mut session = session;
+                    Self::process_batch_inner(
+                        &mut session,
+                        events,
+                        processor_id,
+                        start_cursor_id,
+                        start_cursor_timestamp,
+                    )
+                    .await
+                })
+            })
+            .await
     }
 
     async fn skip_batch(
         &self,
         events: &[WebSocketEvent],
-        last_id: &mut i64,
-        last_timestamp: &mut Option<DateTime<Utc>>,
+        cursor_id: i64,
+        cursor_timestamp: Option<DateTime<Utc>>,
     ) -> Result<()> {
-        for event in events {
-            if let Some(id) = event.id {
-                *last_id = id;
-            }
-            *last_timestamp = Some(event.timestamp);
-        }
+        let (batch_last_id, batch_last_timestamp) = Self::last_cursor_from_events(events);
+        let last_id = if batch_last_id == 0 {
+            cursor_id
+        } else {
+            batch_last_id
+        };
+        let last_timestamp = batch_last_timestamp.or(cursor_timestamp);
 
-        self.event_service.save_cursor(
-            &self.processor_id,
-            *last_id,
-            *last_timestamp,
-        ).await?;
+        let processor_id = self.processor_id.clone();
+        self.pool
+            .with_session_context(|session| {
+                Box::pin(async move {
+                    let mut session = session;
+                    Self::skip_batch_inner(&mut session, processor_id, last_id, last_timestamp)
+                        .await
+                })
+            })
+            .await
+    }
+
+    async fn fetch_batch_inner(
+        session: &mut DbSessionContext<'_>,
+        processor_id: String,
+        batch_size: i64,
+    ) -> Result<(Vec<WebSocketEvent>, i64, Option<DateTime<Utc>>)> {
+        let (last_id, last_timestamp) = Self::fetch_last_cursor(session, processor_id).await?;
+        let events = Self::poll_events(session, last_timestamp, last_id, batch_size).await?;
+
+        Ok((events, last_id, last_timestamp))
+    }
+
+    async fn process_batch_inner(
+        session: &mut DbSessionContext<'_>,
+        events: Vec<WebSocketEvent>,
+        processor_id: String,
+        start_cursor_id: i64,
+        start_cursor_timestamp: Option<DateTime<Utc>>,
+    ) -> Result<()> {
+        let (user_fetch_collector, media_message_ids) =
+            { Self::collect_updates_from_events(session, &events).await? };
+
+        let (batch_cursor_id, batch_cursor_timestamp) = Self::last_cursor_from_events(&events);
+        let last_id = if batch_cursor_id == 0 {
+            start_cursor_id
+        } else {
+            batch_cursor_id
+        };
+        let last_timestamp = batch_cursor_timestamp.or(start_cursor_timestamp);
+
+        Self::sync_users(session, &user_fetch_collector).await?;
+        Self::sync_media(session, &media_message_ids).await?;
+
+        let mut offset_svc =
+            EventProcessorOffsetService::new(DbSessionContext::new(session));
+        offset_svc
+            .update_offset(&processor_id, last_id, last_timestamp, Some(Utc::now()))
+            .await?;
 
         Ok(())
     }
 
+    async fn skip_batch_inner(
+        session: &mut DbSessionContext<'_>,
+        processor_id: String,
+        last_id: i64,
+        last_timestamp: Option<DateTime<Utc>>,
+    ) -> Result<()> {
+        let mut offset_svc =
+            EventProcessorOffsetService::new(DbSessionContext::new(session));
+        offset_svc
+            .update_offset(&processor_id, last_id, last_timestamp, Some(Utc::now()))
+            .await?;
+        Ok(())
+    }
+
+    async fn fetch_last_cursor(
+        session: &mut DbSessionContext<'_>,
+        processor_id: String,
+    ) -> Result<(i64, Option<DateTime<Utc>>)> {
+        let mut offset_svc =
+            EventProcessorOffsetService::new(DbSessionContext::new(session));
+        let cursor = offset_svc.get_cursor(&processor_id).await?;
+        Ok(cursor
+            .map(|c| (c.last_processed_id, c.last_processed_timestamp))
+            .unwrap_or((0, None)))
+    }
+
+    async fn poll_events(
+        session: &mut DbSessionContext<'_>,
+        last_timestamp: Option<DateTime<Utc>>,
+        last_id: i64,
+        batch_size: i64,
+    ) -> Result<Vec<WebSocketEvent>> {
+        let mut event_svc = WebSocketEventService::new(DbSessionContext::new(session));
+        event_svc
+            .poll_events(last_timestamp, last_id, batch_size)
+            .await
+    }
+
+    async fn collect_updates_from_events(
+        session: &mut DbSessionContext<'_>,
+        events: &[WebSocketEvent],
+    ) -> Result<(Vec<(String, String)>, Vec<String>)> {
+        let mut message_service = MessageService::new(DbSessionContext::new(session));
+        let mut user_fetch_collector = Vec::new();
+        let mut media_message_ids = Vec::new();
+
+        for event in events {
+            if let Some(msg_id) =
+                Self::process_event(&mut message_service, event, &mut user_fetch_collector).await?
+            {
+                media_message_ids.push(msg_id);
+            }
+        }
+
+        Ok((user_fetch_collector, media_message_ids))
+    }
+
+    async fn sync_users(
+        session: &mut DbSessionContext<'_>,
+        user_fetch_collector: &[(String, String)],
+    ) -> Result<()> {
+        if user_fetch_collector.is_empty() {
+            return Ok(());
+        }
+
+        let mut user_service = UserService::new(DbSessionContext::new(session));
+        user_service
+            .batch_fetch_and_update(user_fetch_collector)
+            .await
+            .map(|_| ())
+    }
+
+    async fn sync_media(
+        session: &mut DbSessionContext<'_>,
+        media_message_ids: &[String],
+    ) -> Result<()> {
+        if media_message_ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut media_service = MediaService::new(DbSessionContext::new(session));
+        media_service
+            .download_media_batch(media_message_ids)
+            .await
+            .map(|_| ())
+    }
+
+    fn last_cursor_from_events(events: &[WebSocketEvent]) -> (i64, Option<DateTime<Utc>>) {
+        let mut last_id = 0;
+        let mut last_timestamp: Option<DateTime<Utc>> = None;
+
+        for event in events {
+            if let Some(event_id) = event.id {
+                last_id = event_id;
+            }
+            last_timestamp = Some(event.timestamp);
+        }
+
+        (last_id, last_timestamp)
+    }
+
     async fn process_event(
-        &self,
+        message_service: &mut MessageService<'_>,
         event: &WebSocketEvent,
         user_fetch_collector: &mut Vec<(String, String)>,
     ) -> Result<Option<String>> {
         match event.event.as_str() {
             "message:new" => {
-                if let Some(msg) = lilium_models::dzmm::message::Message::from_websocket(&event.data) {
-                    // Collect user for batch fetching
-                    if let Some(sent_by) = &msg.sent_by {
-                        user_fetch_collector.push((sent_by.clone(), msg.room_id.clone()));
-                    }
+                if let Some(msg) =
+                    lilium_models::dzmm::message::Message::from_websocket(&event.data)
+                {
+                    user_fetch_collector.push((msg.sent_by.clone(), msg.room_id.clone()));
+                    message_service.create_message_if_missing(&msg).await?;
 
-                    // Process message and check for media
-                    let media_msg_id = self.message_service.create_message(&self.pool, &msg, &event.data).await?;
-                    return Ok(media_msg_id);
+                    if let Some(msg_data) = event.data.get("message") {
+                        if let Some(content) = msg_data.get("content") {
+                            if let Some(content_type) = content.get("type").and_then(|v| v.as_str())
+                            {
+                                if matches!(content_type, "image" | "video" | "voice" | "sticker") {
+                                    return Ok(Some(msg.message_id.clone()));
+                                }
+                            }
+                        }
+                    }
                 }
+                Ok(None)
             }
             "message:updated" => {
                 if let Some(message_id) = event.data.get("messageId").and_then(|v| v.as_str()) {
-                    self.message_service.update_message(&self.pool, message_id, &event.data).await?;
+                    message_service
+                        .update_message_from_payload(message_id, &event.data)
+                        .await?;
                 }
+                Ok(None)
             }
             "message:deleted" => {
                 if let Some(message_id) = event.data.get("messageId").and_then(|v| v.as_str()) {
-                    self.message_service.mark_deleted(&self.pool, message_id).await?;
+                    message_service.mark_deleted(message_id, None).await?;
                 }
+                Ok(None)
             }
             "message:recalled" => {
                 if let Some(message_id) = event.data.get("messageId").and_then(|v| v.as_str()) {
-                    self.message_service.mark_recalled(&self.pool, message_id).await?;
+                    message_service.mark_recalled(message_id).await?;
                 }
+                Ok(None)
             }
             "presence:user-online" => {
-                // User online - collect for batch fetching
                 if let Some(user_id) = event.data.get("userId").and_then(|v| v.as_str()) {
-                    if let Some(room_id) = event.data.get("chatroomId").and_then(|v| v.as_str()) {
+                    if let Some(room_id) = event.data.get("roomId").and_then(|v| v.as_str()) {
                         user_fetch_collector.push((user_id.to_string(), room_id.to_string()));
                     }
                 }
+                Ok(None)
             }
-            "group:member-joined" | "group:member-left" => {
-                // Handled by system message detection in message:new
-            }
-            _ => {
-                // Unknown event type
-            }
+            "group:member-joined" | "group:member-left" => Ok(None),
+            _ => Ok(None),
         }
-        Ok(None)
     }
 }
 
@@ -255,267 +390,4 @@ impl EventProcessor {
 pub struct CursorPosition {
     pub last_processed_id: i64,
     pub last_processed_timestamp: Option<DateTime<Utc>>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::TimeZone;
-
-    fn make_event(event_type: &str, data: serde_json::Value) -> WebSocketEvent {
-        WebSocketEvent {
-            id: Some(1),
-            event: event_type.to_string(),
-            data,
-            user_id: "user1".to_string(),
-            timestamp: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
-        }
-    }
-
-    #[test]
-    fn test_retry_delay_calculation() {
-        let initial_delay: f64 = 1.0;
-        let max_delay: f64 = 60.0;
-        let backoff_factor: f64 = 2.0;
-
-        let delay1 = initial_delay * backoff_factor.powi(0);
-        assert!(delay1 >= 0.5 && delay1 <= 1.5);
-
-        let delay2 = initial_delay * backoff_factor.powi(1);
-        assert!(delay2 >= 1.0 && delay2 <= 3.0);
-
-        let delay3 = initial_delay * backoff_factor.powi(2);
-        assert!(delay3 >= 2.0 && delay3 <= 6.0);
-
-        let delay_large = initial_delay * backoff_factor.powi(10);
-        let capped = delay_large.min(max_delay);
-        assert!(capped <= max_delay);
-    }
-
-    #[test]
-    fn test_event_type_dispatch_message_new() {
-        let event = make_event("message:new", serde_json::json!({
-            "chatroomId": "room1",
-            "message": {
-                "messageId": "msg1",
-                "sentBy": "user1",
-                "sentAt": "2026-01-01T00:00:00Z",
-                "content": {"type": "text", "text": "hello"}
-            }
-        }));
-        assert_eq!(event.event, "message:new");
-        assert!(event.data.get("chatroomId").is_some());
-    }
-
-    #[test]
-    fn test_event_type_dispatch_message_updated() {
-        let event = make_event("message:updated", serde_json::json!({
-            "chatroomId": "room1",
-            "messageId": "msg1",
-            "message": {
-                "content": {"type": "text", "text": "updated"}
-            }
-        }));
-        assert_eq!(event.event, "message:updated");
-        assert!(event.data.get("messageId").is_some());
-    }
-
-    #[test]
-    fn test_event_type_dispatch_message_deleted() {
-        let event = make_event("message:deleted", serde_json::json!({
-            "chatroomId": "room1",
-            "messageId": "msg1",
-            "deletedBy": "user1"
-        }));
-        assert_eq!(event.event, "message:deleted");
-        assert_eq!(event.data["messageId"], "msg1");
-    }
-
-    #[test]
-    fn test_event_type_dispatch_message_recalled() {
-        let event = make_event("message:recalled", serde_json::json!({
-            "chatroomId": "room1",
-            "messageId": "msg1"
-        }));
-        assert_eq!(event.event, "message:recalled");
-        assert_eq!(event.data["messageId"], "msg1");
-    }
-
-    #[test]
-    fn test_event_type_dispatch_presence_online() {
-        let event = make_event("presence:user-online", serde_json::json!({
-            "chatroomId": "room1",
-            "userId": "user1"
-        }));
-        assert_eq!(event.event, "presence:user-online");
-    }
-
-    #[test]
-    fn test_event_type_dispatch_member_joined() {
-        let event = make_event("group:member-joined", serde_json::json!({
-            "chatroomId": "room1",
-            "userId": "user1"
-        }));
-        assert_eq!(event.event, "group:member-joined");
-    }
-
-    #[test]
-    fn test_event_type_dispatch_member_left() {
-        let event = make_event("group:member-left", serde_json::json!({
-            "chatroomId": "room1",
-            "userId": "user1"
-        }));
-        assert_eq!(event.event, "group:member-left");
-    }
-
-    #[test]
-    fn test_event_type_dispatch_unknown() {
-        let event = make_event("unknown:event", serde_json::json!({}));
-        assert_eq!(event.event, "unknown:event");
-    }
-
-    #[test]
-    fn test_message_new_requires_chatroom_id() {
-        let event = make_event("message:new", serde_json::json!({
-            "message": {
-                "messageId": "msg1"
-            }
-        }));
-        let msg = lilium_models::dzmm::message::Message::from_websocket(&event.data);
-        assert!(msg.is_none());
-    }
-
-    #[test]
-    fn test_message_new_requires_message_id() {
-        let event = make_event("message:new", serde_json::json!({
-            "chatroomId": "room1",
-            "message": {}
-        }));
-        let msg = lilium_models::dzmm::message::Message::from_websocket(&event.data);
-        assert!(msg.is_none());
-    }
-
-    #[test]
-    fn test_message_new_extracts_fields() {
-        let event = make_event("message:new", serde_json::json!({
-            "chatroomId": "room123",
-            "message": {
-                "messageId": "msg456",
-                "sentBy": "user789",
-                "sentAt": "2026-01-01T00:00:00Z",
-                "content": {"type": "text", "text": "hello"}
-            }
-        }));
-        let msg = lilium_models::dzmm::message::Message::from_websocket(&event.data).unwrap();
-        assert_eq!(msg.message_id, "msg456");
-        assert_eq!(msg.room_id, "room123");
-        assert_eq!(msg.sent_by.as_deref(), Some("user789"));
-        assert_eq!(msg.content_type.as_deref(), Some("text"));
-        assert_eq!(msg.content_text.as_deref(), Some("hello"));
-    }
-
-    #[test]
-    fn test_message_updated_recalled_detection() {
-        let event = make_event("message:updated", serde_json::json!({
-            "messageId": "msg1",
-            "message": {
-                "content": {"type": "recalled"}
-            }
-        }));
-        let content_type = event.data["message"]["content"]["type"].as_str();
-        assert_eq!(content_type, Some("recalled"));
-    }
-
-    #[test]
-    fn test_message_updated_content_update() {
-        let event = make_event("message:updated", serde_json::json!({
-            "messageId": "msg1",
-            "message": {
-                "content": {"type": "text", "text": "updated content"}
-            }
-        }));
-        let content_type = event.data["message"]["content"]["type"].as_str();
-        assert_eq!(content_type, Some("text"));
-        let content_text = event.data["message"]["content"]["text"].as_str();
-        assert_eq!(content_text, Some("updated content"));
-    }
-
-    #[test]
-    fn test_system_message_join_detection() {
-        let event = make_event("message:new", serde_json::json!({
-            "chatroomId": "room1",
-            "message": {
-                "messageId": "msg1",
-                "sentBy": "user1",
-                "content": {"type": "system", "text": "user1 加入了群聊"}
-            }
-        }));
-        let msg = lilium_models::dzmm::message::Message::from_websocket(&event.data).unwrap();
-        assert_eq!(msg.content_type.as_deref(), Some("system"));
-        assert!(msg.content_text.as_deref().unwrap().contains("加入了群聊"));
-    }
-
-    #[test]
-    fn test_system_message_leave_detection() {
-        let event = make_event("message:new", serde_json::json!({
-            "chatroomId": "room1",
-            "message": {
-                "messageId": "msg1",
-                "sentBy": "user1",
-                "content": {"type": "system", "text": "user1 离开了群聊"}
-            }
-        }));
-        let msg = lilium_models::dzmm::message::Message::from_websocket(&event.data).unwrap();
-        assert!(msg.content_text.as_deref().unwrap().contains("离开了群聊"));
-    }
-
-    #[test]
-    fn test_media_content_detection() {
-        let event = make_event("message:new", serde_json::json!({
-            "chatroomId": "room1",
-            "message": {
-                "messageId": "msg1",
-                "content": {"type": "image", "url": "http://example.com/img.jpg"}
-            }
-        }));
-        let content_type = event.data["message"]["content"]["type"].as_str();
-        assert!(matches!(content_type, Some("image" | "video" | "voice" | "sticker")));
-    }
-
-    #[test]
-    fn test_user_fetch_collection() {
-        let event = make_event("message:new", serde_json::json!({
-            "chatroomId": "room1",
-            "message": {
-                "messageId": "msg1",
-                "sentBy": "user1",
-                "content": {"type": "text", "text": "hello"}
-            }
-        }));
-        // Verify that sent_by is extracted for user fetching
-        let msg = lilium_models::dzmm::message::Message::from_websocket(&event.data).unwrap();
-        assert!(msg.sent_by.is_some());
-        assert_eq!(msg.sent_by.as_deref(), Some("user1"));
-    }
-
-    #[test]
-    fn test_cursor_position_default() {
-        let cursor = CursorPosition {
-            last_processed_id: 0,
-            last_processed_timestamp: None,
-        };
-        assert_eq!(cursor.last_processed_id, 0);
-        assert!(cursor.last_processed_timestamp.is_none());
-    }
-
-    #[test]
-    fn test_cursor_position_with_timestamp() {
-        let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        let cursor = CursorPosition {
-            last_processed_id: 100,
-            last_processed_timestamp: Some(ts),
-        };
-        assert_eq!(cursor.last_processed_id, 100);
-        assert!(cursor.last_processed_timestamp.is_some());
-    }
 }

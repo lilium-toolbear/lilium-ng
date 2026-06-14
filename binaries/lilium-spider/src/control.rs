@@ -50,17 +50,20 @@ impl ControlCommand {
     }
 
     pub fn from_json(s: &str) -> Result<Self, String> {
-        let payload: serde_json::Value = serde_json::from_str(s)
-            .map_err(|e| format!("Invalid JSON: {}", e))?;
+        let payload: serde_json::Value =
+            serde_json::from_str(s).map_err(|e| format!("Invalid JSON: {}", e))?;
 
-        let action_str = payload.get("action")
+        let action_str = payload
+            .get("action")
             .and_then(|v| v.as_str())
             .ok_or("Missing 'action' field")?;
 
-        let action: ControlAction = serde_json::from_value(serde_json::Value::String(action_str.to_string()))
-            .map_err(|e| format!("Invalid action: {}", e))?;
+        let action: ControlAction =
+            serde_json::from_value(serde_json::Value::String(action_str.to_string()))
+                .map_err(|e| format!("Invalid action: {}", e))?;
 
-        let account_user_id = payload.get("account_user_id")
+        let account_user_id = payload
+            .get("account_user_id")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
@@ -68,7 +71,8 @@ impl ControlCommand {
             validate_account_user_id(uid)?;
         }
 
-        let reason = payload.get("reason")
+        let reason = payload
+            .get("reason")
             .and_then(|v| v.as_str())
             .unwrap_or("requested")
             .to_string();
@@ -89,7 +93,12 @@ pub fn validate_account_user_id(account_user_id: &str) -> Result<(), String> {
     if parts.len() != 5 {
         return Err("account_user_id must be a canonical UUID string".to_string());
     }
-    if parts[0].len() != 8 || parts[1].len() != 4 || parts[2].len() != 4 || parts[3].len() != 4 || parts[4].len() != 12 {
+    if parts[0].len() != 8
+        || parts[1].len() != 4
+        || parts[2].len() != 4
+        || parts[3].len() != 4
+        || parts[4].len() != 12
+    {
         return Err("account_user_id must be a canonical UUID string".to_string());
     }
     for part in &parts {
@@ -110,11 +119,19 @@ pub struct ControlResponse {
 
 impl ControlResponse {
     pub fn success(message: impl Into<String>) -> Self {
-        Self { ok: true, message: message.into(), data: None }
+        Self {
+            ok: true,
+            message: message.into(),
+            data: None,
+        }
     }
 
     pub fn error(message: impl Into<String>) -> Self {
-        Self { ok: false, message: message.into(), data: None }
+        Self {
+            ok: false,
+            message: message.into(),
+            data: None,
+        }
     }
 
     pub fn with_data(mut self, data: serde_json::Value) -> Self {
@@ -140,11 +157,17 @@ pub struct UnixSocketIdentity {
 impl UnixSocketIdentity {
     pub fn from_metadata(meta: &std::fs::Metadata) -> Self {
         use std::os::unix::fs::MetadataExt;
-        Self { dev: meta.dev(), ino: meta.ino() }
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        }
     }
 }
 
-pub async fn write_message(writer: &mut tokio::net::UnixStream, msg: &str) -> Result<(), std::io::Error> {
+pub async fn write_message(
+    writer: &mut tokio::net::UnixStream,
+    msg: &str,
+) -> Result<(), std::io::Error> {
     use tokio::io::AsyncWriteExt;
     writer.write_all(msg.as_bytes()).await?;
     writer.write_all(b"\n").await?;
@@ -175,7 +198,10 @@ mod tests {
         let json = cmd.to_json();
         let parsed = ControlCommand::from_json(&json).unwrap();
         assert_eq!(parsed.action, ControlAction::Status);
-        assert_eq!(parsed.account_user_id.as_deref(), Some("550e8400-e29b-41d4-a716-446655440000"));
+        assert_eq!(
+            parsed.account_user_id.as_deref(),
+            Some("550e8400-e29b-41d4-a716-446655440000")
+        );
     }
 
     #[test]
@@ -198,14 +224,16 @@ mod tests {
             account_user_id: None,
             reason: String::new(),
             data: None,
-        }.requires_account());
+        }
+        .requires_account());
 
         assert!(!ControlCommand {
             action: ControlAction::Status,
             account_user_id: None,
             reason: String::new(),
             data: None,
-        }.requires_account());
+        }
+        .requires_account());
     }
 
     #[test]
@@ -215,14 +243,16 @@ mod tests {
             account_user_id: None,
             reason: String::new(),
             data: None,
-        }.is_arbiter_action());
+        }
+        .is_arbiter_action());
 
         assert!(!ControlCommand {
             action: ControlAction::Reload,
             account_user_id: None,
             reason: String::new(),
             data: None,
-        }.is_arbiter_action());
+        }
+        .is_arbiter_action());
     }
 
     #[test]
@@ -256,7 +286,8 @@ mod tests {
 
     #[test]
     fn test_from_json_accepts_valid_uuid() {
-        let json = r#"{"action": "reload", "account_user_id": "550e8400-e29b-41d4-a716-446655440000"}"#;
+        let json =
+            r#"{"action": "reload", "account_user_id": "550e8400-e29b-41d4-a716-446655440000"}"#;
         let cmd = ControlCommand::from_json(json).unwrap();
         assert_eq!(cmd.action, ControlAction::Reload);
     }

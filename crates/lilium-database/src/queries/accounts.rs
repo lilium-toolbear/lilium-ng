@@ -1,17 +1,14 @@
-use sqlx::PgPool;
 use anyhow::Result;
+use sqlx::{Executor, Postgres};
 
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct Account {
-    pub user_id: String,
-    pub is_enabled: bool,
-}
-
-pub async fn list_enabled_account_ids(pool: &PgPool) -> Result<Vec<String>> {
+pub async fn list_enabled_account_ids<'e, E>(exec: &mut E) -> Result<Vec<String>>
+where
+    for<'q> &'q mut E: Executor<'q, Database = Postgres>,
+{
     let ids = sqlx::query_scalar::<_, String>(
-        "SELECT user_id FROM accounts WHERE is_enabled = true ORDER BY user_id",
+        "SELECT user_id FROM dzmm_account WHERE is_enabled = true ORDER BY user_id",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *exec)
     .await?;
     Ok(ids)
 }

@@ -1,12 +1,13 @@
 use anyhow::Result;
 use clap::Parser;
+use lilium_database::DbPool;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-mod config;
 mod arbiter;
-mod worker;
+mod config;
 mod control;
 mod ingestion;
+mod worker;
 
 #[derive(Parser)]
 #[command(name = "lilium-spider")]
@@ -19,8 +20,9 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| "info".into()))
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
@@ -30,7 +32,7 @@ async fn main() -> Result<()> {
 
     // Connect to database - do NOT run migrations
     // Migrations are managed separately by Alembic in the Python project
-    let pool = sqlx::PgPool::connect(&config.database.url).await?;
+    let pool = DbPool::connect(&config.database.url, config.database.pool_size).await?;
 
     let arbiter = arbiter::Arbiter::new(config, pool);
     arbiter.run().await

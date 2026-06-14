@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
+use lilium_database::DbPool;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod config;
@@ -16,8 +17,9 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| "info".into()))
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
@@ -26,7 +28,7 @@ async fn main() -> Result<()> {
     tracing::info!("Starting lilium-event-processor");
 
     // Connect to database - do NOT run migrations
-    let pool = sqlx::PgPool::connect(&config.database.url).await?;
+    let pool = DbPool::connect(&config.database.url, 5).await?;
 
     let processor = processor::EventProcessor::new(
         pool,

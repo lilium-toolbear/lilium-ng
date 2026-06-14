@@ -25,5 +25,6 @@ pub struct EventProcessorOffset {
     pub processor_id: String,
     pub last_processed_id: i64,
     pub last_processed_timestamp: Option<DateTime<Utc>>,
+    pub last_processed_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
 }

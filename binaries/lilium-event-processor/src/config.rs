@@ -1,5 +1,5 @@
-use serde::Deserialize;
 use anyhow::Result;
+use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
@@ -20,8 +20,12 @@ pub struct ProcessorConfig {
     pub batch_size: usize,
 }
 
-fn default_polling_interval() -> u64 { 5 }
-fn default_batch_size() -> usize { 100 }
+fn default_polling_interval() -> u64 {
+    5
+}
+fn default_batch_size() -> usize {
+    100
+}
 
 impl Config {
     pub fn load(path: &str) -> Result<Self> {

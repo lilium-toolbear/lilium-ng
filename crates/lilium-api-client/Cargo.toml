@@ -6,7 +6,8 @@ edition = "2021"
 [dependencies]
 lilium-common.workspace = true
 lilium-models.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["cookies", "multipart", "brotli"] }
+rand.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -14,4 +15,6 @@ anyhow.workspace = true
 tracing.workspace = true
 chrono.workspace = true
 tungstenite.workspace = true
+tokio-tungstenite.workspace = true
+futures.workspace = true
 url = "2"

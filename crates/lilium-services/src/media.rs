@@ -1,51 +1,76 @@
 use anyhow::Result;
-use sqlx::PgPool;
-use tracing::{info, warn};
+use lilium_database::DbSessionContext;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+use tracing::{info, warn};
 
 /// Service for downloading media
-#[derive(Clone)]
-pub struct MediaService {
-    pool: PgPool,
+pub struct MediaService<'a> {
+    session: DbSessionContext<'a>,
     data_path: PathBuf,
 }
 
-impl MediaService {
-    pub fn new(pool: PgPool) -> Self {
+impl<'a> MediaService<'a> {
+    pub fn new(session: DbSessionContext<'a>) -> Self {
         Self {
-            pool,
+            session,
             data_path: PathBuf::from("./data"),
         }
     }
 
-    pub fn with_data_path(pool: PgPool, data_path: PathBuf) -> Self {
-        Self { pool, data_path }
+    pub fn with_data_path(session: DbSessionContext<'a>, data_path: PathBuf) -> Self {
+        Self { session, data_path }
     }
 
     /// Download media for multiple messages in parallel
     /// Returns (success_count, failure_count)
-    pub async fn download_media_batch(&self, message_ids: &[String]) -> Result<(i64, i64)> {
+    pub async fn download_media_batch(&mut self, message_ids: &[String]) -> Result<(i64, i64)> {
         if message_ids.is_empty() {
             return Ok((0, 0));
         }
 
         info!(count = message_ids.len(), "Downloading media for messages");
 
-        let semaphore = Arc::new(Semaphore::new(10));
-        let mut success_count = 0;
-        let mut failure_count = 0;
+        let media_rows =
+            sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>)>(
+                r#"SELECT message_id, content_type, attachment_url, attachment_file
+               FROM messages WHERE message_id = ANY($1)"#,
+            )
+            .bind(message_ids)
+            .fetch_all(self.session.as_mut())
+            .await?;
 
-        let mut handles = Vec::new();
-        for message_id in message_ids {
+        let mut to_download: Vec<(String, String, String)> = Vec::new();
+        for (message_id, content_type, attachment_url, attachment_file) in media_rows {
+            if attachment_url.is_none() || attachment_file.is_some() {
+                continue;
+            }
+            let ext = Self::content_type_ext(content_type.as_deref().unwrap_or("other"));
+            to_download.push((message_id, attachment_url.unwrap(), ext.to_string()));
+        }
+
+        if to_download.is_empty() {
+            return Ok((0, 0));
+        }
+
+        let semaphore = Arc::new(Semaphore::new(10));
+        let mut success_count: i64 = 0;
+        let mut failure_count: i64 = 0;
+        let mut handles: Vec<tokio::task::JoinHandle<(String, Result<String>)>> = Vec::new();
+        let mut downloaded_files: Vec<(String, String)> = Vec::new();
+
+        for (message_id, attachment_url, ext) in to_download {
             let permit = semaphore.clone().acquire_owned().await?;
-            let message_id = message_id.clone();
-            let pool = self.pool.clone();
             let data_path = self.data_path.clone();
+            let message_id = message_id;
+            let attachment_url = attachment_url;
+            let ext = ext;
 
             let handle = tokio::spawn(async move {
-                let result = Self::download_single_media(&pool, &message_id, &data_path).await;
+                let result =
+                    Self::download_single_media(&message_id, &attachment_url, &ext, &data_path)
+                        .await;
                 drop(permit);
                 (message_id, result)
             });
@@ -55,8 +80,9 @@ impl MediaService {
 
         for handle in handles {
             match handle.await {
-                Ok((_, Ok(()))) => {
+                Ok((message_id, Ok(file_path))) => {
                     success_count += 1;
+                    downloaded_files.push((message_id, file_path));
                 }
                 Ok((message_id, Err(e))) => {
                     failure_count += 1;
@@ -65,6 +91,24 @@ impl MediaService {
                 Err(e) => {
                     failure_count += 1;
                     warn!(error = %e, "Media download task failed");
+                }
+            }
+        }
+
+        for (message_id, file_path) in downloaded_files {
+            match sqlx::query("UPDATE messages SET attachment_file = $1 WHERE message_id = $2")
+                .bind(&file_path)
+                .bind(&message_id)
+                .execute(self.session.as_mut())
+                .await
+            {
+                Ok(_) => {
+                    info!(message_id = %message_id, path = %file_path, "Persisted media attachment path");
+                }
+                Err(e) => {
+                    success_count = success_count.saturating_sub(1);
+                    failure_count += 1;
+                    warn!(message_id = %message_id, error = %e, "Failed to persist attachment file path");
                 }
             }
         }
@@ -78,50 +122,32 @@ impl MediaService {
         Ok((success_count, failure_count))
     }
 
-    /// Download media for a single message
-    async fn download_single_media(pool: &PgPool, message_id: &str, data_path: &PathBuf) -> Result<()> {
-        // Get message with media content
-        let message = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>)>(
-            r#"SELECT message_id, content_type, attachment_url, attachment_file
-               FROM messages WHERE message_id = $1"#,
-        )
-        .bind(message_id)
-        .fetch_optional(pool)
-        .await?;
-
-        if let Some((_, content_type, Some(url), _)) = message {
-            // Determine file extension based on content type
-            let ext = match content_type.as_deref() {
-                Some("image") => "jpg",
-                Some("video") => "mp4",
-                Some("voice") => "m4a",
-                Some("sticker") => "png",
-                _ => "bin",
-            };
-
-            // Create directory structure
-            let media_dir = data_path.join("media").join(message_id);
-            tokio::fs::create_dir_all(&media_dir).await?;
-
-            let file_path = media_dir.join(format!("attachment.{}", ext));
-
-            // Download the file
-            let response = reqwest::get(&url).await?;
-            let bytes = response.bytes().await?;
-            tokio::fs::write(&file_path, &bytes).await?;
-
-            // Update message with file path
-            sqlx::query(
-                "UPDATE messages SET attachment_file = $1 WHERE message_id = $2"
-            )
-            .bind(file_path.to_string_lossy().to_string())
-            .bind(message_id)
-            .execute(pool)
-            .await?;
-
-            info!(message_id = %message_id, path = %file_path.display(), "Downloaded media");
+    fn content_type_ext(content_type: &str) -> &'static str {
+        match content_type {
+            "image" => "jpg",
+            "video" => "mp4",
+            "voice" => "m4a",
+            "sticker" => "png",
+            _ => "bin",
         }
+    }
 
-        Ok(())
+    /// Download media for a single message
+    async fn download_single_media(
+        message_id: &str,
+        attachment_url: &str,
+        ext: &str,
+        data_path: &PathBuf,
+    ) -> Result<String> {
+        let media_dir = data_path.join("media").join(message_id);
+        tokio::fs::create_dir_all(&media_dir).await?;
+
+        let file_path = media_dir.join(format!("attachment.{}", ext));
+
+        let response = reqwest::get(attachment_url).await?;
+        let bytes = response.bytes().await?;
+        tokio::fs::write(&file_path, &bytes).await?;
+
+        Ok(file_path.to_string_lossy().to_string())
     }
 }
