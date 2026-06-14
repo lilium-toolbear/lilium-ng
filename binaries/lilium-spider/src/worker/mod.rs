@@ -1,13 +1,11 @@
 use anyhow::Result;
-use sqlx::PgPool;
-use tracing::{info, error};
 use std::sync::Arc;
+use tracing::{error, info};
 
-use crate::ingestion::{EventIngestor, EventWriter, DiskSpillBuffer};
+use crate::ingestion::{DiskSpillBuffer, EventIngestor, EventWriter};
 
 pub struct Worker {
     account_id: String,
-    pool: PgPool,
     queue_size: usize,
     batch_size: usize,
     buffer_dir: std::path::PathBuf,
@@ -16,27 +14,29 @@ pub struct Worker {
 impl Worker {
     pub fn new(
         account_id: String,
-        pool: PgPool,
         queue_size: usize,
         batch_size: usize,
         buffer_dir: std::path::PathBuf,
     ) -> Self {
-        Self { account_id, pool, queue_size, batch_size, buffer_dir }
+        Self {
+            account_id,
+            queue_size,
+            batch_size,
+            buffer_dir,
+        }
     }
 
     pub async fn run(&self) -> Result<()> {
         info!(account = %self.account_id, "Worker starting");
 
         // Create disk spill buffer
-        let buffer_path = self.buffer_dir.join(format!("ws_buffer_{}.jsonl", self.account_id));
+        let buffer_path = self
+            .buffer_dir
+            .join(format!("ws_buffer_{}.jsonl", self.account_id));
         let spill = DiskSpillBuffer::new(buffer_path);
 
         // Create event ingestor
-        let (ingestor, _rx) = EventIngestor::new(
-            self.account_id.clone(),
-            self.queue_size,
-            spill,
-        );
+        let (ingestor, _rx) = EventIngestor::new(self.account_id.clone(), self.queue_size, spill);
         let ingestor = Arc::new(ingestor);
 
         // Create event writer
@@ -69,10 +69,7 @@ impl Worker {
         Ok(())
     }
 
-    async fn run_writer(
-        writer: EventWriter,
-        account_id: String,
-    ) {
+    async fn run_writer(writer: EventWriter, account_id: String) {
         info!(account = %account_id, "Event writer starting");
 
         loop {
@@ -91,10 +88,7 @@ impl Worker {
         }
     }
 
-    async fn run_websocket(
-        account_id: String,
-        ingestor: Arc<EventIngestor>,
-    ) {
+    async fn run_websocket(account_id: String, _ingestor: Arc<EventIngestor>) {
         info!(account = %account_id, "WebSocket connection starting");
 
         // In a real implementation, this would:

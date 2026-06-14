@@ -5,6 +5,7 @@ members = [
     "crates/lilium-database",
     "crates/lilium-core",
     "crates/lilium-services",
+    "crates/lilium-api-client",
     "binaries/lilium-spider",
     "binaries/lilium-event-processor",
 ]
@@ -17,6 +18,7 @@ lilium-models = { path = "crates/lilium-models" }
 lilium-database = { path = "crates/lilium-database" }
 lilium-core = { path = "crates/lilium-core" }
 lilium-services = { path = "crates/lilium-services" }
+lilium-api-client = { path = "crates/lilium-api-client" }
 
 # 异步运行时
 tokio = { version = "1", features = ["full"] }
@@ -34,6 +36,8 @@ sqlx = { version = "0.8", features = [
 
 # WebSocket
 tungstenite = { version = "0.21", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+futures = "0.3"
 
 # HTTP
 reqwest = { version = "0.12", features = ["json"] }

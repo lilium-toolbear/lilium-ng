@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
@@ -10,6 +10,7 @@ pub struct Wallet {
     pub snapshot_balance: Decimal,
     pub snapshot_escrow_balance: Decimal,
     pub snapshot_tx_id: i64,
+    pub last_daily_credit: Option<NaiveDate>,
     pub total_credited: Decimal,
     pub created_at: DateTime<Utc>,
 }
@@ -27,7 +28,8 @@ pub struct WalletTransaction {
     pub memo: Option<String>,
     pub counterparty_id: String,
     pub tx_group_id: String,
-    pub metadata_json: Option<serde_json::Value>,
+    pub principal_id: Option<String>,
+    pub metadata: Option<serde_json::Value>,
     pub escrow_after: Option<Decimal>,
     pub created_at: DateTime<Utc>,
 }

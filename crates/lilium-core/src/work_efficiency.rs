@@ -63,4 +63,34 @@ mod tests {
         let m = calculate_work_efficiency_multiplier(0, 100, 0, 0, 0, 0, 0);
         assert!(m >= 1.0);
     }
+
+    #[test]
+    fn test_gender_balance_edge_cases() {
+        assert_eq!(calculate_gender_balance(0, 5), 0.0);
+        assert_eq!(calculate_gender_balance(7, 0), 0.0);
+    }
+
+    #[test]
+    fn test_gender_balance_perfect_split() {
+        assert_eq!(calculate_gender_balance(5, 5), 1.0);
+    }
+
+    #[test]
+    fn test_multiplier_full_diversity_capped() {
+        let m = calculate_work_efficiency_multiplier(226, 226, 12, 9, 226, 6, 6);
+        assert!((m - 1.55).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_multiplier_floor() {
+        let m = calculate_work_efficiency_multiplier(0, 226, 0, 0, 0, 0, 0);
+        assert_eq!(m, 1.0);
+    }
+
+    #[test]
+    fn test_multiplier_increases_with_more_active_species() {
+        let m_low = calculate_work_efficiency_multiplier(50, 226, 2, 2, 10, 6, 4);
+        let m_high = calculate_work_efficiency_multiplier(50, 226, 10, 6, 10, 6, 4);
+        assert!(m_high > m_low);
+    }
 }

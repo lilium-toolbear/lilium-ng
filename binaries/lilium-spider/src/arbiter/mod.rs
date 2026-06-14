@@ -1,16 +1,16 @@
+use anyhow::Result;
+use lilium_database::DbPool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use anyhow::Result;
-use sqlx::PgPool;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 use crate::config::Config;
 
 pub struct Arbiter {
     #[allow(dead_code)]
     config: Config,
-    pool: PgPool,
+    pool: DbPool,
     workers: Arc<RwLock<HashMap<String, WorkerHandle>>>,
     shutdown: Arc<tokio::sync::Notify>,
 }
@@ -20,7 +20,7 @@ struct WorkerHandle {
 }
 
 impl Arbiter {
-    pub fn new(config: Config, pool: PgPool) -> Self {
+    pub fn new(config: Config, pool: DbPool) -> Self {
         Self {
             config,
             pool,
@@ -52,12 +52,18 @@ impl Arbiter {
     }
 
     async fn load_enabled_accounts(&self) -> Result<Vec<String>> {
-        let ids = sqlx::query_scalar::<_, String>(
-            "SELECT user_id FROM accounts WHERE is_enabled = true ORDER BY user_id",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(ids)
+        self.pool
+            .with_session_boxed(|session| {
+                Box::pin(async move {
+                    sqlx::query_scalar::<_, String>(
+                        "SELECT user_id FROM accounts WHERE is_enabled = true ORDER BY user_id",
+                    )
+                    .fetch_all(session.as_mut())
+                    .await
+                    .map_err(Into::into)
+                })
+            })
+            .await
     }
 
     pub async fn start_worker(&self, account_id: &str) -> Result<()> {
@@ -68,16 +74,14 @@ impl Arbiter {
         }
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let pool = self.pool.clone();
         let account = account_id.to_string();
 
         tokio::spawn(async move {
             info!(account = %account, "Worker starting");
             let worker = super::worker::Worker::new(
                 account.clone(),
-                pool.clone(),
-                5000,  // queue_size
-                100,   // batch_size
+                5000, // queue_size
+                100,  // batch_size
                 std::path::PathBuf::from("data/event/buffer"),
             );
             tokio::select! {
@@ -115,27 +119,36 @@ mod tests {
 
     #[tokio::test]
     async fn test_arbiter_start_stop() {
-        let config = Config {
-            database: crate::config::DatabaseConfig {
-                url: "postgres://localhost/test".to_string(),
-                pool_size: 1,
-            },
-            worker: crate::config::WorkerConfig {
-                queue_size: 100,
-                batch_size: 10,
-            },
-            processor: crate::config::ProcessorConfig {
-                polling_interval_secs: 1,
-                batch_size: 10,
-            },
-        };
-        let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
-        let arbiter = Arbiter::new(config, pool);
+        lilium_database::test_fixtures::with_db_session_and_pool(
+            lilium_database::test_fixtures::TestServiceFixture::Shared,
+            |_session, pool| {
+                Box::pin(async move {
+                    let config = Config {
+                        database: crate::config::DatabaseConfig {
+                            url: lilium_database::test_fixtures::test_database_url(),
+                            pool_size: 1,
+                        },
+                        worker: crate::config::WorkerConfig {
+                            queue_size: 100,
+                            batch_size: 10,
+                        },
+                        processor: crate::config::ProcessorConfig {
+                            polling_interval_secs: 1,
+                            batch_size: 10,
+                        },
+                    };
 
-        arbiter.start_worker("test_user").await.unwrap();
-        assert!(arbiter.workers.read().await.contains_key("test_user"));
+                    let arbiter = Arbiter::new(config, pool);
+                    arbiter.start_worker("test_user").await.unwrap();
+                    assert!(arbiter.workers.read().await.contains_key("test_user"));
 
-        arbiter.stop_worker("test_user").await;
-        assert!(!arbiter.workers.read().await.contains_key("test_user"));
+                    arbiter.stop_worker("test_user").await;
+                    assert!(!arbiter.workers.read().await.contains_key("test_user"));
+                    Ok(())
+                })
+            },
+        )
+        .await
+        .unwrap();
     }
 }
