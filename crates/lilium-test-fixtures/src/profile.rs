@@ -1,6 +1,5 @@
 use anyhow::Result;
 use lilium_database::Database;
-use lilium_database::pool::DbPool;
 use lilium_database::DbSession;
 
 use crate::database::{TestDatabaseConnection, connect_test_database};
@@ -48,9 +47,6 @@ impl TestDb {
         &self.database
     }
 
-    pub fn raw_pool(&self) -> &DbPool {
-        self.database.raw_pool()
-    }
 }
 
 pub async fn prepare_database(session: &mut DbSession, profile: FixtureProfile) -> Result<()> {

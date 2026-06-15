@@ -1,10 +1,8 @@
 use anyhow::{Context, Result};
-use lilium_database::pool::DbPool;
+use lilium_database::{Database, DatabaseConfig};
 use sqlx::PgPool;
 use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-use std::borrow::Borrow;
-use std::ops::Deref;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,8 +40,7 @@ pub(crate) struct TestDatabaseLease {
 }
 
 #[derive(Clone)]
-pub struct TestDatabaseConnection {
-    inner: DbPool,
+pub(crate) struct TestDatabaseConnection {
     database_url: String,
     max_connections: u32,
     _lease: Arc<TestDatabaseLease>,
@@ -51,25 +48,15 @@ pub struct TestDatabaseConnection {
 
 impl TestDatabaseConnection {
     fn new(
-        inner: DbPool,
         database_url: String,
         max_connections: u32,
         lease: Arc<TestDatabaseLease>,
     ) -> Self {
         Self {
-            inner,
             database_url,
             max_connections,
             _lease: lease,
         }
-    }
-
-    pub fn inner(&self) -> &DbPool {
-        &self.inner
-    }
-
-    pub fn max_connections(&self) -> u32 {
-        self.max_connections
     }
 
     pub(crate) fn database_config(&self) -> lilium_database::DatabaseConfig {
@@ -86,20 +73,6 @@ impl std::fmt::Debug for TestDatabaseConnection {
     }
 }
 
-impl Deref for TestDatabaseConnection {
-    type Target = DbPool;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl Borrow<DbPool> for TestDatabaseConnection {
-    fn borrow(&self) -> &DbPool {
-        &self.inner
-    }
-}
-
 impl TestDatabaseLease {
     fn new(pool: Arc<TestDatabasePool>, database: TestDatabase) -> Self {
         Self {
@@ -111,10 +84,6 @@ impl TestDatabaseLease {
 
 impl Drop for TestDatabaseLease {
     fn drop(&mut self) {
-        if std::thread::panicking() {
-            return;
-        }
-
         let mut database = self.database.lock().expect("lock leased test database");
         if let Some(database) = database.take() {
             self.pool.return_database(database);
@@ -167,19 +136,18 @@ impl TestDatabasePool {
 
     async fn prepare_database(self: &Arc<Self>, database: &TestDatabase) -> Result<()> {
         let database_url = build_test_database_url(&database.base_url, &database.name)?;
-        let options = build_test_database_options(&database_url)?;
-        let pool = DbPool::connect_with_options(options, 1).await?;
+        let database = Database::create(DatabaseConfig::from_url(database_url, 1)).await?;
 
-        pool.with_session(|session| Box::pin(async move { reset_database(session).await }))
+        lilium_database::transaction!(database, |session| { reset_database(session).await })
         .await
     }
 }
 
-pub async fn connect_test_database() -> TestDatabaseConnection {
+pub(crate) async fn connect_test_database() -> TestDatabaseConnection {
     connect_test_database_with_pool_size(4).await
 }
 
-pub async fn connect_test_database_with_pool_size(pool_size: u32) -> TestDatabaseConnection {
+pub(crate) async fn connect_test_database_with_pool_size(pool_size: u32) -> TestDatabaseConnection {
     load_test_env();
 
     let pool = ensure_test_database_pool(pool_size)
@@ -193,23 +161,7 @@ pub async fn connect_test_database_with_pool_size(pool_size: u32) -> TestDatabas
             panic!("build test database url: {error:#}");
         }
     };
-    let options = match build_test_database_options(&database_url) {
-        Ok(options) => options,
-        Err(error) => {
-            pool.return_database(database);
-            panic!("build test database options: {error:#}");
-        }
-    };
-    let inner = match DbPool::connect_with_options(options, pool_size).await {
-        Ok(inner) => inner,
-        Err(error) => {
-            pool.return_database(database);
-            panic!("connect to test database: {error:#}");
-        }
-    };
-
     TestDatabaseConnection::new(
-        inner,
         database_url,
         pool_size,
         Arc::new(TestDatabaseLease::new(pool, database)),

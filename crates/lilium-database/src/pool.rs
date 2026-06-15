@@ -1,9 +1,6 @@
 use anyhow::{Context, Result};
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{pool::PoolConnection, PgPool, Postgres};
-use std::borrow::Borrow;
 use std::future::Future;
-use std::ops::Deref;
 use std::pin::Pin;
 use tracing::instrument;
 
@@ -12,12 +9,6 @@ pub type SessionFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 
 #[derive(Debug, Clone)]
 pub struct DbPool {
     inner: PgPool,
-}
-
-#[derive(Copy, Clone, Debug)]
-enum SessionFinish {
-    Commit,
-    Rollback,
 }
 
 #[derive(Debug)]
@@ -59,27 +50,6 @@ impl DbPool {
         Self { inner }
     }
 
-    #[instrument(skip(url), fields(pool_size))]
-    pub async fn connect(url: &str, pool_size: u32) -> Result<Self> {
-        let normalized_url = normalize_database_url(url);
-        let pool = PgPoolOptions::new()
-            .max_connections(pool_size)
-            .connect(&normalized_url)
-            .await
-            .with_context(|| format!("failed to connect database: {normalized_url}"))?;
-        Ok(Self { inner: pool })
-    }
-
-    #[instrument(skip(options), fields(pool_size))]
-    pub async fn connect_with_options(options: PgConnectOptions, pool_size: u32) -> Result<Self> {
-        let pool = PgPoolOptions::new()
-            .max_connections(pool_size)
-            .connect_with(options)
-            .await
-            .with_context(|| "failed to connect database with explicit options")?;
-        Ok(Self { inner: pool })
-    }
-
     pub fn inner(&self) -> &PgPool {
         &self.inner
     }
@@ -114,14 +84,7 @@ impl DbPool {
         Ok(())
     }
 
-    async fn finish_session(session: &mut DbSession, finish: SessionFinish) -> Result<()> {
-        match finish {
-            SessionFinish::Commit => Self::commit_session(session).await,
-            SessionFinish::Rollback => Self::rollback_session(session).await,
-        }
-    }
-
-    async fn run_session<T, F>(&self, finish: SessionFinish, f: F) -> Result<T>
+    async fn run_session<T, F>(&self, f: F) -> Result<T>
     where
         F: for<'a> FnOnce(&'a mut DbSession) -> SessionFuture<'a, T>,
     {
@@ -129,7 +92,7 @@ impl DbPool {
         let result = f(&mut session).await;
         match result {
             Ok(value) => {
-                Self::finish_session(&mut session, finish).await?;
+                Self::commit_session(&mut session).await?;
                 Ok(value)
             }
             Err(error) => {
@@ -144,29 +107,6 @@ impl DbPool {
     where
         F: for<'a> FnOnce(&'a mut DbSession) -> SessionFuture<'a, T>,
     {
-        self.run_session(SessionFinish::Commit, f).await
-    }
-
-    #[instrument(skip(self, f))]
-    pub async fn with_rollback_session<T, F>(&self, f: F) -> Result<T>
-    where
-        F: for<'a> FnOnce(&'a mut DbSession) -> SessionFuture<'a, T>,
-    {
-        self.run_session(SessionFinish::Rollback, f).await
-    }
-
-}
-
-impl Borrow<PgPool> for DbPool {
-    fn borrow(&self) -> &PgPool {
-        self.inner()
-    }
-}
-
-impl Deref for DbPool {
-    type Target = PgPool;
-
-    fn deref(&self) -> &Self::Target {
-        self.inner()
+        self.run_session(f).await
     }
 }

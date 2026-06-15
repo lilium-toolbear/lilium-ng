@@ -1,6 +1,6 @@
 pub mod database;
 pub mod entities;
-pub mod pool;
+mod pool;
 pub mod transaction;
 
 pub use database::{Database, DatabaseConfig, RawDbConnection};

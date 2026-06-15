@@ -74,10 +74,6 @@ impl Database {
         &self.orm
     }
 
-    pub fn raw_pool(&self) -> &DbPool {
-        &self.raw_pool
-    }
-
     #[instrument(skip(self, f))]
     pub async fn transaction<T, F>(&self, f: F) -> Result<T>
     where
@@ -128,15 +124,13 @@ mod tests {
             .await
             .unwrap();
 
-        let raw_pool = db.raw_pool().inner();
         let sea_pool = db.orm().get_postgres_connection_pool();
 
-        assert_eq!(raw_pool.options().get_max_connections(), 1);
         assert_eq!(sea_pool.options().get_max_connections(), 1);
 
         db.orm().execute_unprepared("SELECT 1").await.unwrap();
 
-        let _raw_conn = raw_pool.acquire().await.unwrap();
+        let _raw_conn = db.raw_connection().await.unwrap();
 
         assert!(sea_pool.try_acquire().is_none());
     }
