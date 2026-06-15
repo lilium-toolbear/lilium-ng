@@ -4,9 +4,15 @@ use chrono::Utc;
 use futures::{FutureExt, future::BoxFuture};
 use lilium_models::dzmm::message::Message;
 use lilium_models::ingestion::EventEnvelope;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::net::{TcpSocket, lookup_host};
 use tokio::sync::Notify;
+use tokio_tungstenite::{
+    MaybeTlsStream, client_async, client_async_tls_with_config, connect_async,
+    tungstenite::{handshake::client::Response, http::Request},
+};
 use tracing::instrument;
 use tracing::{error, info, warn};
 use url::Url;
@@ -148,10 +154,6 @@ impl WsClient {
         let mut builder = rust_socketio::asynchronous::ClientBuilder::new(self.url.clone())
             .transport_type(rust_socketio::TransportType::Websocket)
             .reconnect(false);
-
-        if let Some(local_address) = dzmm_local_address_from_env()? {
-            builder = builder.local_address(local_address);
-        }
 
         let cookie_header = self.cookie_header.clone().unwrap_or_default();
         let mut origin_url = Url::parse(&self.url).context("Invalid websocket URL")?;
@@ -321,11 +323,18 @@ impl WsClient {
             disconnect_state.clone(),
         )?;
 
-        let connect_result =
-            tokio::time::timeout(std::time::Duration::from_secs(10), builder.connect())
+        let connect_result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let request = builder
+                .websocket_request()
+                .context("Failed to build Socket.IO websocket request")?;
+            let stream = connect_websocket_request(request, dzmm_local_address_from_env()?).await?;
+            builder
+                .connect_with_websocket_stream(stream)
                 .await
-                .context("Timed out while connecting to Socket.IO")?
-                .context("Failed to connect to Socket.IO")?;
+                .context("Failed to connect to Socket.IO")
+        })
+        .await
+        .context("Timed out while connecting to Socket.IO")??;
 
         let socket = connect_result;
         info!(account = %self.account_id, "WebSocket connected");
@@ -363,6 +372,89 @@ where
     };
 
     fut.await;
+}
+
+async fn connect_websocket_request(
+    request: Request<()>,
+    local_address: Option<IpAddr>,
+) -> Result<rust_socketio::AsyncWebsocketStream> {
+    let Some(local_address) = local_address else {
+        let (stream, _) = connect_async(request)
+            .await
+            .context("Failed to connect Socket.IO websocket")?;
+        return Ok(stream);
+    };
+
+    let (stream, _) = connect_bound_websocket_request(request, local_address).await?;
+    Ok(stream)
+}
+
+async fn connect_bound_websocket_request(
+    request: Request<()>,
+    local_address: IpAddr,
+) -> Result<(rust_socketio::AsyncWebsocketStream, Response)> {
+    let uri = request.uri().clone();
+    let scheme = uri.scheme_str().unwrap_or("ws");
+    let host = uri
+        .host()
+        .context("Socket.IO websocket URL must include a host")?
+        .to_string();
+    let port = uri.port_u16().unwrap_or(match scheme {
+        "wss" => 443,
+        _ => 80,
+    });
+
+    let remote_addr = lookup_host((host.as_str(), port))
+        .await
+        .context("Failed to resolve Socket.IO websocket host")?
+        .find(|addr| same_ip_family(addr.ip(), local_address))
+        .with_context(|| {
+            format!(
+                "No {} address found for Socket.IO websocket host {}",
+                ip_family_name(local_address),
+                host
+            )
+        })?;
+
+    let socket = match local_address {
+        IpAddr::V4(_) => TcpSocket::new_v4(),
+        IpAddr::V6(_) => TcpSocket::new_v6(),
+    }
+    .context("Failed to create Socket.IO websocket TCP socket")?;
+    socket
+        .bind(SocketAddr::new(local_address, 0))
+        .context("Failed to bind Socket.IO websocket local address")?;
+    let tcp_stream = socket
+        .connect(remote_addr)
+        .await
+        .context("Failed to connect Socket.IO websocket TCP stream")?;
+
+    match scheme {
+        "ws" => {
+            let stream = MaybeTlsStream::Plain(tcp_stream);
+            client_async(request, stream)
+                .await
+                .context("Failed to complete Socket.IO websocket handshake")
+        }
+        "wss" => client_async_tls_with_config(request, tcp_stream, None, None)
+            .await
+            .context("Failed to complete Socket.IO secure websocket handshake"),
+        other => anyhow::bail!("Unsupported Socket.IO websocket scheme: {}", other),
+    }
+}
+
+fn same_ip_family(left: IpAddr, right: IpAddr) -> bool {
+    matches!(
+        (left, right),
+        (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
+    )
+}
+
+fn ip_family_name(address: IpAddr) -> &'static str {
+    match address {
+        IpAddr::V4(_) => "IPv4",
+        IpAddr::V6(_) => "IPv6",
+    }
 }
 
 fn socketio_payload_to_value(payload: rust_socketio::Payload) -> serde_json::Value {

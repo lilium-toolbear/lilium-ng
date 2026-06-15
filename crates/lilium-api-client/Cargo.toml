@@ -16,5 +16,6 @@ tracing.workspace = true
 chrono.workspace = true
 futures.workspace = true
 rust_socketio.workspace = true
+tokio-tungstenite.workspace = true
 url = "2"
 base64 = "0.22"
