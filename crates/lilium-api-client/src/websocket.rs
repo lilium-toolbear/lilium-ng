@@ -1,16 +1,20 @@
+use crate::config::dzmm_local_address_from_env;
 use anyhow::{Context, Result};
 use chrono::Utc;
-use futures::{future::BoxFuture, StreamExt};
+use futures::{StreamExt, future::BoxFuture};
 use lilium_models::dzmm::message::Message;
 use lilium_models::ingestion::EventEnvelope;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::net::{TcpSocket, TcpStream, lookup_host};
 use tokio::sync::Notify;
 use tokio_tungstenite::{
-    connect_async,
+    MaybeTlsStream, WebSocketStream, client_async, connect_async,
     tungstenite::{
-        http::{header::COOKIE, Request},
         Message as WsMessage,
+        handshake::client::Response,
+        http::{Request, header::COOKIE},
     },
 };
 use tracing::instrument;
@@ -125,6 +129,86 @@ impl WebSocketEventDecoder {
     }
 }
 
+async fn connect_ws_request(
+    request: Request<()>,
+    local_address: Option<IpAddr>,
+) -> Result<(WebSocketStream<MaybeTlsStream<TcpStream>>, Response)> {
+    let Some(local_address) = local_address else {
+        return connect_async(request)
+            .await
+            .context("Failed to connect to WebSocket");
+    };
+
+    let uri = request.uri().clone();
+    let scheme = uri.scheme_str().unwrap_or("ws").to_string();
+    let host = uri
+        .host()
+        .context("WebSocket URL must include a host")?
+        .to_string();
+    let port = uri.port_u16().unwrap_or(match scheme.as_str() {
+        "wss" => 443,
+        _ => 80,
+    });
+
+    let remote_addr = lookup_host((host.as_str(), port))
+        .await
+        .context("Failed to resolve WebSocket host")?
+        .find(|addr| same_ip_family(addr.ip(), local_address))
+        .with_context(|| {
+            format!(
+                "No {} address found for WebSocket host {}",
+                ip_family_name(local_address),
+                host
+            )
+        })?;
+
+    let socket = match local_address {
+        IpAddr::V4(_) => TcpSocket::new_v4(),
+        IpAddr::V6(_) => TcpSocket::new_v6(),
+    }
+    .context("Failed to create WebSocket TCP socket")?;
+    socket
+        .bind(SocketAddr::new(local_address, 0))
+        .context("Failed to bind WebSocket local address")?;
+    let tcp_stream = socket
+        .connect(remote_addr)
+        .await
+        .context("Failed to connect WebSocket TCP stream")?;
+
+    let stream = match scheme.as_str() {
+        "wss" => {
+            let connector =
+                native_tls::TlsConnector::new().context("Failed to create native TLS connector")?;
+            let connector = tokio_native_tls::TlsConnector::from(connector);
+            let tls_stream = connector
+                .connect(&host, tcp_stream)
+                .await
+                .context("Failed to establish WebSocket TLS stream")?;
+            MaybeTlsStream::NativeTls(tls_stream)
+        }
+        "ws" => MaybeTlsStream::Plain(tcp_stream),
+        _ => anyhow::bail!("Unsupported WebSocket scheme: {}", scheme),
+    };
+
+    client_async(request, stream)
+        .await
+        .context("Failed to complete WebSocket handshake")
+}
+
+fn same_ip_family(left: IpAddr, right: IpAddr) -> bool {
+    matches!(
+        (left, right),
+        (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
+    )
+}
+
+fn ip_family_name(address: IpAddr) -> &'static str {
+    match address {
+        IpAddr::V4(_) => "IPv4",
+        IpAddr::V6(_) => "IPv6",
+    }
+}
+
 pub struct WsClient {
     account_id: String,
     url: String,
@@ -167,7 +251,8 @@ impl WsClient {
         info!(account = %self.account_id, url = %self.url, "Connecting to WebSocket");
 
         let request = self.build_request()?;
-        let (ws_stream, _) = connect_async(request)
+        let local_address = dzmm_local_address_from_env()?;
+        let (ws_stream, _) = connect_ws_request(request, local_address)
             .await
             .context("Failed to connect to WebSocket")?;
 

@@ -1681,15 +1681,18 @@ name = "lilium-api-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "futures",
  "lilium-common",
  "lilium-models",
+ "native-tls",
  "rand 0.10.1",
  "reqwest",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-native-tls",
  "tokio-tungstenite",
  "tracing",
  "tungstenite",
