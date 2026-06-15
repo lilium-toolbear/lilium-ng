@@ -1,7 +1,7 @@
 use anyhow::Result;
 use lilium_api_client::websocket::WsClient;
-use lilium_database::{Database, DbSessionContext};
-use lilium_services::account_service::AccountService;
+use lilium_database::Database;
+use lilium_services::account_service;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
@@ -103,9 +103,7 @@ impl Worker {
     async fn load_cookie_header(database: &Database, account_id: &str) -> Result<Option<String>> {
         let account_id = account_id.to_string();
         lilium_database::transaction!(database, |session| {
-            let session = DbSessionContext::new(session);
-            let mut svc = AccountService::new(session);
-            let account = svc.get_account(&account_id).await?;
+            let account = account_service::get_account(session, &account_id).await?;
             Ok(account.and_then(|a| a.cookies))
         })
         .await
