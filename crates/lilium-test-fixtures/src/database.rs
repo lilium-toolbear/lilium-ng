@@ -72,7 +72,7 @@ impl TestDatabaseConnection {
         self.max_connections
     }
 
-    pub fn database_config(&self) -> lilium_database::DatabaseConfig {
+    pub(crate) fn database_config(&self) -> lilium_database::DatabaseConfig {
         lilium_database::DatabaseConfig::from_url(self.database_url.clone(), self.max_connections)
     }
 }
