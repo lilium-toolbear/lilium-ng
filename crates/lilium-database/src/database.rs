@@ -116,7 +116,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires TEST_DATABASE_URL"]
     async fn create_uses_one_shared_pg_pool_budget() {
         dotenvy::dotenv().ok();
         let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL must be set");
@@ -136,7 +135,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires TEST_DATABASE_URL"]
     async fn transaction_macro_commits_and_raw_connection_executes() {
         dotenvy::dotenv().ok();
         let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL must be set");
