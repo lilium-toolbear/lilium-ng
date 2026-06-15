@@ -361,74 +361,66 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_event_service_roundtrip() {
-        lilium_test_fixtures::with_db_session(
-            lilium_test_fixtures::FixtureProfile::Event,
-            |session| {
-                Box::pin(async move {
-                    let mut session = session;
-                    let now = Utc::now();
-                    let user_id = unique_event_id();
-                    insert_event(
-                        &mut session,
-                        &user_id,
-                        "test",
-                        json!({"hello": "world"}),
-                        now,
-                    )
-                    .await
-                    .expect("insert event");
-                    let events = get_pending_events(&mut session, 10, Some(&user_id), Some("test"))
-                        .await
-                        .expect("pending events");
-                    assert!(!events.is_empty());
-                    assert!(events.iter().any(|e| e.user_id == user_id));
-                    Ok(())
-                })
-            },
-        )
+        let test_db =
+            lilium_test_fixtures::TestDb::acquire(lilium_test_fixtures::FixtureProfile::Event)
+                .await
+                .expect("init event db");
+
+        lilium_database::transaction!(test_db.database(), |session| {
+            let now = Utc::now();
+            let user_id = unique_event_id();
+            insert_event(session, &user_id, "test", json!({"hello": "world"}), now)
+                .await
+                .expect("insert event");
+            let events = get_pending_events(session, 10, Some(&user_id), Some("test"))
+                .await
+                .expect("pending events");
+            assert!(!events.is_empty());
+            assert!(events.iter().any(|e| e.user_id == user_id));
+            Ok(())
+        })
         .await
         .expect("event roundtrip");
     }
 
     #[tokio::test]
     async fn event_processor_offset_service_roundtrip() {
-        lilium_test_fixtures::with_db_session(
-            lilium_test_fixtures::FixtureProfile::Event,
-            |session| {
-                Box::pin(async move {
-                    let mut session = session;
-                    let processor_id = unique_event_id();
+        let test_db =
+            lilium_test_fixtures::TestDb::acquire(lilium_test_fixtures::FixtureProfile::Event)
+                .await
+                .expect("init event db");
 
-                    let offset = get_offset(&mut session, &processor_id)
-                        .await
-                        .expect("initial offset");
-                    assert_eq!(offset, 0);
+        lilium_database::transaction!(test_db.database(), |session| {
+            let processor_id = unique_event_id();
 
-                    let updated = update_offset(
-                        &mut session,
-                        &processor_id,
-                        42,
-                        Some(Utc::now()),
-                        Some(Utc::now()),
-                    )
-                    .await
-                    .expect("update offset");
-                    assert_eq!(updated.processor_id, processor_id);
-                    assert_eq!(updated.last_processed_id, 42);
+            let offset = get_offset(session, &processor_id)
+                .await
+                .expect("initial offset");
+            assert_eq!(offset, 0);
 
-                    let cursor = get_cursor(&mut session, &processor_id)
-                        .await
-                        .expect("get cursor")
-                        .expect("cursor exists");
-                    assert_eq!(cursor.last_processed_id, 42);
+            let updated = update_offset(
+                session,
+                &processor_id,
+                42,
+                Some(Utc::now()),
+                Some(Utc::now()),
+            )
+            .await
+            .expect("update offset");
+            assert_eq!(updated.processor_id, processor_id);
+            assert_eq!(updated.last_processed_id, 42);
 
-                    delete_offset(&mut session, &processor_id)
-                        .await
-                        .expect("delete offset");
-                    Ok(())
-                })
-            },
-        )
+            let cursor = get_cursor(session, &processor_id)
+                .await
+                .expect("get cursor")
+                .expect("cursor exists");
+            assert_eq!(cursor.last_processed_id, 42);
+
+            delete_offset(session, &processor_id)
+                .await
+                .expect("delete offset");
+            Ok(())
+        })
         .await
         .expect("offset roundtrip");
     }
