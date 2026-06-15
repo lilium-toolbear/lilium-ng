@@ -72,7 +72,6 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    #[ignore = "requires TEST_DATABASE_URL"]
     async fn acquire_empty_profile_exposes_database_runtime() {
         let test_db = TestDb::acquire(FixtureProfile::Empty)
             .await
