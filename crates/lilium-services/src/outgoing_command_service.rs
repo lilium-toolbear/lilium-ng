@@ -701,9 +701,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                let pending = get_pending_commands(session, "user1", 10)
-                    .await
-                    .unwrap();
+                let pending = get_pending_commands(session, "user1", 10).await.unwrap();
                 assert_eq!(pending.len(), 3);
                 assert_eq!(pending[0].id, cmd1.id);
                 assert_eq!(pending[1].id, cmd2.id);
@@ -753,9 +751,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                let pending_user1 = get_pending_commands(session, "user1", 10)
-                    .await
-                    .unwrap();
+                let pending_user1 = get_pending_commands(session, "user1", 10).await.unwrap();
                 assert_eq!(pending_user1.len(), 2);
                 assert!(pending_user1.iter().all(|c| c.account_user_id == "user1"));
                 Ok(())
@@ -785,9 +781,7 @@ mod tests {
                     .await
                     .unwrap();
                 }
-                let pending = get_pending_commands(session, "user1", 3)
-                    .await
-                    .unwrap();
+                let pending = get_pending_commands(session, "user1", 3).await.unwrap();
                 assert_eq!(pending.len(), 3);
                 Ok(())
             })
@@ -928,9 +922,7 @@ mod tests {
             .expect("init outgoing command db");
 
             lilium_database::transaction!(test_db.database(), |session| {
-                let result = retry_or_fail(session, 99999, "some error")
-                    .await
-                    .unwrap();
+                let result = retry_or_fail(session, 99999, "some error").await.unwrap();
                 assert!(!result);
                 Ok(())
             })
@@ -972,9 +964,7 @@ mod tests {
             .expect("init outgoing command db");
 
             lilium_database::transaction!(test_db.database(), |session| {
-                let result = prune_processed_before(session, Utc::now())
-                    .await
-                    .unwrap();
+                let result = prune_processed_before(session, Utc::now()).await.unwrap();
                 assert_eq!(result, 0);
                 Ok(())
             })

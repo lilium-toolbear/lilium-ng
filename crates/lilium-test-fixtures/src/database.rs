@@ -47,11 +47,7 @@ pub(crate) struct TestDatabaseConnection {
 }
 
 impl TestDatabaseConnection {
-    fn new(
-        database_url: String,
-        max_connections: u32,
-        lease: Arc<TestDatabaseLease>,
-    ) -> Self {
+    fn new(database_url: String, max_connections: u32, lease: Arc<TestDatabaseLease>) -> Self {
         Self {
             database_url,
             max_connections,
@@ -138,8 +134,7 @@ impl TestDatabasePool {
         let database_url = build_test_database_url(&database.base_url, &database.name)?;
         let database = Database::create(DatabaseConfig::from_url(database_url, 1)).await?;
 
-        lilium_database::transaction!(database, |session| { reset_database(session).await })
-        .await
+        lilium_database::transaction!(database, |session| { reset_database(session).await }).await
     }
 }
 

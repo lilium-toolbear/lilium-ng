@@ -458,9 +458,15 @@ mod tests {
 
             lilium_database::transaction!(test_db.database(), |session| {
                 let now = Utc::now();
-                upsert_member_simple(session, "test_simple_r", "test_simple_u", "creator", Some(now))
-                    .await
-                    .expect("upsert");
+                upsert_member_simple(
+                    session,
+                    "test_simple_r",
+                    "test_simple_u",
+                    "creator",
+                    Some(now),
+                )
+                .await
+                .expect("upsert");
                 let member = get_member_info(session, "test_simple_r", "test_simple_u")
                     .await
                     .expect("query");
@@ -481,17 +487,18 @@ mod tests {
 
             lilium_database::transaction!(test_db.database(), |session| {
                 let now = Utc::now();
-                upsert_member(session, "test_rejoin_r", "test_rejoin_u", "member", Some(now))
-                    .await
-                    .expect("upsert");
-                mark_member_left(
+                upsert_member(
                     session,
                     "test_rejoin_r",
                     "test_rejoin_u",
-                    Some(Utc::now()),
+                    "member",
+                    Some(now),
                 )
                 .await
-                .expect("mark left");
+                .expect("upsert");
+                mark_member_left(session, "test_rejoin_r", "test_rejoin_u", Some(Utc::now()))
+                    .await
+                    .expect("mark left");
                 upsert_member_simple(
                     session,
                     "test_rejoin_r",
@@ -525,14 +532,10 @@ mod tests {
                     .await
                     .expect("upsert");
                 let left_at = Utc::now();
-                let marked = mark_member_left(
-                    session,
-                    "test_leave_r",
-                    "test_leave_u",
-                    Some(left_at),
-                )
-                .await
-                .expect("mark left");
+                let marked =
+                    mark_member_left(session, "test_leave_r", "test_leave_u", Some(left_at))
+                        .await
+                        .expect("mark left");
                 assert!(marked);
                 let member = get_member_info(session, "test_leave_r", "test_leave_u")
                     .await

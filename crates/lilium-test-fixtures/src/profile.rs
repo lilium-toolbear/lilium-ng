@@ -46,7 +46,6 @@ impl TestDb {
     pub fn database(&self) -> &lilium_database::Database {
         &self.database
     }
-
 }
 
 pub async fn prepare_database(session: &mut DbSession, profile: FixtureProfile) -> Result<()> {
