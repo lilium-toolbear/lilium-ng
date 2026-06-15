@@ -333,47 +333,46 @@ mod tests {
 
     #[tokio::test]
     async fn create_and_get_account_roundtrip() {
-        lilium_test_fixtures::with_db_session(
-            lilium_test_fixtures::FixtureProfile::Account,
-            |session| {
-                Box::pin(async move {
-                    let mut session = session;
-                    let user_id = format!(
-                        "account_{}_{}",
-                        Utc::now().timestamp_micros(),
-                        std::process::id()
-                    );
-                    lilium_test_fixtures::seed_test_users(&mut session, &[&user_id])
-                        .await
-                        .expect("seed account user");
-                    let profile = json!({"nickname": "test_account"});
-                    let created = create_account(
-                        &mut session,
-                        &user_id,
-                        profile.clone(),
-                        Some("test@example.com"),
-                        Some("password"),
-                        None,
-                        None,
-                        None,
-                        Some("a=b"),
-                    )
-                    .await
-                    .expect("create account");
-                    assert_eq!(created.user_id, user_id);
-                    let fetched = get_account(&mut session, &user_id)
-                        .await
-                        .expect("fetch account")
-                        .expect("account exists");
-                    assert_eq!(fetched.user_id, user_id);
-                    assert_eq!(fetched.user_profile, profile);
-                    delete_account(&mut session, &user_id)
-                        .await
-                        .expect("delete account");
-                    Ok(())
-                })
-            },
-        )
+        let test_db =
+            lilium_test_fixtures::TestDb::acquire(lilium_test_fixtures::FixtureProfile::Account)
+                .await
+                .expect("init account db");
+
+        lilium_database::transaction!(test_db.database(), |session| {
+            let user_id = format!(
+                "account_{}_{}",
+                Utc::now().timestamp_micros(),
+                std::process::id()
+            );
+            lilium_test_fixtures::seed_test_users(session, &[&user_id])
+                .await
+                .expect("seed account user");
+            let profile = json!({"nickname": "test_account"});
+            let created = create_account(
+                session,
+                &user_id,
+                profile.clone(),
+                Some("test@example.com"),
+                Some("password"),
+                None,
+                None,
+                None,
+                Some("a=b"),
+            )
+            .await
+            .expect("create account");
+            assert_eq!(created.user_id, user_id);
+            let fetched = get_account(session, &user_id)
+                .await
+                .expect("fetch account")
+                .expect("account exists");
+            assert_eq!(fetched.user_id, user_id);
+            assert_eq!(fetched.user_profile, profile);
+            delete_account(session, &user_id)
+                .await
+                .expect("delete account");
+            Ok(())
+        })
         .await
         .expect("account roundtrip");
     }
