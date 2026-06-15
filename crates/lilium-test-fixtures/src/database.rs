@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use lilium_database::DbPool;
+use lilium_database::pool::DbPool;
 use sqlx::PgPool;
 use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};

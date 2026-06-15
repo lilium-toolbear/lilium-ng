@@ -1,5 +1,6 @@
 use anyhow::Result;
-use lilium_database::{Database, DbPool};
+use lilium_database::Database;
+use lilium_database::pool::DbPool;
 use lilium_database::DbSession;
 
 use crate::database::{TestDatabaseConnection, connect_test_database};
