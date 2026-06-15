@@ -3,6 +3,8 @@ use chrono::{DateTime, Utc};
 use lilium_api_client::http::DzmmApi;
 use lilium_common::LiliumError;
 use lilium_database::DbSession;
+use lilium_database::entities::users;
+use lilium_database::orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter};
 use std::collections::{HashMap, HashSet};
 use tracing::{info, instrument};
 
@@ -145,23 +147,38 @@ pub fn avatar_url_changed(existing: Option<&str>, candidate: Option<&str>) -> bo
     }
 }
 
-#[instrument(skip(session), fields(user_id = %user_id))]
-pub async fn get_by_id(session: &mut DbSession, user_id: &str) -> Result<Option<User>> {
-    let user = sqlx::query_as::<_, User>(
-        r#"SELECT user_id, full_name, avatar_url, avatar_file, bio, birthday,
-                  birthday_public, quirk, is_bot, gender, metadata, raw_data,
-                  last_seen, message_count, deleted_count, recalled_count,
-                  created_at, updated_at
-           FROM users WHERE user_id = $1"#,
-    )
-    .bind(user_id)
-    .fetch_optional(session.as_mut())
-    .await?;
+#[instrument(skip(db), fields(user_id = %user_id))]
+pub async fn get_by_id<C>(db: &C, user_id: &str) -> Result<Option<User>>
+where
+    C: ConnectionTrait,
+{
+    let user = users::Entity::find_by_id(user_id.to_owned())
+        .one(db)
+        .await?
+        .map(Into::into);
     Ok(user)
 }
 
-#[instrument(skip(session, user_ids), fields(user_count = user_ids.len()))]
-pub async fn get_by_ids(session: &mut DbSession, user_ids: &[String]) -> Result<Vec<User>> {
+#[instrument(skip(db, user_ids), fields(user_count = user_ids.len()))]
+pub async fn get_by_ids<C>(db: &C, user_ids: &[String]) -> Result<Vec<User>>
+where
+    C: ConnectionTrait,
+{
+    if user_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let users = users::Entity::find()
+        .filter(users::Column::UserId.is_in(user_ids.iter().cloned()))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    Ok(users)
+}
+
+async fn get_by_ids_raw(session: &mut DbSession, user_ids: &[String]) -> Result<Vec<User>> {
     if user_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -366,7 +383,7 @@ pub async fn batch_fetch_and_update(
 
     let mut existing_users = Vec::new();
     for chunk in unique_user_ids.chunks(5000) {
-        existing_users.extend(get_by_ids(session, chunk).await?);
+        existing_users.extend(get_by_ids_raw(session, chunk).await?);
     }
     let existing_users: HashMap<String, User> = existing_users
         .into_iter()
@@ -434,7 +451,7 @@ pub async fn batch_fetch_and_update_with_auth(
 
     let mut existing_users = Vec::new();
     for chunk in unique_user_ids.chunks(5000) {
-        existing_users.extend(get_by_ids(session, chunk).await?);
+        existing_users.extend(get_by_ids_raw(session, chunk).await?);
     }
     let existing_users: HashMap<String, User> = existing_users
         .into_iter()
@@ -519,22 +536,19 @@ pub async fn batch_fetch_and_update_with_auth(
     Ok((new_count, updated_count))
 }
 
-#[instrument(skip(session), fields(user_id = %user_id))]
-pub async fn fetch_user_profile(
-    session: &mut DbSession,
-    user_id: &str,
-) -> Result<Option<UserProfile>> {
-    let user = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
-        "SELECT user_id, full_name, avatar_url FROM users WHERE user_id = $1",
-    )
-    .bind(user_id)
-    .fetch_optional(session.as_mut())
-    .await?;
+#[instrument(skip(db), fields(user_id = %user_id))]
+pub async fn fetch_user_profile<C>(db: &C, user_id: &str) -> Result<Option<UserProfile>>
+where
+    C: ConnectionTrait,
+{
+    let user = users::Entity::find_by_id(user_id.to_owned())
+        .one(db)
+        .await?;
 
-    Ok(user.map(|(uid, name, avatar)| UserProfile {
-        user_id: uid,
-        display_name: name,
-        avatar_url: avatar,
+    Ok(user.map(|user| UserProfile {
+        user_id: user.user_id,
+        display_name: user.full_name,
+        avatar_url: user.avatar_url,
     }))
 }
 
@@ -612,15 +626,12 @@ mod tests {
                     .await
                     .expect("init user db");
 
-            lilium_database::transaction!(test_db.database(), |session| {
-                let user = get_by_id(session, "user1").await.expect("query");
-                if let Some(u) = user {
-                    assert_eq!(u.user_id, "user1");
-                }
-                Ok(())
-            })
-            .await
-            .expect("get_by_id existing");
+            let user = get_by_id(test_db.database().orm(), "user1")
+                .await
+                .expect("query");
+            if let Some(u) = user {
+                assert_eq!(u.user_id, "user1");
+            }
         }
 
         #[tokio::test]
@@ -630,13 +641,10 @@ mod tests {
                     .await
                     .expect("init user db");
 
-            lilium_database::transaction!(test_db.database(), |session| {
-                let user = get_by_id(session, "__nonexistent__").await.expect("query");
-                assert!(user.is_none());
-                Ok(())
-            })
-            .await
-            .expect("get_by_id nonexistent");
+            let user = get_by_id(test_db.database().orm(), "__nonexistent__")
+                .await
+                .expect("query");
+            assert!(user.is_none());
         }
 
         #[tokio::test]
@@ -646,17 +654,12 @@ mod tests {
                     .await
                     .expect("init user db");
 
-            lilium_database::transaction!(test_db.database(), |session| {
-                let users = get_by_ids(session, &["user1".into(), "user2".into()])
-                    .await
-                    .expect("query");
-                let ids: std::collections::HashSet<_> =
-                    users.iter().map(|u| u.user_id.clone()).collect();
-                assert_eq!(ids.len(), users.len());
-                Ok(())
-            })
-            .await
-            .expect("get_by_ids multiple");
+            let users = get_by_ids(test_db.database().orm(), &["user1".into(), "user2".into()])
+                .await
+                .expect("query");
+            let ids: std::collections::HashSet<_> =
+                users.iter().map(|u| u.user_id.clone()).collect();
+            assert_eq!(ids.len(), users.len());
         }
 
         #[tokio::test]
@@ -666,13 +669,10 @@ mod tests {
                     .await
                     .expect("init user db");
 
-            lilium_database::transaction!(test_db.database(), |session| {
-                let users = get_by_ids(session, &[]).await.expect("query");
-                assert!(users.is_empty());
-                Ok(())
-            })
-            .await
-            .expect("get_by_ids empty");
+            let users = get_by_ids(test_db.database().orm(), &[])
+                .await
+                .expect("query");
+            assert!(users.is_empty());
         }
 
         #[tokio::test]
@@ -682,15 +682,13 @@ mod tests {
                     .await
                     .expect("init user db");
 
-            lilium_database::transaction!(test_db.database(), |session| {
-                let users = get_by_ids(session, &["user1".into(), "__nonexistent__".into()])
-                    .await
-                    .expect("query");
-                assert!(users.iter().all(|u| u.user_id != "__nonexistent__"));
-                Ok(())
-            })
+            let users = get_by_ids(
+                test_db.database().orm(),
+                &["user1".into(), "__nonexistent__".into()],
+            )
             .await
-            .expect("get_by_ids_with_nonexistent");
+            .expect("query");
+            assert!(users.iter().all(|u| u.user_id != "__nonexistent__"));
         }
 
         #[tokio::test]
@@ -904,17 +902,12 @@ mod tests {
                     .await
                     .expect("init user db");
 
-            lilium_database::transaction!(test_db.database(), |session| {
-                let profile = fetch_user_profile(session, "user1")
-                    .await
-                    .expect("query");
-                if let Some(p) = profile {
-                    assert_eq!(p.user_id, "user1");
-                }
-                Ok(())
-            })
-            .await
-            .expect("fetch user profile existing");
+            let profile = fetch_user_profile(test_db.database().orm(), "user1")
+                .await
+                .expect("query");
+            if let Some(p) = profile {
+                assert_eq!(p.user_id, "user1");
+            }
         }
 
         #[tokio::test]
@@ -924,15 +917,10 @@ mod tests {
                     .await
                     .expect("init user db");
 
-            lilium_database::transaction!(test_db.database(), |session| {
-                let profile = fetch_user_profile(session, "__nonexistent__")
-                    .await
-                    .expect("query");
-                assert!(profile.is_none());
-                Ok(())
-            })
-            .await
-            .expect("fetch user profile nonexistent");
+            let profile = fetch_user_profile(test_db.database().orm(), "__nonexistent__")
+                .await
+                .expect("query");
+            assert!(profile.is_none());
         }
 
         #[tokio::test]
@@ -944,10 +932,9 @@ mod tests {
 
             lilium_database::transaction!(test_db.database(), |session| {
                 let pairs = vec![("user1".into(), "room1".into())];
-                let (new_count, updated_count) =
-                    super::batch_fetch_and_update(session, &pairs)
-                        .await
-                        .expect("batch");
+                let (new_count, updated_count) = super::batch_fetch_and_update(session, &pairs)
+                    .await
+                    .expect("batch");
                 assert!(new_count >= 0);
                 assert!(updated_count >= 0);
                 Ok(())

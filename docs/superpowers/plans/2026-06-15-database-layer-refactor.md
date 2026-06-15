@@ -8,12 +8,15 @@ fixtures, and stateless service functions.
 
 ## Implemented
 
-- Added SeaORM dependency and `crates/lilium-database/src/entities`.
+- Added SeaORM dependency and live-schema entity modules in
+  `crates/lilium-database/src/entities`.
 - Added `Database`, `DatabaseConfig`, `RawDbConnection`, and `transaction!`.
 - Built SeaORM and raw SQL access from one shared SQLx `PgPool`.
 - Switched binaries to construct `Database` from env-loaded binary config.
 - Migrated spider and event-processor transaction call sites to `transaction!`.
-- Converted session-wrapper services to stateless functions:
+- Converted session-wrapper services to stateless functions. Raw transaction
+  work accepts `&mut DbSession`; ORM-backed user reads accept a SeaORM
+  connection:
   - account
   - event and processor offsets
   - message
@@ -26,6 +29,12 @@ fixtures, and stateless service functions.
   - `NotificationService`
 - Deleted `crates/lilium-database/src/queries`.
 - Moved remaining message raw SQL helpers into `crates/lilium-services/src/message.rs`.
+- Migrated ordinary user read operations to SeaORM:
+  - `user::get_by_id`
+  - `user::get_by_ids`
+  - `user::fetch_user_profile`
+- Kept user batch mutation internals on SQLx because they run inside the
+  existing raw transaction boundary with related writes.
 - Added guard-based `TestDb::acquire`.
 - Migrated service and event-processor database tests off callback fixtures.
 - Removed callback helpers `with_db_session` and `with_db_session_and_pool`.
@@ -40,7 +49,7 @@ These commands passed after the implementation:
 ```bash
 cargo check --workspace --all-targets
 cargo test -p lilium-test-fixtures
-cargo test -p lilium-services
+cargo test -p lilium-services user_service_integration
 cargo test -p lilium-event-processor
 ```
 
@@ -53,9 +62,11 @@ rg -n "DbSessionContext|with_db_session|with_db_session_and_pool|with_session_co
 ## Current Boundaries
 
 - `Database::transaction` remains SQLx-backed through `DbSession`.
-- SeaORM entity coverage exists as infrastructure; service CRUD has not been
-  mechanically rewritten to SeaORM entities in this implementation pass.
-- Raw SQL remains in services where it owns PostgreSQL-specific behavior or
-  where ORM migration is still pending.
+- SeaORM entity coverage now mirrors the live bootstrap schema for stable
+  business columns.
+- User primary-key read operations are SeaORM-backed service functions.
+- Raw SQL remains in services for PostgreSQL-specific behavior, partition-aware
+  message/event work, dynamic search SQL, advisory locks, counters, and
+  multi-step mutations that share the existing raw transaction boundary.
 - `DbPool` is private low-level infrastructure, not the production application
   entry point.

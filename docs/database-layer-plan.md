@@ -40,16 +40,18 @@ maintenance SQL.
 ## Service Layer
 
 Service structs do not exist only to hold database sessions. Session-only
-services were converted to module functions that accept `&mut DbSession`
-explicitly:
+services were converted to module functions. Functions that participate in the
+raw SQL transaction boundary accept `&mut DbSession` explicitly:
 
 - account functions
 - event and processor offset functions
 - message functions
 - outgoing command functions
 - room member functions
-- user functions
+- user mutations, search, and batch update internals
 - websocket connection functions
+
+User primary-key reads accept a SeaORM connection through `ConnectionTrait`.
 
 Allowed service structs hold runtime dependencies, not execution state.
 `MediaService` owns HTTP/data-path dependencies and accepts `&mut DbSession` for
@@ -58,9 +60,18 @@ a database session.
 
 ## Raw SQL And ORM
 
-SeaORM is present as the ORM layer. The project uses an ORM-first hybrid model:
-ordinary entity work should move to entities/models, while PostgreSQL-specific
-queries remain explicit raw SQL near the service/use case that owns the behavior.
+SeaORM is the ORM layer. `crates/lilium-database/src/entities` defines entity
+models for the stable business columns in the live bootstrap schema.
+
+The project uses an ORM-first hybrid model. Ordinary user primary-key reads use
+SeaORM entities in `lilium-services::user`. PostgreSQL-specific behavior remains
+explicit raw SQL near the service/use case that owns the behavior:
+
+- message full-text search and partition-aware queries
+- websocket/event processor range scans
+- advisory locks
+- counters and conflict updates
+- raw protocol features behind `Database::raw_connection`
 
 The old `crates/lilium-database/src/queries` module has been deleted. Message
 raw SQL helpers that still matter now live in `crates/lilium-services/src/message.rs`.
@@ -90,6 +101,11 @@ Production binaries, services, and test fixtures use `Database`, `DbSession`,
 
 `DbSessionContext`, callback session helpers, lazy/env pool constructors, and
 `queries` have been removed.
+
+SeaORM-backed service reads currently cover `user::get_by_id`,
+`user::get_by_ids`, and `user::fetch_user_profile`. SQLx-backed service
+functions remain where the function requires the current raw transaction
+boundary or PostgreSQL-specific SQL.
 
 ## Verification Commands
 
