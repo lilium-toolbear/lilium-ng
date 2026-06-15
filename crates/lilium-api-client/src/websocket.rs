@@ -1,20 +1,15 @@
+use crate::config::dzmm_local_address_from_env;
 use anyhow::{Context, Result};
 use chrono::Utc;
-use futures::{future::BoxFuture, StreamExt};
+use futures::{FutureExt, future::BoxFuture};
 use lilium_models::dzmm::message::Message;
 use lilium_models::ingestion::EventEnvelope;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
-use tokio_tungstenite::{
-    connect_async,
-    tungstenite::{
-        http::{header::COOKIE, Request},
-        Message as WsMessage,
-    },
-};
 use tracing::instrument;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
+use url::Url;
 
 pub struct WebSocketEventDecoder;
 
@@ -129,7 +124,6 @@ pub struct WsClient {
     account_id: String,
     url: String,
     cookie_header: Option<String>,
-    session_id: Option<String>,
 }
 
 impl WsClient {
@@ -139,203 +133,278 @@ impl WsClient {
             account_id,
             url,
             cookie_header,
-            session_id: None,
         }
     }
 
-    fn build_request(&self) -> Result<Request<()>> {
-        let mut builder = Request::builder().uri(&self.url);
-        if let Some(cookie_header) = &self.cookie_header {
-            builder = builder.header(COOKIE, cookie_header);
+    fn build_socketio_client<F>(
+        &self,
+        on_event: Arc<tokio::sync::Mutex<F>>,
+        disconnect_notify: Arc<Notify>,
+        disconnect_state: Arc<AtomicBool>,
+    ) -> Result<rust_socketio::asynchronous::ClientBuilder>
+    where
+        F: FnMut(EventEnvelope) -> BoxFuture<'static, ()> + Send + 'static,
+    {
+        let mut builder = rust_socketio::asynchronous::ClientBuilder::new(self.url.clone())
+            .transport_type(rust_socketio::TransportType::Websocket)
+            .reconnect(false);
+
+        if let Some(local_address) = dzmm_local_address_from_env()? {
+            builder = builder.local_address(local_address);
         }
-        builder
-            .body(())
-            .context("Failed to build WebSocket request")
+
+        let cookie_header = self.cookie_header.clone().unwrap_or_default();
+        let mut origin_url = Url::parse(&self.url).context("Invalid websocket URL")?;
+        origin_url.set_path("");
+        origin_url.set_query(None);
+        origin_url.set_fragment(None);
+        let origin = origin_url.to_string().trim_end_matches('/').to_string();
+        let referer = format!("{origin}/chat");
+
+        builder = builder
+            .opening_header("Cookie", cookie_header)
+            .opening_header("Origin", origin)
+            .opening_header("Referer", referer)
+            .opening_header(
+                "User-Agent",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0",
+            )
+            .opening_header("Accept-Encoding", "gzip, deflate, br")
+            .opening_header("Accept-Language", "en-US,en;q=0.9")
+            .opening_header("Cache-Control", "no-cache")
+            .opening_header("Pragma", "no-cache");
+
+        let account_id = self.account_id.clone();
+        let on_event_connect = on_event.clone();
+        builder = builder.on("connect", move |_, _| {
+            let account_id = account_id.clone();
+            let on_event = on_event_connect.clone();
+            async move {
+                info!(account = %account_id, "Connected to DZMM WebSocket");
+                emit_envelope(
+                    on_event,
+                    EventEnvelope {
+                        account_user_id: account_id,
+                        event_type: "sio:connect".to_string(),
+                        payload: serde_json::json!({}),
+                        received_at: Utc::now(),
+                        source: "socket".to_string(),
+                    },
+                )
+                .await;
+            }
+            .boxed()
+        });
+
+        let account_id = self.account_id.clone();
+        let on_event_disconnect = on_event.clone();
+        let disconnect_notify_disconnect = disconnect_notify.clone();
+        let disconnect_state_disconnect = disconnect_state.clone();
+        builder = builder.on("disconnect", move |_, _| {
+            let account_id = account_id.clone();
+            let on_event = on_event_disconnect.clone();
+            let disconnect_notify = disconnect_notify_disconnect.clone();
+            let disconnect_state = disconnect_state_disconnect.clone();
+            async move {
+                warn!(account = %account_id, "Disconnected from DZMM WebSocket");
+                disconnect_state.store(true, Ordering::Relaxed);
+                emit_envelope(
+                    on_event,
+                    EventEnvelope {
+                        account_user_id: account_id,
+                        event_type: "sio:disconnect".to_string(),
+                        payload: serde_json::json!({}),
+                        received_at: Utc::now(),
+                        source: "socket".to_string(),
+                    },
+                )
+                .await;
+                disconnect_notify.notify_waiters();
+            }
+            .boxed()
+        });
+
+        let account_id = self.account_id.clone();
+        let on_event_error = on_event.clone();
+        let disconnect_notify_error = disconnect_notify.clone();
+        let disconnect_state_error = disconnect_state.clone();
+        builder = builder.on("error", move |payload, _| {
+            let account_id = account_id.clone();
+            let on_event = on_event_error.clone();
+            let disconnect_notify = disconnect_notify_error.clone();
+            let disconnect_state = disconnect_state_error.clone();
+            async move {
+                let payload_value = socketio_payload_to_value(payload);
+                error!(account = %account_id, error = %payload_value, "Socket.IO connection error");
+                disconnect_state.store(true, Ordering::Relaxed);
+                emit_envelope(
+                    on_event,
+                    EventEnvelope {
+                        account_user_id: account_id,
+                        event_type: "sio:connect_error".to_string(),
+                        payload: serde_json::json!({ "error": payload_value }),
+                        received_at: Utc::now(),
+                        source: "socket".to_string(),
+                    },
+                )
+                .await;
+                disconnect_notify.notify_waiters();
+            }
+            .boxed()
+        });
+
+        let account_id = self.account_id.clone();
+        builder = builder.on_any(move |event, payload, _| {
+            let account_id = account_id.clone();
+            let on_event = on_event.clone();
+            async move {
+                let event_name: String = event.into();
+                let payload_value = socketio_payload_to_value(payload);
+                let (classified_type, is_room_message) =
+                    WebSocketEventDecoder::classify_event(&payload_value);
+
+                let (event_type, payload) = if is_room_message {
+                    if let Some(message) = WebSocketEventDecoder::decode_message(&payload_value) {
+                        (
+                            classified_type,
+                            serde_json::to_value(message).unwrap_or(serde_json::Value::Null),
+                        )
+                    } else {
+                        (event_name, payload_value)
+                    }
+                } else {
+                    (event_name, payload_value)
+                };
+
+                emit_envelope(
+                    on_event,
+                    EventEnvelope {
+                        account_user_id: account_id,
+                        event_type,
+                        payload,
+                        received_at: Utc::now(),
+                        source: "socket".to_string(),
+                    },
+                )
+                .await;
+            }
+            .boxed()
+        });
+
+        Ok(builder)
     }
 
     #[instrument(skip(self, on_event, shutdown, shutdown_notify, reconnect_notify), fields(account_id = %self.account_id, url = %self.url))]
     pub async fn run<F>(
         &mut self,
-        mut on_event: F,
+        on_event: F,
         shutdown: Arc<AtomicBool>,
         shutdown_notify: Arc<Notify>,
         reconnect_notify: Arc<Notify>,
     ) -> Result<()>
     where
-        F: FnMut(EventEnvelope) -> BoxFuture<'static, ()> + Send,
+        F: FnMut(EventEnvelope) -> BoxFuture<'static, ()> + Send + 'static,
     {
         info!(account = %self.account_id, url = %self.url, "Connecting to WebSocket");
 
-        let request = self.build_request()?;
-        let (ws_stream, _) = connect_async(request)
-            .await
-            .context("Failed to connect to WebSocket")?;
+        if shutdown.load(Ordering::Relaxed) {
+            info!(account = %self.account_id, "Shutdown requested before connect");
+            return Ok(());
+        }
 
-        let (_, mut read) = ws_stream.split();
+        let on_event = Arc::new(tokio::sync::Mutex::new(on_event));
+        let disconnect_notify = Arc::new(Notify::new());
+        let disconnect_state = Arc::new(AtomicBool::new(false));
+        let builder = self.build_socketio_client(
+            on_event,
+            disconnect_notify.clone(),
+            disconnect_state.clone(),
+        )?;
 
+        let connect_result =
+            tokio::time::timeout(std::time::Duration::from_secs(10), builder.connect())
+                .await
+                .context("Timed out while connecting to Socket.IO")?
+                .context("Failed to connect to Socket.IO")?;
+
+        let socket = connect_result;
         info!(account = %self.account_id, "WebSocket connected");
 
-        loop {
-            if shutdown.load(Ordering::Relaxed) {
-                info!(account = %self.account_id, "Shutdown requested");
-                break;
-            }
+        if disconnect_state.load(Ordering::Relaxed) {
+            info!(account = %self.account_id, "WebSocket disconnected during connect");
+            let _ = socket.disconnect().await;
+            return Ok(());
+        }
 
-            tokio::select! {
-                _ = shutdown_notify.notified() => {
-                    info!(account = %self.account_id, "WebSocket shutdown signalled");
-                    break;
-                }
-                _ = reconnect_notify.notified() => {
-                    info!(account = %self.account_id, "WebSocket reconnect requested");
-                    break;
-                }
-                msg = read.next() => {
-                    match msg {
-                        Some(Ok(WsMessage::Text(text))) => match self.handle_message(&text).await {
-                            Ok(Some(event)) => {
-                                on_event(event).await;
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                warn!(account = %self.account_id, error = %e, "Failed to handle message");
-                            }
-                        },
-                        Some(Ok(WsMessage::Binary(data))) => {
-                            if let Ok(text) = String::from_utf8(data.to_vec()) {
-                                match self.handle_message(&text).await {
-                                    Ok(Some(event)) => {
-                                        on_event(event).await;
-                                    }
-                                    Ok(None) => {}
-                                    Err(e) => {
-                                        warn!(account = %self.account_id, error = %e, "Failed to handle binary message");
-                                    }
-                                }
-                            }
-                        }
-                        Some(Ok(WsMessage::Ping(data))) => {
-                            debug!(account = %self.account_id, len = data.len(), "Received ping");
-                        }
-                        Some(Ok(WsMessage::Pong(_))) => {
-                            debug!(account = %self.account_id, "Received pong");
-                        }
-                        Some(Ok(WsMessage::Close(_))) => {
-                            info!(account = %self.account_id, "WebSocket closed");
-                            break;
-                        }
-                        Some(Err(e)) => {
-                            error!(account = %self.account_id, error = %e, "WebSocket error");
-                            break;
-                        }
-                        None => break,
-                        _ => {}
-                    }
-                }
+        tokio::select! {
+            _ = shutdown_notify.notified() => {
+                info!(account = %self.account_id, "WebSocket shutdown signalled");
+            }
+            _ = reconnect_notify.notified() => {
+                info!(account = %self.account_id, "WebSocket reconnect requested");
+            }
+            _ = disconnect_notify.notified() => {
+                info!(account = %self.account_id, "WebSocket disconnected");
             }
         }
+
+        let _ = socket.disconnect().await;
         Ok(())
     }
+}
 
-    #[instrument(skip(self, raw), fields(account_id = %self.account_id, raw_len = raw.len()))]
-    async fn handle_message(&mut self, raw: &str) -> Result<Option<EventEnvelope>> {
-        let trimmed = raw.trim();
+async fn emit_envelope<F>(on_event: Arc<tokio::sync::Mutex<F>>, event: EventEnvelope)
+where
+    F: FnMut(EventEnvelope) -> BoxFuture<'static, ()> + Send + 'static,
+{
+    let fut = {
+        let mut handler = on_event.lock().await;
+        (handler)(event)
+    };
 
-        if trimmed == "2" {
-            debug!(account = %self.account_id, "Received ping, sending pong");
-            return Ok(None);
+    fut.await;
+}
+
+fn socketio_payload_to_value(payload: rust_socketio::Payload) -> serde_json::Value {
+    match payload {
+        rust_socketio::Payload::Text(values) => match values.as_slice() {
+            [single] => decode_value(single),
+            [] => serde_json::Value::Null,
+            _ => serde_json::Value::Array(
+                values
+                    .into_iter()
+                    .map(|value| decode_value(&value))
+                    .collect(),
+            ),
+        },
+        rust_socketio::Payload::Binary(bytes) => match String::from_utf8(bytes.to_vec()) {
+            Ok(text) => serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text)),
+            Err(_) => serde_json::Value::Array(
+                bytes
+                    .into_iter()
+                    .map(|byte| serde_json::Value::from(byte))
+                    .collect(),
+            ),
+        },
+        #[allow(deprecated)]
+        rust_socketio::Payload::String(text) => {
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text))
         }
+    }
+}
 
-        if trimmed == "3" {
-            debug!(account = %self.account_id, "Received pong");
-            return Ok(None);
+fn decode_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(s) => {
+            serde_json::from_str(s).unwrap_or_else(|_| serde_json::Value::String(s.clone()))
         }
-
-        if let Some(json_part) = trimmed.strip_prefix("40") {
-            let session_id = if trimmed.len() > 2 {
-                if json_part.starts_with('{') {
-                    serde_json::from_str::<serde_json::Value>(json_part)
-                        .ok()
-                        .and_then(|v| v.as_str().map(|s| s.to_string()))
-                } else {
-                    let quoted = format!("\"{}\"", json_part);
-                    serde_json::from_str::<serde_json::Value>(&quoted)
-                        .ok()
-                        .and_then(|v| v.as_str().map(|s| s.to_string()))
-                }
-            } else {
-                None
-            };
-
-            if let Some(sid) = session_id {
-                self.session_id = Some(sid.clone());
-                info!(account = %self.account_id, session_id = %sid, "Socket.IO connected");
-            } else {
-                info!(account = %self.account_id, "Socket.IO connected (no session ID)");
-            }
-            return Ok(None);
+        serde_json::Value::Array(arr) if arr.len() == 1 => decode_value(&arr[0]),
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(decode_value).collect())
         }
-
-        if trimmed.starts_with("43") {
-            debug!(account = %self.account_id, "Socket.IO connect acknowledgement");
-            return Ok(None);
-        }
-
-        if trimmed.starts_with('4') && trimmed.len() > 1 && trimmed.as_bytes()[1] == b'2' {
-            let json_str = &trimmed[2..];
-            let parsed: serde_json::Value = serde_json::from_str(json_str)
-                .context("Failed to parse Socket.IO event payload")?;
-
-            if let Some(arr) = parsed.as_array() {
-                if arr.len() >= 2 {
-                    let event_name = arr[0].as_str().unwrap_or("unknown").to_string();
-                    let event_data = &arr[1];
-
-                    let decoded = WebSocketEventDecoder::decode_data(event_data)
-                        .unwrap_or_else(|| event_data.clone());
-
-                    let (classified_type, is_room_msg) =
-                        WebSocketEventDecoder::classify_event(&decoded);
-
-                    if is_room_msg {
-                        if let Some(message) = WebSocketEventDecoder::decode_message(&decoded) {
-                            return Ok(Some(EventEnvelope {
-                                account_user_id: self.account_id.clone(),
-                                event_type: classified_type,
-                                payload: serde_json::to_value(&message)
-                                    .unwrap_or(serde_json::Value::Null),
-                                received_at: Utc::now(),
-                                source: "socket".to_string(),
-                            }));
-                        }
-                    }
-
-                    return Ok(Some(EventEnvelope {
-                        account_user_id: self.account_id.clone(),
-                        event_type: event_name,
-                        payload: decoded,
-                        received_at: Utc::now(),
-                        source: "socket".to_string(),
-                    }));
-                }
-            }
-
-            return Ok(None);
-        }
-
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            let (event_type, _) = WebSocketEventDecoder::classify_event(&val);
-            return Ok(Some(EventEnvelope {
-                account_user_id: self.account_id.clone(),
-                event_type,
-                payload: val,
-                received_at: Utc::now(),
-                source: "socket".to_string(),
-            }));
-        }
-
-        debug!(account = %self.account_id, raw = %trimmed, "Unrecognized message format");
-        Ok(None)
+        serde_json::Value::Object(_) => value.clone(),
+        serde_json::Value::Null => serde_json::Value::Null,
+        _ => value.clone(),
     }
 }
 

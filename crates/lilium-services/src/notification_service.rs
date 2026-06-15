@@ -3,8 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::Result;
-use lilium_database::DbSessionContext;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::time::timeout;
 use tracing::instrument;
 
@@ -14,16 +13,13 @@ struct Subscriber {
     sender: broadcast::Sender<String>,
 }
 
-pub struct NotificationService<'a> {
-    _session: DbSessionContext<'a>,
+pub struct NotificationService {
     subscribers: Arc<RwLock<Vec<Subscriber>>>,
 }
 
-impl<'a> NotificationService<'a> {
-    #[instrument(skip(session))]
-    pub fn new(session: DbSessionContext<'a>) -> Self {
+impl NotificationService {
+    pub fn new() -> Self {
         Self {
-            _session: session,
             subscribers: Arc::new(RwLock::new(Vec::new())),
         }
     }
@@ -207,176 +203,96 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscribe_returns_id_and_receiver() {
-        lilium_test_fixtures::with_db_session(
-            lilium_test_fixtures::FixtureProfile::Notification,
-            |session| {
-                Box::pin(async move {
-                    let mut service = NotificationService::new(session);
-                    let (id, _receiver) = service.subscribe("test_channel").await.unwrap();
-                    assert_eq!(id, 0);
-                    Ok(())
-                })
-            },
-        )
-        .await
-        .expect("test_subscribe_returns_id_and_receiver");
+        let mut service = NotificationService::new();
+        let (id, _receiver) = service.subscribe("test_channel").await.unwrap();
+        assert_eq!(id, 0);
     }
 
     #[tokio::test]
     async fn test_subscribe_increments_ids() {
-        lilium_test_fixtures::with_db_session(
-            lilium_test_fixtures::FixtureProfile::Notification,
-            |session| {
-                Box::pin(async move {
-                    let mut service = NotificationService::new(session);
-                    let (id1, _) = service.subscribe("ch").await.unwrap();
-                    let (id2, _) = service.subscribe("ch").await.unwrap();
-                    assert_eq!(id1, 0);
-                    assert_eq!(id2, 1);
-                    Ok(())
-                })
-            },
-        )
-        .await
-        .expect("test_subscribe_increments_ids");
+        let mut service = NotificationService::new();
+        let (id1, _) = service.subscribe("ch").await.unwrap();
+        let (id2, _) = service.subscribe("ch").await.unwrap();
+        assert_eq!(id1, 0);
+        assert_eq!(id2, 1);
     }
 
     #[tokio::test]
     async fn test_unsubscribe_removes_subscriber() {
-        lilium_test_fixtures::with_db_session(
-            lilium_test_fixtures::FixtureProfile::Notification,
-            |session| {
-                Box::pin(async move {
-                    let mut service = NotificationService::new(session);
-                    let (id, _receiver) = service.subscribe("ch").await.unwrap();
-                    service.unsubscribe(id).await.unwrap();
-                    let (new_id, _) = service.subscribe("ch").await.unwrap();
-                    assert_eq!(new_id, 0);
-                    Ok(())
-                })
-            },
-        )
-        .await
-        .expect("test_unsubscribe_removes_subscriber");
+        let mut service = NotificationService::new();
+        let (id, _receiver) = service.subscribe("ch").await.unwrap();
+        service.unsubscribe(id).await.unwrap();
+        let (new_id, _) = service.subscribe("ch").await.unwrap();
+        assert_eq!(new_id, 0);
     }
 
     #[tokio::test]
     async fn test_wait_for_notification_times_out() {
-        lilium_test_fixtures::with_db_session(
-            lilium_test_fixtures::FixtureProfile::Notification,
-            |session| {
-                Box::pin(async move {
-                    let mut service = NotificationService::new(session);
-                    let result = service
-                        .wait_for_notification("ch", Some(Duration::from_millis(10)))
-                        .await
-                        .unwrap();
-                    assert!(!result);
-                    Ok(())
-                })
-            },
-        )
-        .await
-        .expect("test_wait_for_notification_times_out");
+        let mut service = NotificationService::new();
+        let result = service
+            .wait_for_notification("ch", Some(Duration::from_millis(10)))
+            .await
+            .unwrap();
+        assert!(!result);
     }
 
     #[tokio::test]
     async fn test_wait_for_notification_receives() {
-        lilium_test_fixtures::with_db_session(
-            lilium_test_fixtures::FixtureProfile::Notification,
-            |session| {
-                Box::pin(async move {
-                    let mut service = NotificationService::new(session);
-                    let (id, _receiver) = service.subscribe("ch").await.unwrap();
+        let mut service = NotificationService::new();
+        let (id, _receiver) = service.subscribe("ch").await.unwrap();
 
-                    let subscribers = service.subscribers.clone();
+        let subscribers = service.subscribers.clone();
 
-                    tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_millis(5)).await;
-                        let subs = subscribers.read().await;
-                        let _ = subs[id].sender.send("msg".into());
-                    });
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let subs = subscribers.read().await;
+            let _ = subs[id].sender.send("msg".into());
+        });
 
-                    let result = service
-                        .wait_for_notification("ch", Some(Duration::from_secs(1)))
-                        .await
-                        .unwrap();
-                    assert!(result);
-                    Ok(())
-                })
-            },
-        )
-        .await
-        .expect("test_wait_for_notification_receives");
+        let result = service
+            .wait_for_notification("ch", Some(Duration::from_secs(1)))
+            .await
+            .unwrap();
+        assert!(result);
     }
 
     #[tokio::test]
     async fn test_wait_for_multiple_empty_channels_returns_none() {
-        lilium_test_fixtures::with_db_session(
-            lilium_test_fixtures::FixtureProfile::Notification,
-            |session| {
-                Box::pin(async move {
-                    let mut service = NotificationService::new(session);
-                    let result = service
-                        .wait_for_multiple(&[], Some(Duration::from_millis(10)))
-                        .await
-                        .unwrap();
-                    assert!(result.is_none());
-                    Ok(())
-                })
-            },
-        )
-        .await
-        .expect("test_wait_for_multiple_empty_channels_returns_none");
+        let mut service = NotificationService::new();
+        let result = service
+            .wait_for_multiple(&[], Some(Duration::from_millis(10)))
+            .await
+            .unwrap();
+        assert!(result.is_none());
     }
 
     #[tokio::test]
     async fn test_wait_for_multiple_receives_channel_name() {
-        lilium_test_fixtures::with_db_session(
-            lilium_test_fixtures::FixtureProfile::Notification,
-            |session| {
-                Box::pin(async move {
-                    let mut service = NotificationService::new(session);
-                    let (id, _receiver) = service.subscribe("channel_a").await.unwrap();
+        let mut service = NotificationService::new();
+        let (id, _receiver) = service.subscribe("channel_a").await.unwrap();
 
-                    let subscribers = service.subscribers.clone();
+        let subscribers = service.subscribers.clone();
 
-                    tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_millis(5)).await;
-                        let subs = subscribers.read().await;
-                        let _ = subs[id].sender.send("msg".into());
-                    });
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let subs = subscribers.read().await;
+            let _ = subs[id].sender.send("msg".into());
+        });
 
-                    let result = service
-                        .wait_for_multiple(&["channel_a"], Some(Duration::from_secs(1)))
-                        .await
-                        .unwrap();
-                    assert_eq!(result, Some("channel_a".to_string()));
-                    Ok(())
-                })
-            },
-        )
-        .await
-        .expect("test_wait_for_multiple_receives_channel_name");
+        let result = service
+            .wait_for_multiple(&["channel_a"], Some(Duration::from_secs(1)))
+            .await
+            .unwrap();
+        assert_eq!(result, Some("channel_a".to_string()));
     }
 
     #[tokio::test]
     async fn test_wait_for_multiple_times_out() {
-        lilium_test_fixtures::with_db_session(
-            lilium_test_fixtures::FixtureProfile::Notification,
-            |session| {
-                Box::pin(async move {
-                    let mut service = NotificationService::new(session);
-                    let result = service
-                        .wait_for_multiple(&["ch"], Some(Duration::from_millis(10)))
-                        .await
-                        .unwrap();
-                    assert!(result.is_none());
-                    Ok(())
-                })
-            },
-        )
-        .await
-        .expect("test_wait_for_multiple_times_out");
+        let mut service = NotificationService::new();
+        let result = service
+            .wait_for_multiple(&["ch"], Some(Duration::from_millis(10)))
+            .await
+            .unwrap();
+        assert!(result.is_none());
     }
 }

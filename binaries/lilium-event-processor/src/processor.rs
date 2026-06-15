@@ -1,28 +1,27 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 #[cfg(not(test))]
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::sync::Arc;
 use tokio::sync::Notify;
-use tokio::time::{sleep, Duration, Instant};
+use tokio::time::{Duration, Instant, sleep};
 use tracing::{error, info, warn};
 
 #[cfg(not(test))]
 use lilium_common::LiliumError;
-use lilium_database::{DbPool, DbSessionContext};
+use lilium_database::{Database, DbSession};
 use lilium_models::ingestion::WebSocketEvent;
 #[cfg(not(test))]
-use lilium_services::account_service::AccountService;
-use lilium_services::event::{EventProcessorOffsetService, WebSocketEventService};
+use lilium_services::account_service as account;
+use lilium_services::event;
 use lilium_services::media::MediaService;
-use lilium_services::message::MessageService;
-use lilium_services::room_member::RoomMemberService;
-use lilium_services::user::UserService;
+use lilium_services::message;
+use lilium_services::{room_member, user};
 
 pub struct EventProcessor {
     processor_id: String,
-    pool: DbPool,
+    database: Database,
     batch_size: usize,
     polling_interval: Duration,
     max_retries: u32,
@@ -35,14 +34,14 @@ pub struct EventProcessor {
 
 impl EventProcessor {
     pub fn new(
-        pool: DbPool,
+        database: Database,
         processor_id: String,
         batch_size: usize,
         polling_interval_secs: u64,
     ) -> Self {
         Self {
             processor_id,
-            pool,
+            database,
             batch_size,
             polling_interval: Duration::from_secs(polling_interval_secs),
             max_retries: 3,
@@ -114,14 +113,10 @@ impl EventProcessor {
     async fn fetch_batch(&self) -> Result<(Vec<WebSocketEvent>, i64, Option<DateTime<Utc>>)> {
         let processor_id = self.processor_id.clone();
         let batch_size = self.batch_size as i64;
-        self.pool
-            .with_session_context(|session| {
-                Box::pin(async move {
-                    let mut session = session;
-                    Self::fetch_batch_inner(&mut session, processor_id, batch_size).await
-                })
-            })
-            .await
+        lilium_database::transaction!(self.database, |session| {
+            Self::fetch_batch_inner(session, processor_id, batch_size).await
+        })
+        .await
     }
 
     async fn process_batch_with_retry(
@@ -222,22 +217,18 @@ impl EventProcessor {
         start_cursor_timestamp: Option<DateTime<Utc>>,
     ) -> Result<()> {
         let processor_id = self.processor_id.clone();
-        self.pool
-            .with_session_context(|session| {
-                let events = events.to_vec();
-                Box::pin(async move {
-                    let mut session = session;
-                    Self::process_batch_inner(
-                        &mut session,
-                        events,
-                        processor_id,
-                        start_cursor_id,
-                        start_cursor_timestamp,
-                    )
-                    .await
-                })
-            })
+        let events = events.to_vec();
+        lilium_database::transaction!(self.database, |session| {
+            Self::process_batch_inner(
+                session,
+                events,
+                processor_id,
+                start_cursor_id,
+                start_cursor_timestamp,
+            )
             .await
+        })
+        .await
     }
 
     async fn skip_batch(
@@ -255,19 +246,14 @@ impl EventProcessor {
         let last_timestamp = batch_last_timestamp.or(cursor_timestamp);
 
         let processor_id = self.processor_id.clone();
-        self.pool
-            .with_session_context(|session| {
-                Box::pin(async move {
-                    let mut session = session;
-                    Self::skip_batch_inner(&mut session, processor_id, last_id, last_timestamp)
-                        .await
-                })
-            })
-            .await
+        lilium_database::transaction!(self.database, |session| {
+            Self::skip_batch_inner(session, processor_id, last_id, last_timestamp).await
+        })
+        .await
     }
 
     async fn fetch_batch_inner(
-        session: &mut DbSessionContext<'_>,
+        session: &mut DbSession,
         processor_id: String,
         batch_size: i64,
     ) -> Result<(Vec<WebSocketEvent>, i64, Option<DateTime<Utc>>)> {
@@ -278,7 +264,7 @@ impl EventProcessor {
     }
 
     async fn process_batch_inner(
-        session: &mut DbSessionContext<'_>,
+        session: &mut DbSession,
         events: Vec<WebSocketEvent>,
         processor_id: String,
         start_cursor_id: i64,
@@ -300,65 +286,60 @@ impl EventProcessor {
         Self::sync_users(session, &user_fetch_collector).await?;
         Self::sync_media(session, &media_message_ids).await?;
 
-        let mut offset_svc = EventProcessorOffsetService::new(DbSessionContext::new(session));
-        offset_svc
-            .update_offset(
-                &processor_id,
-                last_processed_id,
-                last_timestamp,
-                Some(Utc::now()),
-            )
-            .await?;
+        event::update_offset(
+            session,
+            &processor_id,
+            last_processed_id,
+            last_timestamp,
+            Some(Utc::now()),
+        )
+        .await?;
 
         Ok(())
     }
 
     async fn skip_batch_inner(
-        session: &mut DbSessionContext<'_>,
+        session: &mut DbSession,
         processor_id: String,
         last_id: i64,
         last_timestamp: Option<DateTime<Utc>>,
     ) -> Result<()> {
         let last_processed_id = i32::try_from(last_id)
             .map_err(|_| anyhow!("event id exceeds event_processor_offsets range"))?;
-        let mut offset_svc = EventProcessorOffsetService::new(DbSessionContext::new(session));
-        offset_svc
-            .update_offset(
-                &processor_id,
-                last_processed_id,
-                last_timestamp,
-                Some(Utc::now()),
-            )
-            .await?;
+        event::update_offset(
+            session,
+            &processor_id,
+            last_processed_id,
+            last_timestamp,
+            Some(Utc::now()),
+        )
+        .await?;
         Ok(())
     }
 
     async fn fetch_last_cursor(
-        session: &mut DbSessionContext<'_>,
+        session: &mut DbSession,
         processor_id: String,
     ) -> Result<(i64, Option<DateTime<Utc>>)> {
-        let mut offset_svc = EventProcessorOffsetService::new(DbSessionContext::new(session));
-        let cursor = offset_svc.get_cursor(&processor_id).await?;
+        let cursor = event::get_cursor(session, &processor_id).await?;
         Ok(cursor
             .map(|c| (i64::from(c.last_processed_id), c.last_processed_timestamp))
             .unwrap_or((0, None)))
     }
 
     async fn poll_events(
-        session: &mut DbSessionContext<'_>,
+        session: &mut DbSession,
         last_timestamp: Option<DateTime<Utc>>,
         last_id: i64,
         batch_size: i64,
     ) -> Result<Vec<WebSocketEvent>> {
-        let mut event_svc = WebSocketEventService::new(DbSessionContext::new(session));
-        event_svc
-            .poll_events(last_timestamp, last_id, batch_size)
+        event::poll_events(session, last_timestamp, last_id, batch_size)
             .await
             .map_err(Into::into)
     }
 
     async fn collect_updates_from_events(
-        session: &mut DbSessionContext<'_>,
+        session: &mut DbSession,
         events: &[WebSocketEvent],
     ) -> Result<(Vec<(String, String, String)>, Vec<String>)> {
         let mut user_fetch_collector = Vec::new();
@@ -376,7 +357,7 @@ impl EventProcessor {
     }
 
     async fn sync_users(
-        session: &mut DbSessionContext<'_>,
+        session: &mut DbSession,
         user_fetch_collector: &[(String, String, String)],
     ) -> Result<()> {
         if user_fetch_collector.is_empty() {
@@ -385,13 +366,11 @@ impl EventProcessor {
 
         #[cfg(test)]
         {
-            let mut user_service = UserService::new(DbSessionContext::new(session));
             let user_room_pairs: Vec<(String, String)> = user_fetch_collector
                 .iter()
                 .map(|(_, user_id, room_id)| (user_id.clone(), room_id.clone()))
                 .collect();
-            return user_service
-                .batch_fetch_and_update(&user_room_pairs)
+            return user::batch_fetch_and_update(session, &user_room_pairs)
                 .await
                 .map(|_| ());
         }
@@ -411,25 +390,21 @@ impl EventProcessor {
             let account_count = grouped.len();
 
             for (source_account_user_id, user_room_pairs) in grouped {
-                let account = {
-                    let mut account_service = AccountService::new(DbSessionContext::new(session));
-                    account_service.get_account(&source_account_user_id).await?
-                }
-                .ok_or_else(|| {
-                    LiliumError::service(
-                        "ACCOUNT_SYNC_ACCOUNT_NOT_FOUND",
-                        format!(
-                            "Account '{}' not found for user sync",
-                            source_account_user_id
-                        ),
-                    )
-                })?;
+                let account = { account::get_account(session, &source_account_user_id).await? }
+                    .ok_or_else(|| {
+                        LiliumError::service(
+                            "ACCOUNT_SYNC_ACCOUNT_NOT_FOUND",
+                            format!(
+                                "Account '{}' not found for user sync",
+                                source_account_user_id
+                            ),
+                        )
+                    })?;
 
-                let auth = AccountService::create_auth_client(&account)?;
-                let mut user_service = UserService::new(DbSessionContext::new(session));
-                let (new_count, updated_count) = user_service
-                    .batch_fetch_and_update_with_auth(&auth, &user_room_pairs, 1)
-                    .await?;
+                let auth = account::create_auth_client(&account)?;
+                let (new_count, updated_count) =
+                    user::batch_fetch_and_update_with_auth(session, &auth, &user_room_pairs, 1)
+                        .await?;
                 total_new += new_count;
                 total_updated += updated_count;
             }
@@ -445,17 +420,14 @@ impl EventProcessor {
         }
     }
 
-    async fn sync_media(
-        session: &mut DbSessionContext<'_>,
-        media_message_ids: &[String],
-    ) -> Result<()> {
+    async fn sync_media(session: &mut DbSession, media_message_ids: &[String]) -> Result<()> {
         if media_message_ids.is_empty() {
             return Ok(());
         }
 
-        let mut media_service = MediaService::new(DbSessionContext::new(session));
+        let media_service = MediaService::new();
         media_service
-            .download_media_batch(media_message_ids)
+            .download_media_batch(session, media_message_ids)
             .await
             .map(|_| ())
     }
@@ -475,7 +447,7 @@ impl EventProcessor {
     }
 
     async fn process_event(
-        session: &mut DbSessionContext<'_>,
+        session: &mut DbSession,
         event: &WebSocketEvent,
         user_fetch_collector: &mut Vec<(String, String, String)>,
     ) -> Result<Option<String>> {
@@ -489,11 +461,7 @@ impl EventProcessor {
                 if let Some(msg) =
                     lilium_models::dzmm::message::Message::from_websocket(&event.data)
                 {
-                    let created = {
-                        let mut message_service =
-                            MessageService::new(DbSessionContext::new(session));
-                        message_service.create_message_if_missing(&msg).await?
-                    };
+                    let created = message::create_message_if_missing(session, &msg).await?;
 
                     if !created {
                         return Ok(None);
@@ -510,23 +478,23 @@ impl EventProcessor {
                     if msg.content_type == "system" {
                         if let Some(content_text) = msg.content_text.as_deref() {
                             if content_text.contains("加入了群聊") && !msg.sent_by.is_empty() {
-                                let mut room_member_service =
-                                    RoomMemberService::new(DbSessionContext::new(session));
-                                room_member_service
-                                    .upsert_member_simple(
-                                        &msg.room_id,
-                                        &msg.sent_by,
-                                        "member",
-                                        Some(msg.sent_at),
-                                    )
-                                    .await?;
+                                room_member::upsert_member_simple(
+                                    session,
+                                    &msg.room_id,
+                                    &msg.sent_by,
+                                    "member",
+                                    Some(msg.sent_at),
+                                )
+                                .await?;
                             } else if content_text.contains("离开了群聊") && !msg.sent_by.is_empty()
                             {
-                                let mut room_member_service =
-                                    RoomMemberService::new(DbSessionContext::new(session));
-                                let _ = room_member_service
-                                    .mark_member_left(&msg.room_id, &msg.sent_by, Some(msg.sent_at))
-                                    .await?;
+                                let _ = room_member::mark_member_left(
+                                    session,
+                                    &msg.room_id,
+                                    &msg.sent_by,
+                                    Some(msg.sent_at),
+                                )
+                                .await?;
                             }
                         }
                     }
@@ -557,25 +525,20 @@ impl EventProcessor {
             }
             "message:updated" => {
                 if let Some(message_id) = event.data.get("messageId").and_then(|v| v.as_str()) {
-                    let mut message_service = MessageService::new(DbSessionContext::new(session));
-                    message_service
-                        .update_message_from_payload(message_id, &event.data)
-                        .await?;
+                    message::update_message_from_payload(session, message_id, &event.data).await?;
                 }
                 Ok(None)
             }
             "message:deleted" => {
                 if let Some(message_id) = event.data.get("messageId").and_then(|v| v.as_str()) {
                     let deleted_by = event.data.get("deletedBy").and_then(|v| v.as_str());
-                    let mut message_service = MessageService::new(DbSessionContext::new(session));
-                    message_service.mark_deleted(message_id, deleted_by).await?;
+                    message::mark_deleted(session, message_id, deleted_by).await?;
                 }
                 Ok(None)
             }
             "message:recalled" => {
                 if let Some(message_id) = event.data.get("messageId").and_then(|v| v.as_str()) {
-                    let mut message_service = MessageService::new(DbSessionContext::new(session));
-                    message_service.mark_recalled(message_id).await?;
+                    message::mark_recalled(session, message_id).await?;
                 }
                 Ok(None)
             }
@@ -594,11 +557,14 @@ impl EventProcessor {
             "group:member-joined" => {
                 if let Some(user_id) = event.data.get("userId").and_then(|v| v.as_str()) {
                     if let Some(room_id) = event.data.get("chatroomId").and_then(|v| v.as_str()) {
-                        let mut room_member_service =
-                            RoomMemberService::new(DbSessionContext::new(session));
-                        room_member_service
-                            .upsert_member_simple(room_id, user_id, "member", Some(event.timestamp))
-                            .await?;
+                        room_member::upsert_member_simple(
+                            session,
+                            room_id,
+                            user_id,
+                            "member",
+                            Some(event.timestamp),
+                        )
+                        .await?;
                         user_fetch_collector.push((
                             event.user_id.clone(),
                             user_id.to_string(),
@@ -611,11 +577,13 @@ impl EventProcessor {
             "group:member-left" => {
                 if let Some(user_id) = event.data.get("userId").and_then(|v| v.as_str()) {
                     if let Some(room_id) = event.data.get("chatroomId").and_then(|v| v.as_str()) {
-                        let mut room_member_service =
-                            RoomMemberService::new(DbSessionContext::new(session));
-                        let _ = room_member_service
-                            .mark_member_left(room_id, user_id, Some(event.timestamp))
-                            .await?;
+                        let _ = room_member::mark_member_left(
+                            session,
+                            room_id,
+                            user_id,
+                            Some(event.timestamp),
+                        )
+                        .await?;
                     }
                 }
                 Ok(None)
@@ -640,9 +608,9 @@ mod tests {
     use super::*;
     use lilium_models::dzmm::message::Message as DzmmMessage;
     use lilium_models::dzmm::room_member::RoomMember;
-    use lilium_services::event::EventProcessorOffsetService;
-    use lilium_services::message::MessageService;
-    use lilium_test_fixtures::{with_db_session, FixtureProfile};
+    use lilium_services::event;
+    use lilium_services::message;
+    use lilium_test_fixtures::{FixtureProfile, TestDb};
     use sqlx::query_as;
 
     fn utc(ts: &str) -> DateTime<Utc> {
@@ -668,7 +636,7 @@ mod tests {
     }
 
     async fn room_member_row(
-        session: &mut DbSessionContext<'_>,
+        session: &mut DbSession,
         room_id: &str,
         user_id: &str,
     ) -> Result<Option<RoomMember>> {
@@ -686,59 +654,55 @@ mod tests {
 
     #[tokio::test]
     async fn message_new_system_join_updates_room_members() {
-        with_db_session(FixtureProfile::Shared, |session| {
-            Box::pin(async move {
-                let mut session = session;
-                let event = websocket_event(
-                    11,
-                    "message:new",
-                    "account_1",
-                    "2026-06-02T12:00:00Z",
-                    serde_json::json!({
-                        "chatroomId": "room_1",
-                        "message": {
-                            "message_id": "msg_join",
-                            "chatroom_id": "room_1",
-                            "sent_by": "user_joined",
-                            "sent_at": "2026-06-02T12:00:00Z",
-                            "content": {
-                                "type": "system",
-                                "text": "Alice 加入了群聊"
-                            }
+        let test_db = TestDb::acquire(FixtureProfile::Shared)
+            .await
+            .expect("init shared db");
+
+        lilium_database::transaction!(test_db.database(), |session| {
+            let event = websocket_event(
+                11,
+                "message:new",
+                "account_1",
+                "2026-06-02T12:00:00Z",
+                serde_json::json!({
+                    "chatroomId": "room_1",
+                    "message": {
+                        "message_id": "msg_join",
+                        "chatroom_id": "room_1",
+                        "sent_by": "user_joined",
+                        "sent_at": "2026-06-02T12:00:00Z",
+                        "content": {
+                            "type": "system",
+                            "text": "Alice 加入了群聊"
                         }
-                    }),
-                );
+                    }
+                }),
+            );
 
-                let mut user_fetch_collector = Vec::new();
-                let result =
-                    EventProcessor::process_event(&mut session, &event, &mut user_fetch_collector)
-                        .await
-                        .expect("process event");
+            let mut user_fetch_collector = Vec::new();
+            let result = EventProcessor::process_event(session, &event, &mut user_fetch_collector)
+                .await
+                .expect("process event");
 
-                assert!(result.is_none());
-                assert_eq!(
-                    user_fetch_collector,
-                    vec![(
-                        "account_1".to_string(),
-                        "user_joined".to_string(),
-                        "room_1".to_string()
-                    )]
-                );
+            assert!(result.is_none());
+            assert_eq!(
+                user_fetch_collector,
+                vec![(
+                    "account_1".to_string(),
+                    "user_joined".to_string(),
+                    "room_1".to_string()
+                )]
+            );
 
-                let message_service = MessageService::new(DbSessionContext::new(&mut session));
-                drop(message_service);
+            let member = room_member_row(session, "room_1", "user_joined")
+                .await?
+                .expect("member row");
+            assert_eq!(member.room_id, "room_1");
+            assert_eq!(member.user_id, "user_joined");
+            assert_eq!(member.joined_at, Some(utc("2026-06-02T12:00:00Z")));
+            assert!(member.left_at.is_none());
 
-                let mut member_session = session;
-                let member = room_member_row(&mut member_session, "room_1", "user_joined")
-                    .await?
-                    .expect("member row");
-                assert_eq!(member.room_id, "room_1");
-                assert_eq!(member.user_id, "user_joined");
-                assert_eq!(member.joined_at, Some(utc("2026-06-02T12:00:00Z")));
-                assert!(member.left_at.is_none());
-
-                Ok(())
-            })
+            Ok(())
         })
         .await
         .expect("message_new_system_join_updates_room_members");
@@ -746,45 +710,44 @@ mod tests {
 
     #[tokio::test]
     async fn group_member_left_marks_room_member_left() {
-        with_db_session(FixtureProfile::Shared, |session| {
-            Box::pin(async move {
-                let mut session = session;
-                let mut room_member_service =
-                    RoomMemberService::new(DbSessionContext::new(&mut session));
-                room_member_service
-                    .upsert_member_simple(
-                        "room_1",
-                        "user_left",
-                        "member",
-                        Some(utc("2026-06-01T00:00:00Z")),
-                    )
-                    .await?;
+        let test_db = TestDb::acquire(FixtureProfile::Shared)
+            .await
+            .expect("init shared db");
 
-                let event = websocket_event(
-                    12,
-                    "group:member-left",
-                    "account_1",
-                    "2026-06-02T12:30:00Z",
-                    serde_json::json!({
-                        "chatroomId": "room_1",
-                        "userId": "user_left"
-                    }),
-                );
+        lilium_database::transaction!(test_db.database(), |session| {
+            room_member::upsert_member_simple(
+                session,
+                "room_1",
+                "user_left",
+                "member",
+                Some(utc("2026-06-01T00:00:00Z")),
+            )
+            .await?;
 
-                let mut user_fetch_collector = Vec::new();
-                EventProcessor::process_event(&mut session, &event, &mut user_fetch_collector)
-                    .await
-                    .expect("process event");
+            let event = websocket_event(
+                12,
+                "group:member-left",
+                "account_1",
+                "2026-06-02T12:30:00Z",
+                serde_json::json!({
+                    "chatroomId": "room_1",
+                    "userId": "user_left"
+                }),
+            );
 
-                assert!(user_fetch_collector.is_empty());
+            let mut user_fetch_collector = Vec::new();
+            EventProcessor::process_event(session, &event, &mut user_fetch_collector)
+                .await
+                .expect("process event");
 
-                let member = room_member_row(&mut session, "room_1", "user_left")
-                    .await?
-                    .expect("member row");
-                assert_eq!(member.left_at, Some(utc("2026-06-02T12:30:00Z")));
+            assert!(user_fetch_collector.is_empty());
 
-                Ok(())
-            })
+            let member = room_member_row(session, "room_1", "user_left")
+                .await?
+                .expect("member row");
+            assert_eq!(member.left_at, Some(utc("2026-06-02T12:30:00Z")));
+
+            Ok(())
         })
         .await
         .expect("group_member_left_marks_room_member_left");
@@ -792,67 +755,65 @@ mod tests {
 
     #[tokio::test]
     async fn message_deleted_uses_deleted_by() {
-        with_db_session(FixtureProfile::Shared, |session| {
-            Box::pin(async move {
-                let mut session = session;
-                let sent_at = utc("2026-06-01T00:00:00Z");
-                let message = DzmmMessage {
-                    message_id: "msg_deleted".to_string(),
-                    room_id: "room_1".to_string(),
-                    sent_at,
-                    sent_by: "user_deleted".to_string(),
-                    content_type: "text".to_string(),
-                    content_text: Some("hello".to_string()),
-                    content_tsv: None,
-                    attachment_url: None,
-                    attachment_file: None,
-                    sticker_id: None,
-                    alt_text: None,
-                    metadata: None,
-                    raw_data: serde_json::json!({"message_id": "msg_deleted"}),
-                    source: "spider".to_string(),
-                    created_at: sent_at,
-                    updated_at: None,
-                    is_deleted: false,
-                    deleted_at: None,
-                    deleted_by: None,
-                    is_recalled: false,
-                    is_edited: false,
-                    history: None,
-                    reference_message_id: None,
-                    reference_data: None,
-                };
-                let mut message_service = MessageService::new(DbSessionContext::new(&mut session));
-                message_service.create_message(&message).await?;
+        let test_db = TestDb::acquire(FixtureProfile::Shared)
+            .await
+            .expect("init shared db");
 
-                let event = websocket_event(
-                    13,
-                    "message:deleted",
-                    "account_1",
-                    "2026-06-02T13:00:00Z",
-                    serde_json::json!({
-                        "chatroomId": "room_1",
-                        "messageId": "msg_deleted",
-                        "deletedBy": "user_admin"
-                    }),
-                );
+        lilium_database::transaction!(test_db.database(), |session| {
+            let sent_at = utc("2026-06-01T00:00:00Z");
+            let message = DzmmMessage {
+                message_id: "msg_deleted".to_string(),
+                room_id: "room_1".to_string(),
+                sent_at,
+                sent_by: "user_deleted".to_string(),
+                content_type: "text".to_string(),
+                content_text: Some("hello".to_string()),
+                content_tsv: None,
+                attachment_url: None,
+                attachment_file: None,
+                sticker_id: None,
+                alt_text: None,
+                metadata: None,
+                raw_data: serde_json::json!({"message_id": "msg_deleted"}),
+                source: "spider".to_string(),
+                created_at: sent_at,
+                updated_at: None,
+                is_deleted: false,
+                deleted_at: None,
+                deleted_by: None,
+                is_recalled: false,
+                is_edited: false,
+                history: None,
+                reference_message_id: None,
+                reference_data: None,
+            };
+            message::create_message(session, &message).await?;
 
-                let mut user_fetch_collector = Vec::new();
-                EventProcessor::process_event(&mut session, &event, &mut user_fetch_collector)
-                    .await
-                    .expect("process event");
+            let event = websocket_event(
+                13,
+                "message:deleted",
+                "account_1",
+                "2026-06-02T13:00:00Z",
+                serde_json::json!({
+                    "chatroomId": "room_1",
+                    "messageId": "msg_deleted",
+                    "deletedBy": "user_admin"
+                }),
+            );
 
-                let mut message_service = MessageService::new(DbSessionContext::new(&mut session));
-                let updated = message_service
-                    .get_by_id_at("msg_deleted", sent_at, false)
-                    .await?
-                    .expect("message exists");
+            let mut user_fetch_collector = Vec::new();
+            EventProcessor::process_event(session, &event, &mut user_fetch_collector)
+                .await
+                .expect("process event");
 
-                assert!(updated.is_deleted);
-                assert_eq!(updated.deleted_by.as_deref(), Some("user_admin"));
+            let updated = message::get_by_id_at(session, "msg_deleted", sent_at, false)
+                .await?
+                .expect("message exists");
 
-                Ok(())
-            })
+            assert!(updated.is_deleted);
+            assert_eq!(updated.deleted_by.as_deref(), Some("user_admin"));
+
+            Ok(())
         })
         .await
         .expect("message_deleted_uses_deleted_by");
@@ -860,23 +821,16 @@ mod tests {
 
     #[tokio::test]
     async fn batch_retry_falls_back_to_per_event_processing() {
-        let pool = lilium_test_fixtures::connect_test_database().await;
-        pool.with_session_context(|session| {
-            Box::pin(async move {
-                let mut session = session;
-                lilium_test_fixtures::prepare_database(
-                    &mut session,
-                    lilium_test_fixtures::FixtureProfile::Event,
-                )
-                .await?;
-                Ok(())
-            })
-        })
-        .await
-        .expect("init event db");
+        let test_db = TestDb::acquire(FixtureProfile::Event)
+            .await
+            .expect("init event db");
 
-        let mut processor =
-            EventProcessor::new(pool.inner().clone(), "test_processor".to_string(), 10, 60);
+        let mut processor = EventProcessor::new(
+            test_db.database().clone(),
+            "test_processor".to_string(),
+            10,
+            60,
+        );
         processor.max_retries = 0;
 
         let events = vec![
@@ -901,12 +855,11 @@ mod tests {
             .await
             .expect("fallback processing");
 
-        let offset = pool
-            .with_session_context(|session| {
+        let offset = test_db
+            .database()
+            .transaction(|session| {
                 Box::pin(async move {
-                    let mut offset_service = EventProcessorOffsetService::new(session);
-                    offset_service
-                        .get_offset("test_processor")
+                    event::get_offset(session, "test_processor")
                         .await
                         .map_err(Into::into)
                 })

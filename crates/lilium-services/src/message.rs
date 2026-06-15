@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use lilium_common::LiliumError;
-use lilium_database::DbSessionContext;
+use lilium_database::DbSession;
 
 use lilium_models::dzmm::message::Message;
 use tracing::instrument;
@@ -29,10 +29,6 @@ const SELECT_MESSAGE_COLS: &str = r#"message_id, room_id, sent_at, sent_by, cont
     metadata, raw_data, source, created_at, updated_at,
     is_deleted, deleted_at, deleted_by, is_recalled, is_edited,
     history, reference_message_id, reference_data"#;
-
-pub struct MessageService<'a> {
-    session: DbSessionContext<'a>,
-}
 
 #[derive(Debug, Clone)]
 enum BindVal {
@@ -243,6 +239,84 @@ fn apply_binds<'q>(
     q
 }
 
+async fn insert_message_if_missing(session: &mut DbSession, message: &Message) -> Result<bool> {
+    let result = sqlx::query(
+        r#"INSERT INTO messages (
+               message_id, room_id, sent_at, sent_by, content_type, content_text,
+               raw_data, source, created_at, is_deleted, is_recalled, is_edited, history
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+           ON CONFLICT DO NOTHING"#,
+    )
+    .bind(&message.message_id)
+    .bind(&message.room_id)
+    .bind(message.sent_at)
+    .bind(&message.sent_by)
+    .bind(&message.content_type)
+    .bind(&message.content_text)
+    .bind(&message.raw_data)
+    .bind(&message.source)
+    .bind(message.created_at)
+    .bind(message.is_deleted)
+    .bind(message.is_recalled)
+    .bind(message.is_edited)
+    .bind(&message.history)
+    .execute(session.as_mut())
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+async fn set_message_recalled(session: &mut DbSession, message_id: &str) -> Result<()> {
+    sqlx::query("UPDATE messages SET is_recalled = true, updated_at = NOW() WHERE message_id = $1")
+        .bind(message_id)
+        .execute(session.as_mut())
+        .await?;
+    Ok(())
+}
+
+async fn get_message_by_id_at(
+    session: &mut DbSession,
+    message_id: &str,
+    sent_at: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<Message>> {
+    sqlx::query_as::<_, Message>(
+        r#"SELECT message_id, room_id, sent_at, sent_by, content_type, content_text,
+           content_tsv::text, attachment_url, attachment_file, sticker_id, alt_text,
+           metadata, raw_data, source, created_at, updated_at,
+           is_deleted, deleted_at, deleted_by, is_recalled, is_edited,
+           history, reference_message_id, reference_data
+           FROM messages
+           WHERE message_id = $1 AND sent_at = $2"#,
+    )
+    .bind(message_id)
+    .bind(sent_at)
+    .fetch_optional(session.as_mut())
+    .await
+    .map_err(|e| e.into())
+}
+
+async fn update_message_content(
+    session: &mut DbSession,
+    message_id: &str,
+    text: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"UPDATE messages SET
+           content_text = $1,
+           is_edited = true,
+           updated_at = NOW(),
+           history = COALESCE(history, '[]'::jsonb) || jsonb_build_object(
+               'content', content_text,
+               'edited_at', NOW()
+           )
+           WHERE message_id = $2"#,
+    )
+    .bind(text)
+    .bind(message_id)
+    .execute(session.as_mut())
+    .await?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct MessageFilters {
     pub room_id: Option<String>,
@@ -394,277 +468,271 @@ fn encode_cursor_three(
     )
 }
 
-impl<'a> MessageService<'a> {
-    #[instrument(skip(session))]
-    pub fn new(session: DbSessionContext<'a>) -> Self {
-        Self { session }
+#[instrument(skip(session, filters, pagination), fields(enriched))]
+pub async fn get_messages(
+    session: &mut DbSession,
+    filters: &MessageFilters,
+    pagination: &PaginationParams,
+    enriched: bool,
+) -> crate::Result<PaginatedResult<EnrichedMessage>> {
+    let per_page = if pagination.per_page > 0 {
+        pagination.per_page
+    } else {
+        pagination.limit
     }
+    .min(200);
 
-    #[instrument(skip(self, filters, pagination), fields(enriched))]
-    pub async fn get_messages(
-        &mut self,
-        filters: &MessageFilters,
-        pagination: &PaginationParams,
-        enriched: bool,
-    ) -> crate::Result<PaginatedResult<EnrichedMessage>> {
-        let per_page = if pagination.per_page > 0 {
-            pagination.per_page
+    let query_parts = build_query_parts(filters, filters.visible_only.unwrap_or(false));
+
+    let select_clause = if enriched {
+        SELECT_ENRICHED
+    } else {
+        SELECT_BASE
+    };
+    let enriched_joins = if enriched {
+        if !query_parts.joins.contains("LEFT JOIN users") {
+            " LEFT JOIN users u ON m.sent_by = u.user_id"
         } else {
-            pagination.limit
+            ""
         }
-        .min(200);
-
-        let query_parts = build_query_parts(filters, filters.visible_only.unwrap_or(false));
-
-        let select_clause = if enriched {
-            SELECT_ENRICHED
-        } else {
-            SELECT_BASE
-        };
-        let enriched_joins = if enriched {
-            if !query_parts.joins.contains("LEFT JOIN users") {
-                " LEFT JOIN users u ON m.sent_by = u.user_id"
+        .to_string()
+            + if !query_parts.joins.contains("LEFT JOIN rooms") {
+                " LEFT JOIN rooms r ON m.room_id = r.room_id"
             } else {
                 ""
             }
-            .to_string()
-                + if !query_parts.joins.contains("LEFT JOIN rooms") {
-                    " LEFT JOIN rooms r ON m.room_id = r.room_id"
-                } else {
-                    ""
-                }
-        } else {
-            String::new()
-        };
+    } else {
+        String::new()
+    };
 
-        let sort_column = if pagination.sort_by.as_deref() == Some("created_at") {
-            "m.created_at"
-        } else {
-            "m.sent_at"
-        };
+    let sort_column = if pagination.sort_by.as_deref() == Some("created_at") {
+        "m.created_at"
+    } else {
+        "m.sent_at"
+    };
 
-        let mut sql = format!(
-            "SELECT {} FROM messages m{}{} WHERE 1=1{}",
-            select_clause, query_parts.joins, enriched_joins, query_parts.conditions
-        );
+    let mut sql = format!(
+        "SELECT {} FROM messages m{}{} WHERE 1=1{}",
+        select_clause, query_parts.joins, enriched_joins, query_parts.conditions
+    );
 
-        let mut param_idx = if query_parts.params.is_empty() {
-            1
-        } else {
-            query_parts.params.len() as u32 + 1
-        };
+    let mut param_idx = if query_parts.params.is_empty() {
+        1
+    } else {
+        query_parts.params.len() as u32 + 1
+    };
 
-        let use_three_part = if pagination.sort_by.as_deref() != Some("created_at") {
-            if let Some(ref cursor) = pagination.cursor {
-                let parts: Vec<&str> = cursor.split('|').collect();
-                parts.len() == 3
-            } else {
-                false
-            }
+    let use_three_part = if pagination.sort_by.as_deref() != Some("created_at") {
+        if let Some(ref cursor) = pagination.cursor {
+            let parts: Vec<&str> = cursor.split('|').collect();
+            parts.len() == 3
         } else {
             false
-        };
+        }
+    } else {
+        false
+    };
 
-        if let Some(ref cursor) = pagination.cursor {
-            let decoded = decode_cursor(cursor)?;
+    if let Some(ref cursor) = pagination.cursor {
+        let decoded = decode_cursor(cursor)?;
 
-            match (&decoded, use_three_part) {
-                (Cursor::ThreePart(..), true) => {
-                    let p1 = param_idx;
-                    param_idx += 1;
-                    let p2 = param_idx;
-                    param_idx += 1;
-                    let p3 = param_idx;
+        match (&decoded, use_three_part) {
+            (Cursor::ThreePart(..), true) => {
+                let p1 = param_idx;
+                param_idx += 1;
+                let p2 = param_idx;
+                param_idx += 1;
+                let p3 = param_idx;
 
-                    let cmp = if pagination.reverse { ">" } else { "<" };
+                let cmp = if pagination.reverse { ">" } else { "<" };
+                sql.push_str(&format!(
+                    " AND ((m.sent_at, m.created_at, m.message_id) {cmp} (${p1}, ${p2}, ${p3}))"
+                ));
+            }
+            _ => {
+                let p1 = param_idx;
+                param_idx += 1;
+                let p2 = param_idx;
+                param_idx += 1;
+                let p3 = param_idx;
+
+                if pagination.reverse {
                     sql.push_str(&format!(
-                        " AND ((m.sent_at, m.created_at, m.message_id) {cmp} (${p1}, ${p2}, ${p3}))"
+                        " AND (m.{sort} > ${p1} OR (m.{sort} = ${p2} AND m.message_id > ${p3}))",
+                        sort = sort_column
+                    ));
+                } else {
+                    sql.push_str(&format!(
+                        " AND (m.{sort} < ${p1} OR (m.{sort} = ${p2} AND m.message_id < ${p3}))",
+                        sort = sort_column
                     ));
                 }
-                _ => {
-                    let p1 = param_idx;
-                    param_idx += 1;
-                    let p2 = param_idx;
-                    param_idx += 1;
-                    let p3 = param_idx;
-
-                    if pagination.reverse {
-                        sql.push_str(&format!(
-                            " AND (m.{sort} > ${p1} OR (m.{sort} = ${p2} AND m.message_id > ${p3}))",
-                            sort = sort_column
-                        ));
-                    } else {
-                        sql.push_str(&format!(
-                            " AND (m.{sort} < ${p1} OR (m.{sort} = ${p2} AND m.message_id < ${p3}))",
-                            sort = sort_column
-                        ));
-                    }
-                }
             }
         }
+    }
 
-        if pagination.page.unwrap_or(1) > 1 && pagination.cursor.is_none() {
-            param_idx += 1;
-            sql.push_str(&format!(" OFFSET ${}", param_idx));
+    if pagination.page.unwrap_or(1) > 1 && pagination.cursor.is_none() {
+        param_idx += 1;
+        sql.push_str(&format!(" OFFSET ${}", param_idx));
+    }
+
+    if use_three_part {
+        if pagination.reverse {
+            sql.push_str(" ORDER BY m.sent_at ASC, m.created_at ASC, m.message_id ASC");
+        } else {
+            sql.push_str(" ORDER BY m.sent_at DESC, m.created_at DESC, m.message_id DESC");
         }
+    } else if pagination.reverse {
+        sql.push_str(&format!(" ORDER BY {} ASC, m.message_id ASC", sort_column));
+    } else {
+        sql.push_str(&format!(
+            " ORDER BY {} DESC, m.message_id DESC",
+            sort_column
+        ));
+    }
 
+    let limit_param = param_idx;
+    sql.push_str(&format!(" LIMIT ${}", limit_param));
+
+    let mut q = sqlx::query_as::<_, EnrichedMessage>(&sql);
+    q = apply_binds(q, &query_parts.params);
+
+    if let Some(ref cursor) = pagination.cursor {
+        let decoded = decode_cursor(cursor)?;
+        match (&decoded, use_three_part) {
+            (Cursor::ThreePart(sa, ca, mid), true) => {
+                q = q.bind(*sa).bind(*ca).bind(mid.clone());
+                q = q.bind(*sa).bind(*ca).bind(mid.clone());
+            }
+            (Cursor::TwoPart(sa, mid), _) => {
+                q = q.bind(*sa).bind(mid.clone()).bind(mid.clone());
+            }
+            _ => {
+                let (sa, mid) = match decoded {
+                    Cursor::TwoPart(s, m) => (s, m),
+                    Cursor::ThreePart(s, _, m) => (s, m),
+                };
+                q = q.bind(sa).bind(mid.clone()).bind(mid.clone());
+            }
+        }
+    }
+
+    if pagination.page.unwrap_or(1) > 1 && pagination.cursor.is_none() {
+        let pp = pagination.page.unwrap();
+        let offset = (pp - 1) * pagination.per_page;
+        q = q.bind(offset);
+    }
+
+    q = q.bind(per_page + 1);
+    let mut messages = q.fetch_all(session.as_mut()).await?;
+
+    let has_more = messages.len() as i64 > per_page;
+    if has_more {
+        messages.pop();
+    }
+
+    let next_cursor = if has_more {
+        let last = messages.last().unwrap();
         if use_three_part {
-            if pagination.reverse {
-                sql.push_str(" ORDER BY m.sent_at ASC, m.created_at ASC, m.message_id ASC");
-            } else {
-                sql.push_str(" ORDER BY m.sent_at DESC, m.created_at DESC, m.message_id DESC");
-            }
-        } else if pagination.reverse {
-            sql.push_str(&format!(" ORDER BY {} ASC, m.message_id ASC", sort_column));
+            Some(encode_cursor_three(
+                last.sent_at,
+                last.created_at,
+                &last.message_id,
+            ))
         } else {
-            sql.push_str(&format!(
-                " ORDER BY {} DESC, m.message_id DESC",
-                sort_column
-            ));
+            Some(encode_cursor_two(last.sent_at, &last.message_id))
         }
+    } else {
+        None
+    };
 
-        let limit_param = param_idx;
-        sql.push_str(&format!(" LIMIT ${}", limit_param));
+    Ok(PaginatedResult {
+        data: messages,
+        next_cursor,
+        has_more,
+    })
+}
 
-        let mut q = sqlx::query_as::<_, EnrichedMessage>(&sql);
-        q = apply_binds(q, &query_parts.params);
+#[instrument(skip(session), fields(message_id = %message_id, enriched))]
+pub async fn get_by_id(
+    session: &mut DbSession,
+    message_id: &str,
+    enriched: bool,
+) -> Result<Option<EnrichedMessage>> {
+    let select_clause = if enriched {
+        SELECT_ENRICHED
+    } else {
+        SELECT_BASE
+    };
+    let join_clause = if enriched {
+        " LEFT JOIN users u ON m.sent_by = u.user_id LEFT JOIN rooms r ON m.room_id = r.room_id"
+    } else {
+        ""
+    };
 
-        if let Some(ref cursor) = pagination.cursor {
-            let decoded = decode_cursor(cursor)?;
-            match (&decoded, use_three_part) {
-                (Cursor::ThreePart(sa, ca, mid), true) => {
-                    q = q.bind(*sa).bind(*ca).bind(mid.clone());
-                    q = q.bind(*sa).bind(*ca).bind(mid.clone());
-                }
-                (Cursor::TwoPart(sa, mid), _) => {
-                    q = q.bind(*sa).bind(mid.clone()).bind(mid.clone());
-                }
-                _ => {
-                    let (sa, mid) = match decoded {
-                        Cursor::TwoPart(s, m) => (s, m),
-                        Cursor::ThreePart(s, _, m) => (s, m),
-                    };
-                    q = q.bind(sa).bind(mid.clone()).bind(mid.clone());
-                }
-            }
-        }
+    sqlx::query_as::<_, EnrichedMessage>(&format!(
+        "SELECT {} FROM messages m{} WHERE m.message_id = $1 ORDER BY m.sent_at DESC LIMIT 1",
+        select_clause, join_clause,
+    ))
+    .bind(message_id)
+    .fetch_optional(session.as_mut())
+    .await
+    .map_err(anyhow::Error::from)
+}
 
-        if pagination.page.unwrap_or(1) > 1 && pagination.cursor.is_none() {
-            let pp = pagination.page.unwrap();
-            let offset = (pp - 1) * pagination.per_page;
-            q = q.bind(offset);
-        }
+#[instrument(skip(session), fields(message_id = %message_id, sent_at = %sent_at, enriched))]
+pub async fn get_by_id_at(
+    session: &mut DbSession,
+    message_id: &str,
+    sent_at: DateTime<Utc>,
+    enriched: bool,
+) -> Result<Option<EnrichedMessage>> {
+    let select_clause = if enriched {
+        SELECT_ENRICHED
+    } else {
+        SELECT_BASE
+    };
+    let join_clause = if enriched {
+        " LEFT JOIN users u ON m.sent_by = u.user_id LEFT JOIN rooms r ON m.room_id = r.room_id"
+    } else {
+        ""
+    };
 
-        q = q.bind(per_page + 1);
-        let mut messages = q.fetch_all(self.session.as_mut()).await?;
+    sqlx::query_as::<_, EnrichedMessage>(&format!(
+        "SELECT {} FROM messages m{} WHERE m.message_id = $1 AND m.sent_at = $2",
+        select_clause, join_clause,
+    ))
+    .bind(message_id)
+    .bind(sent_at)
+    .fetch_optional(session.as_mut())
+    .await
+    .map_err(anyhow::Error::from)
+}
 
-        let has_more = messages.len() as i64 > per_page;
-        if has_more {
-            messages.pop();
-        }
+#[instrument(skip(session), fields(message_id = %message_id, before_count, after_count))]
+pub async fn get_context(
+    session: &mut DbSession,
+    message_id: &str,
+    before_count: i64,
+    after_count: i64,
+) -> Result<Option<MessageContextResult>> {
+    let anchor = sqlx::query_as::<_, Message>(&format!(
+        "SELECT {} FROM messages WHERE message_id = $1 ORDER BY sent_at DESC LIMIT 1",
+        SELECT_MESSAGE_COLS
+    ))
+    .bind(message_id)
+    .fetch_optional(session.as_mut())
+    .await?;
 
-        let next_cursor = if has_more {
-            let last = messages.last().unwrap();
-            if use_three_part {
-                Some(encode_cursor_three(
-                    last.sent_at,
-                    last.created_at,
-                    &last.message_id,
-                ))
-            } else {
-                Some(encode_cursor_two(last.sent_at, &last.message_id))
-            }
-        } else {
-            None
-        };
+    let anchor = match anchor {
+        Some(m) => m,
+        None => return Ok(None),
+    };
 
-        Ok(PaginatedResult {
-            data: messages,
-            next_cursor,
-            has_more,
-        })
-    }
+    let before_limit = before_count.min(50);
+    let after_limit = after_count.min(50);
 
-    #[instrument(skip(self), fields(message_id = %message_id, enriched))]
-    pub async fn get_by_id(
-        &mut self,
-        message_id: &str,
-        enriched: bool,
-    ) -> Result<Option<EnrichedMessage>> {
-        let select_clause = if enriched {
-            SELECT_ENRICHED
-        } else {
-            SELECT_BASE
-        };
-        let join_clause = if enriched {
-            " LEFT JOIN users u ON m.sent_by = u.user_id LEFT JOIN rooms r ON m.room_id = r.room_id"
-        } else {
-            ""
-        };
-
-        sqlx::query_as::<_, EnrichedMessage>(&format!(
-            "SELECT {} FROM messages m{} WHERE m.message_id = $1 ORDER BY m.sent_at DESC LIMIT 1",
-            select_clause, join_clause,
-        ))
-        .bind(message_id)
-        .fetch_optional(self.session.as_mut())
-        .await
-        .map_err(anyhow::Error::from)
-    }
-
-    #[instrument(skip(self), fields(message_id = %message_id, sent_at = %sent_at, enriched))]
-    pub async fn get_by_id_at(
-        &mut self,
-        message_id: &str,
-        sent_at: DateTime<Utc>,
-        enriched: bool,
-    ) -> Result<Option<EnrichedMessage>> {
-        let select_clause = if enriched {
-            SELECT_ENRICHED
-        } else {
-            SELECT_BASE
-        };
-        let join_clause = if enriched {
-            " LEFT JOIN users u ON m.sent_by = u.user_id LEFT JOIN rooms r ON m.room_id = r.room_id"
-        } else {
-            ""
-        };
-
-        sqlx::query_as::<_, EnrichedMessage>(&format!(
-            "SELECT {} FROM messages m{} WHERE m.message_id = $1 AND m.sent_at = $2",
-            select_clause, join_clause,
-        ))
-        .bind(message_id)
-        .bind(sent_at)
-        .fetch_optional(self.session.as_mut())
-        .await
-        .map_err(anyhow::Error::from)
-    }
-
-    #[instrument(skip(self), fields(message_id = %message_id, before_count, after_count))]
-    pub async fn get_context(
-        &mut self,
-        message_id: &str,
-        before_count: i64,
-        after_count: i64,
-    ) -> Result<Option<MessageContextResult>> {
-        let anchor = sqlx::query_as::<_, Message>(&format!(
-            "SELECT {} FROM messages WHERE message_id = $1 ORDER BY sent_at DESC LIMIT 1",
-            SELECT_MESSAGE_COLS
-        ))
-        .bind(message_id)
-        .fetch_optional(self.session.as_mut())
-        .await?;
-
-        let anchor = match anchor {
-            Some(m) => m,
-            None => return Ok(None),
-        };
-
-        let before_limit = before_count.min(50);
-        let after_limit = after_count.min(50);
-
-        let before = sqlx::query_as::<_, EnrichedMessage>(&format!(
+    let before = sqlx::query_as::<_, EnrichedMessage>(&format!(
             "SELECT {} FROM messages m{} WHERE m.room_id = $1 AND (m.sent_at < $2 OR (m.sent_at = $2 AND m.message_id < $3)) ORDER BY m.sent_at DESC, m.message_id DESC LIMIT $4",
             SELECT_ENRICHED,
             " LEFT JOIN users u ON m.sent_by = u.user_id LEFT JOIN rooms r ON m.room_id = r.room_id",
@@ -673,10 +741,10 @@ impl<'a> MessageService<'a> {
         .bind(anchor.sent_at)
         .bind(&anchor.message_id)
         .bind(before_limit)
-        .fetch_all(self.session.as_mut())
+        .fetch_all(session.as_mut())
         .await?;
 
-        let after = sqlx::query_as::<_, EnrichedMessage>(&format!(
+    let after = sqlx::query_as::<_, EnrichedMessage>(&format!(
             "SELECT {} FROM messages m{} WHERE m.room_id = $1 AND (m.sent_at > $2 OR (m.sent_at = $2 AND m.message_id > $3)) ORDER BY m.sent_at ASC, m.message_id ASC LIMIT $4",
             SELECT_ENRICHED,
             " LEFT JOIN users u ON m.sent_by = u.user_id LEFT JOIN rooms r ON m.room_id = r.room_id",
@@ -685,42 +753,42 @@ impl<'a> MessageService<'a> {
         .bind(anchor.sent_at)
         .bind(&anchor.message_id)
         .bind(after_limit)
-        .fetch_all(self.session.as_mut())
+        .fetch_all(session.as_mut())
         .await?;
 
-        let anchor_enriched = self.enrich_single(&anchor).await?;
-        let before_count_actual = before.len() as i64;
-        let after_count_actual = after.len() as i64;
+    let anchor_enriched = enrich_single(session, &anchor).await?;
+    let before_count_actual = before.len() as i64;
+    let after_count_actual = after.len() as i64;
 
-        let mut messages: Vec<EnrichedMessage> = Vec::new();
-        for msg in before.into_iter().rev() {
-            messages.push(msg);
-        }
-        messages.push(anchor_enriched);
-        messages.extend(after);
-
-        Ok(Some(MessageContextResult {
-            messages,
-            before_count: before_count_actual,
-            after_count: after_count_actual,
-        }))
+    let mut messages: Vec<EnrichedMessage> = Vec::new();
+    for msg in before.into_iter().rev() {
+        messages.push(msg);
     }
+    messages.push(anchor_enriched);
+    messages.extend(after);
 
-    #[instrument(skip(self), fields(message_id = %message_id, count))]
-    pub async fn get_before(
-        &mut self,
-        message_id: &str,
-        count: i64,
-    ) -> Result<Vec<EnrichedMessage>> {
-        let target = self.get_by_id(message_id, false).await?;
-        let target = match target {
-            Some(m) => m,
-            None => return Ok(Vec::new()),
-        };
+    Ok(Some(MessageContextResult {
+        messages,
+        before_count: before_count_actual,
+        after_count: after_count_actual,
+    }))
+}
 
-        let limit = count.min(50);
+#[instrument(skip(session), fields(message_id = %message_id, count))]
+pub async fn get_before(
+    session: &mut DbSession,
+    message_id: &str,
+    count: i64,
+) -> Result<Vec<EnrichedMessage>> {
+    let target = get_by_id(session, message_id, false).await?;
+    let target = match target {
+        Some(m) => m,
+        None => return Ok(Vec::new()),
+    };
 
-        let mut messages = sqlx::query_as::<_, EnrichedMessage>(&format!(
+    let limit = count.min(50);
+
+    let mut messages = sqlx::query_as::<_, EnrichedMessage>(&format!(
             "SELECT {} FROM messages m{} WHERE m.room_id = $1 AND (m.sent_at < $2 OR (m.sent_at = $2 AND m.message_id < $3)) ORDER BY m.sent_at DESC, m.message_id DESC LIMIT $4",
             SELECT_ENRICHED,
             " LEFT JOIN users u ON m.sent_by = u.user_id LEFT JOIN rooms r ON m.room_id = r.room_id",
@@ -729,28 +797,28 @@ impl<'a> MessageService<'a> {
         .bind(target.sent_at)
         .bind(&target.message_id)
         .bind(limit)
-        .fetch_all(self.session.as_mut())
+        .fetch_all(session.as_mut())
         .await?;
 
-        messages.reverse();
-        Ok(messages)
-    }
+    messages.reverse();
+    Ok(messages)
+}
 
-    #[instrument(skip(self), fields(message_id = %message_id, count))]
-    pub async fn get_after(
-        &mut self,
-        message_id: &str,
-        count: i64,
-    ) -> Result<Vec<EnrichedMessage>> {
-        let target = self.get_by_id(message_id, false).await?;
-        let target = match target {
-            Some(m) => m,
-            None => return Ok(Vec::new()),
-        };
+#[instrument(skip(session), fields(message_id = %message_id, count))]
+pub async fn get_after(
+    session: &mut DbSession,
+    message_id: &str,
+    count: i64,
+) -> Result<Vec<EnrichedMessage>> {
+    let target = get_by_id(session, message_id, false).await?;
+    let target = match target {
+        Some(m) => m,
+        None => return Ok(Vec::new()),
+    };
 
-        let limit = count.min(50);
+    let limit = count.min(50);
 
-        sqlx::query_as::<_, EnrichedMessage>(&format!(
+    sqlx::query_as::<_, EnrichedMessage>(&format!(
             "SELECT {} FROM messages m{} WHERE m.room_id = $1 AND (m.sent_at > $2 OR (m.sent_at = $2 AND m.message_id > $3)) ORDER BY m.sent_at ASC, m.message_id ASC LIMIT $4",
             SELECT_ENRICHED,
             " LEFT JOIN users u ON m.sent_by = u.user_id LEFT JOIN rooms r ON m.room_id = r.room_id",
@@ -759,260 +827,263 @@ impl<'a> MessageService<'a> {
         .bind(target.sent_at)
         .bind(&target.message_id)
         .bind(limit)
-        .fetch_all(self.session.as_mut())
+        .fetch_all(session.as_mut())
         .await
         .map_err(anyhow::Error::from)
+}
+
+async fn enrich_single(session: &mut DbSession, message: &Message) -> Result<EnrichedMessage> {
+    let user_data = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+        "SELECT full_name, avatar_url FROM users WHERE user_id = $1",
+    )
+    .bind(&message.sent_by)
+    .fetch_optional(session.as_mut())
+    .await?;
+
+    let room_data =
+        sqlx::query_as::<_, (Option<String>,)>("SELECT title FROM rooms WHERE room_id = $1")
+            .bind(&message.room_id)
+            .fetch_optional(session.as_mut())
+            .await?;
+
+    let (user_display_name, user_avatar_url) = user_data.unwrap_or((None, None));
+    let room_title = room_data.and_then(|(t,)| t);
+
+    Ok(EnrichedMessage {
+        message_id: message.message_id.clone(),
+        room_id: message.room_id.clone(),
+        sent_at: message.sent_at,
+        sent_by: message.sent_by.clone(),
+        content_type: message.content_type.clone(),
+        content_text: message.content_text.clone(),
+        content_tsv: message.content_tsv.clone(),
+        attachment_url: message.attachment_url.clone(),
+        attachment_file: message.attachment_file.clone(),
+        sticker_id: message.sticker_id.clone(),
+        alt_text: message.alt_text.clone(),
+        metadata: message.metadata.clone(),
+        raw_data: message.raw_data.clone(),
+        source: message.source.clone(),
+        created_at: message.created_at,
+        updated_at: message.updated_at,
+        is_deleted: message.is_deleted,
+        deleted_at: message.deleted_at,
+        deleted_by: message.deleted_by.clone(),
+        is_recalled: message.is_recalled,
+        is_edited: message.is_edited,
+        history: message.history.clone(),
+        reference_message_id: message.reference_message_id.clone(),
+        reference_data: message.reference_data.clone(),
+        user_display_name,
+        user_avatar_url,
+        room_title,
+    })
+}
+
+#[instrument(skip(session, messages), fields(message_count = messages.len()))]
+pub async fn enrich_batch(
+    session: &mut DbSession,
+    messages: &[Message],
+) -> Result<Vec<EnrichedMessage>> {
+    if messages.is_empty() {
+        return Ok(Vec::new());
     }
 
-    async fn enrich_single(&mut self, message: &Message) -> Result<EnrichedMessage> {
-        let user_data = sqlx::query_as::<_, (Option<String>, Option<String>)>(
-            "SELECT full_name, avatar_url FROM users WHERE user_id = $1",
+    let user_ids: Vec<String> = messages
+        .iter()
+        .map(|m| m.sent_by.clone())
+        .filter(|id| !id.is_empty())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    let room_ids: Vec<String> = messages
+        .iter()
+        .map(|m| m.room_id.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    let users_map: HashMap<String, (Option<String>, Option<String>)> = if !user_ids.is_empty() {
+        let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+            "SELECT user_id, full_name, avatar_url FROM users WHERE user_id = ANY($1)",
         )
-        .bind(&message.sent_by)
-        .fetch_optional(self.session.as_mut())
+        .bind(&user_ids)
+        .fetch_all(session.as_mut())
         .await?;
+        rows.into_iter()
+            .map(|(id, name, avatar)| (id, (name, avatar)))
+            .collect()
+    } else {
+        HashMap::new()
+    };
 
-        let room_data =
-            sqlx::query_as::<_, (Option<String>,)>("SELECT title FROM rooms WHERE room_id = $1")
-                .bind(&message.room_id)
-                .fetch_optional(self.session.as_mut())
-                .await?;
+    let rooms_map: HashMap<String, String> = if !room_ids.is_empty() {
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT room_id, title FROM rooms WHERE room_id = ANY($1)",
+        )
+        .bind(&room_ids)
+        .fetch_all(session.as_mut())
+        .await?;
+        rows.into_iter().collect()
+    } else {
+        HashMap::new()
+    };
 
-        let (user_display_name, user_avatar_url) = user_data.unwrap_or((None, None));
-        let room_title = room_data.and_then(|(t,)| t);
-
-        Ok(EnrichedMessage {
-            message_id: message.message_id.clone(),
-            room_id: message.room_id.clone(),
-            sent_at: message.sent_at,
-            sent_by: message.sent_by.clone(),
-            content_type: message.content_type.clone(),
-            content_text: message.content_text.clone(),
-            content_tsv: message.content_tsv.clone(),
-            attachment_url: message.attachment_url.clone(),
-            attachment_file: message.attachment_file.clone(),
-            sticker_id: message.sticker_id.clone(),
-            alt_text: message.alt_text.clone(),
-            metadata: message.metadata.clone(),
-            raw_data: message.raw_data.clone(),
-            source: message.source.clone(),
-            created_at: message.created_at,
-            updated_at: message.updated_at,
-            is_deleted: message.is_deleted,
-            deleted_at: message.deleted_at,
-            deleted_by: message.deleted_by.clone(),
-            is_recalled: message.is_recalled,
-            is_edited: message.is_edited,
-            history: message.history.clone(),
-            reference_message_id: message.reference_message_id.clone(),
-            reference_data: message.reference_data.clone(),
-            user_display_name,
-            user_avatar_url,
-            room_title,
+    let enriched = messages
+        .iter()
+        .map(|msg| {
+            let (user_display_name, user_avatar_url) =
+                users_map.get(&msg.sent_by).cloned().unwrap_or((None, None));
+            let room_title = rooms_map.get(&msg.room_id).cloned();
+            EnrichedMessage {
+                message_id: msg.message_id.clone(),
+                room_id: msg.room_id.clone(),
+                sent_at: msg.sent_at,
+                sent_by: msg.sent_by.clone(),
+                content_type: msg.content_type.clone(),
+                content_text: msg.content_text.clone(),
+                content_tsv: msg.content_tsv.clone(),
+                attachment_url: msg.attachment_url.clone(),
+                attachment_file: msg.attachment_file.clone(),
+                sticker_id: msg.sticker_id.clone(),
+                alt_text: msg.alt_text.clone(),
+                metadata: msg.metadata.clone(),
+                raw_data: msg.raw_data.clone(),
+                source: msg.source.clone(),
+                created_at: msg.created_at,
+                updated_at: msg.updated_at,
+                is_deleted: msg.is_deleted,
+                deleted_at: msg.deleted_at,
+                deleted_by: msg.deleted_by.clone(),
+                is_recalled: msg.is_recalled,
+                is_edited: msg.is_edited,
+                history: msg.history.clone(),
+                reference_message_id: msg.reference_message_id.clone(),
+                reference_data: msg.reference_data.clone(),
+                user_display_name,
+                user_avatar_url,
+                room_title,
+            }
         })
-    }
+        .collect();
 
-    #[instrument(skip(self, messages), fields(message_count = messages.len()))]
-    pub async fn enrich_batch(&mut self, messages: &[Message]) -> Result<Vec<EnrichedMessage>> {
-        if messages.is_empty() {
-            return Ok(Vec::new());
-        }
+    Ok(enriched)
+}
 
-        let user_ids: Vec<String> = messages
-            .iter()
-            .map(|m| m.sent_by.clone())
-            .filter(|id| !id.is_empty())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
+#[instrument(skip(session), fields(room_id = ?room_id, limit))]
+pub async fn get_deleted_messages(
+    session: &mut DbSession,
+    room_id: Option<&str>,
+    limit: i64,
+) -> Result<Vec<Message>> {
+    let mut sql = format!(
+        "SELECT {} FROM messages WHERE (is_deleted = true OR is_recalled = true)",
+        SELECT_MESSAGE_COLS
+    );
+    let mut param_idx = 0;
 
-        let room_ids: Vec<String> = messages
-            .iter()
-            .map(|m| m.room_id.clone())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
-
-        let users_map: HashMap<String, (Option<String>, Option<String>)> = if !user_ids.is_empty() {
-            let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
-                "SELECT user_id, full_name, avatar_url FROM users WHERE user_id = ANY($1)",
-            )
-            .bind(&user_ids)
-            .fetch_all(self.session.as_mut())
-            .await?;
-            rows.into_iter()
-                .map(|(id, name, avatar)| (id, (name, avatar)))
-                .collect()
-        } else {
-            HashMap::new()
-        };
-
-        let rooms_map: HashMap<String, String> = if !room_ids.is_empty() {
-            let rows = sqlx::query_as::<_, (String, String)>(
-                "SELECT room_id, title FROM rooms WHERE room_id = ANY($1)",
-            )
-            .bind(&room_ids)
-            .fetch_all(self.session.as_mut())
-            .await?;
-            rows.into_iter().collect()
-        } else {
-            HashMap::new()
-        };
-
-        let enriched = messages
-            .iter()
-            .map(|msg| {
-                let (user_display_name, user_avatar_url) =
-                    users_map.get(&msg.sent_by).cloned().unwrap_or((None, None));
-                let room_title = rooms_map.get(&msg.room_id).cloned();
-                EnrichedMessage {
-                    message_id: msg.message_id.clone(),
-                    room_id: msg.room_id.clone(),
-                    sent_at: msg.sent_at,
-                    sent_by: msg.sent_by.clone(),
-                    content_type: msg.content_type.clone(),
-                    content_text: msg.content_text.clone(),
-                    content_tsv: msg.content_tsv.clone(),
-                    attachment_url: msg.attachment_url.clone(),
-                    attachment_file: msg.attachment_file.clone(),
-                    sticker_id: msg.sticker_id.clone(),
-                    alt_text: msg.alt_text.clone(),
-                    metadata: msg.metadata.clone(),
-                    raw_data: msg.raw_data.clone(),
-                    source: msg.source.clone(),
-                    created_at: msg.created_at,
-                    updated_at: msg.updated_at,
-                    is_deleted: msg.is_deleted,
-                    deleted_at: msg.deleted_at,
-                    deleted_by: msg.deleted_by.clone(),
-                    is_recalled: msg.is_recalled,
-                    is_edited: msg.is_edited,
-                    history: msg.history.clone(),
-                    reference_message_id: msg.reference_message_id.clone(),
-                    reference_data: msg.reference_data.clone(),
-                    user_display_name,
-                    user_avatar_url,
-                    room_title,
-                }
-            })
-            .collect();
-
-        Ok(enriched)
-    }
-
-    #[instrument(skip(self), fields(room_id = ?room_id, limit))]
-    pub async fn get_deleted_messages(
-        &mut self,
-        room_id: Option<&str>,
-        limit: i64,
-    ) -> Result<Vec<Message>> {
-        let mut sql = format!(
-            "SELECT {} FROM messages WHERE (is_deleted = true OR is_recalled = true)",
-            SELECT_MESSAGE_COLS
-        );
-        let mut param_idx = 0;
-
-        if room_id.is_some() {
-            param_idx += 1;
-            sql.push_str(&format!(" AND room_id = ${}", param_idx));
-        }
-
+    if room_id.is_some() {
         param_idx += 1;
-        sql.push_str(&format!(
-            " ORDER BY deleted_at DESC NULLS LAST LIMIT ${}",
-            param_idx
-        ));
-
-        let mut q = sqlx::query_as::<_, Message>(&sql);
-        if let Some(rid) = room_id {
-            q = q.bind(rid);
-        }
-        q = q.bind(limit);
-        let rows = q.fetch_all(self.session.as_mut()).await?;
-        Ok(rows)
+        sql.push_str(&format!(" AND room_id = ${}", param_idx));
     }
 
-    #[instrument(skip(self), fields(room_id = %room_id))]
-    pub async fn get_room_stats(&mut self, room_id: &str) -> Result<MessageStats> {
-        let row = sqlx::query_as::<_, (i64, i64, i64, i64)>(
-            "SELECT COUNT(*)::bigint,
+    param_idx += 1;
+    sql.push_str(&format!(
+        " ORDER BY deleted_at DESC NULLS LAST LIMIT ${}",
+        param_idx
+    ));
+
+    let mut q = sqlx::query_as::<_, Message>(&sql);
+    if let Some(rid) = room_id {
+        q = q.bind(rid);
+    }
+    q = q.bind(limit);
+    let rows = q.fetch_all(session.as_mut()).await?;
+    Ok(rows)
+}
+
+#[instrument(skip(session), fields(room_id = %room_id))]
+pub async fn get_room_stats(session: &mut DbSession, room_id: &str) -> Result<MessageStats> {
+    let row = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+        "SELECT COUNT(*)::bigint,
                     COALESCE(SUM(CASE WHEN is_deleted THEN 1 ELSE 0 END), 0)::bigint,
                     COALESCE(SUM(CASE WHEN is_recalled THEN 1 ELSE 0 END), 0)::bigint,
                     COALESCE(SUM(CASE WHEN is_edited THEN 1 ELSE 0 END), 0)::bigint
              FROM messages WHERE room_id = $1",
-        )
-        .bind(room_id)
-        .fetch_one(self.session.as_mut())
-        .await?;
+    )
+    .bind(room_id)
+    .fetch_one(session.as_mut())
+    .await?;
 
-        let type_rows = sqlx::query_as::<_, (String, i64)>(
+    let type_rows = sqlx::query_as::<_, (String, i64)>(
             "SELECT content_type, COUNT(*)::bigint FROM messages WHERE room_id = $1 GROUP BY content_type",
         )
         .bind(room_id)
-        .fetch_all(self.session.as_mut())
+        .fetch_all(session.as_mut())
         .await?;
 
-        Ok(MessageStats {
-            total: row.0,
-            deleted: row.1,
-            recalled: row.2,
-            edited: row.3,
-            by_content_type: type_rows.into_iter().collect(),
-            by_room: None,
-        })
-    }
+    Ok(MessageStats {
+        total: row.0,
+        deleted: row.1,
+        recalled: row.2,
+        edited: row.3,
+        by_content_type: type_rows.into_iter().collect(),
+        by_room: None,
+    })
+}
 
-    #[instrument(skip(self), fields(user_id = %user_id))]
-    pub async fn get_user_stats(&mut self, user_id: &str) -> Result<MessageStats> {
-        let row = sqlx::query_as::<_, (i64, i64, i64, i64)>(
-            "SELECT COUNT(*)::bigint,
+#[instrument(skip(session), fields(user_id = %user_id))]
+pub async fn get_user_stats(session: &mut DbSession, user_id: &str) -> Result<MessageStats> {
+    let row = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+        "SELECT COUNT(*)::bigint,
                     COALESCE(SUM(CASE WHEN is_deleted THEN 1 ELSE 0 END), 0)::bigint,
                     COALESCE(SUM(CASE WHEN is_recalled THEN 1 ELSE 0 END), 0)::bigint,
                     COALESCE(SUM(CASE WHEN is_edited THEN 1 ELSE 0 END), 0)::bigint
              FROM messages WHERE sent_by = $1",
-        )
-        .bind(user_id)
-        .fetch_one(self.session.as_mut())
-        .await?;
+    )
+    .bind(user_id)
+    .fetch_one(session.as_mut())
+    .await?;
 
-        let type_rows = sqlx::query_as::<_, (String, i64)>(
+    let type_rows = sqlx::query_as::<_, (String, i64)>(
             "SELECT content_type, COUNT(*)::bigint FROM messages WHERE sent_by = $1 GROUP BY content_type",
         )
         .bind(user_id)
-        .fetch_all(self.session.as_mut())
+        .fetch_all(session.as_mut())
         .await?;
 
-        let room_rows = sqlx::query_as::<_, (String, i64)>(
+    let room_rows = sqlx::query_as::<_, (String, i64)>(
             "SELECT room_id, COUNT(*)::bigint FROM messages WHERE sent_by = $1 GROUP BY room_id ORDER BY COUNT(*) DESC LIMIT 10",
         )
         .bind(user_id)
-        .fetch_all(self.session.as_mut())
+        .fetch_all(session.as_mut())
         .await?;
 
-        Ok(MessageStats {
-            total: row.0,
-            deleted: row.1,
-            recalled: row.2,
-            edited: row.3,
-            by_content_type: type_rows.into_iter().collect(),
-            by_room: Some(room_rows.into_iter().collect()),
-        })
-    }
+    Ok(MessageStats {
+        total: row.0,
+        deleted: row.1,
+        recalled: row.2,
+        edited: row.3,
+        by_content_type: type_rows.into_iter().collect(),
+        by_room: Some(room_rows.into_iter().collect()),
+    })
+}
 
-    #[instrument(skip(self), fields(message_id = %message_id))]
-    pub async fn message_exists(&mut self, message_id: &str) -> Result<bool> {
-        let exists = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM messages WHERE message_id = $1)",
-        )
-        .bind(message_id)
-        .fetch_one(self.session.as_mut())
-        .await?;
-        Ok(exists)
-    }
+#[instrument(skip(session), fields(message_id = %message_id))]
+pub async fn message_exists(session: &mut DbSession, message_id: &str) -> Result<bool> {
+    let exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM messages WHERE message_id = $1)",
+    )
+    .bind(message_id)
+    .fetch_one(session.as_mut())
+    .await?;
+    Ok(exists)
+}
 
-    #[instrument(skip(self, message), fields(message_id = %message.message_id))]
-    pub async fn create_message(&mut self, message: &Message) -> Result<()> {
-        sqlx::query(
+#[instrument(skip(session, message), fields(message_id = %message.message_id))]
+pub async fn create_message(session: &mut DbSession, message: &Message) -> Result<()> {
+    sqlx::query(
             r#"INSERT INTO messages (message_id, room_id, sent_at, sent_by, content_type, content_text,
                attachment_url, attachment_file, sticker_id, alt_text, metadata, raw_data, source,
                created_at, updated_at, is_deleted, deleted_at, deleted_by, is_recalled, is_edited,
@@ -1042,360 +1113,351 @@ impl<'a> MessageService<'a> {
         .bind(&message.history)
         .bind(&message.reference_message_id)
         .bind(&message.reference_data)
-        .execute(self.session.as_mut())
+        .execute(session.as_mut())
         .await?;
-        Ok(())
+    Ok(())
+}
+
+#[instrument(skip(session, message), fields(message_id = %message.message_id))]
+pub async fn create_message_if_missing(session: &mut DbSession, message: &Message) -> Result<bool> {
+    insert_message_if_missing(session, message).await
+}
+
+#[instrument(skip(session, messages), fields(message_count = messages.len()))]
+pub async fn batch_create_if_missing(
+    session: &mut DbSession,
+    messages: &[Message],
+) -> Result<Vec<(String, DateTime<Utc>)>> {
+    if messages.is_empty() {
+        return Ok(Vec::new());
     }
 
-    #[instrument(skip(self, message), fields(message_id = %message.message_id))]
-    pub async fn create_message_if_missing(&mut self, message: &Message) -> Result<bool> {
-        lilium_database::queries::messages::create_message_if_missing(
-            self.session.as_mut(),
-            message,
-        )
-        .await
+    let mut sql = String::from(
+        "INSERT INTO messages (message_id, room_id, sent_at, sent_by, content_type, content_text, raw_data, source, created_at, is_deleted, is_recalled, is_edited, history) VALUES ",
+    );
+    let mut param_idx = 0u32;
+    let mut value_rows: Vec<String> = Vec::new();
+
+    for _i in 0..messages.len() {
+        let base = param_idx;
+        let cols = [
+            base + 1,
+            base + 2,
+            base + 3,
+            base + 4,
+            base + 5,
+            base + 6,
+            base + 7,
+            base + 8,
+            base + 9,
+            base + 10,
+            base + 11,
+            base + 12,
+            base + 13,
+        ];
+        value_rows.push(format!(
+            "(${},{},{},{},{},{},{},{},{},{},{},{},{})",
+            cols[0],
+            cols[1],
+            cols[2],
+            cols[3],
+            cols[4],
+            cols[5],
+            cols[6],
+            cols[7],
+            cols[8],
+            cols[9],
+            cols[10],
+            cols[11],
+            cols[12],
+        ));
+        param_idx += 13;
     }
 
-    #[instrument(skip(self, messages), fields(message_count = messages.len()))]
-    pub async fn batch_create_if_missing(
-        &mut self,
-        messages: &[Message],
-    ) -> Result<Vec<(String, DateTime<Utc>)>> {
-        if messages.is_empty() {
-            return Ok(Vec::new());
-        }
+    sql.push_str(&value_rows.join(", "));
+    sql.push_str(" ON CONFLICT (message_id, sent_at) DO NOTHING RETURNING message_id, sent_at");
 
-        let mut sql = String::from(
-            "INSERT INTO messages (message_id, room_id, sent_at, sent_by, content_type, content_text, raw_data, source, created_at, is_deleted, is_recalled, is_edited, history) VALUES ",
-        );
-        let mut param_idx = 0u32;
-        let mut value_rows: Vec<String> = Vec::new();
-
-        for _i in 0..messages.len() {
-            let base = param_idx;
-            let cols = [
-                base + 1,
-                base + 2,
-                base + 3,
-                base + 4,
-                base + 5,
-                base + 6,
-                base + 7,
-                base + 8,
-                base + 9,
-                base + 10,
-                base + 11,
-                base + 12,
-                base + 13,
-            ];
-            value_rows.push(format!(
-                "(${},{},{},{},{},{},{},{},{},{},{},{},{})",
-                cols[0],
-                cols[1],
-                cols[2],
-                cols[3],
-                cols[4],
-                cols[5],
-                cols[6],
-                cols[7],
-                cols[8],
-                cols[9],
-                cols[10],
-                cols[11],
-                cols[12],
-            ));
-            param_idx += 13;
-        }
-
-        sql.push_str(&value_rows.join(", "));
-        sql.push_str(" ON CONFLICT (message_id, sent_at) DO NOTHING RETURNING message_id, sent_at");
-
-        let mut q = sqlx::query_as::<_, (String, DateTime<Utc>)>(&sql);
-        for msg in messages {
-            q = q
-                .bind(&msg.message_id)
-                .bind(&msg.room_id)
-                .bind(msg.sent_at)
-                .bind(&msg.sent_by)
-                .bind(&msg.content_type)
-                .bind(&msg.content_text)
-                .bind(&msg.raw_data)
-                .bind(&msg.source)
-                .bind(msg.created_at)
-                .bind(msg.is_deleted)
-                .bind(msg.is_recalled)
-                .bind(msg.is_edited)
-                .bind(&msg.history);
-        }
-
-        let rows = q.fetch_all(self.session.as_mut()).await?;
-        Ok(rows)
+    let mut q = sqlx::query_as::<_, (String, DateTime<Utc>)>(&sql);
+    for msg in messages {
+        q = q
+            .bind(&msg.message_id)
+            .bind(&msg.room_id)
+            .bind(msg.sent_at)
+            .bind(&msg.sent_by)
+            .bind(&msg.content_type)
+            .bind(&msg.content_text)
+            .bind(&msg.raw_data)
+            .bind(&msg.source)
+            .bind(msg.created_at)
+            .bind(msg.is_deleted)
+            .bind(msg.is_recalled)
+            .bind(msg.is_edited)
+            .bind(&msg.history);
     }
 
-    #[instrument(skip(self, message), fields(message_id = %message.message_id))]
-    pub async fn update_message(&mut self, message: &Message) -> Result<()> {
-        sqlx::query(
-            r#"UPDATE messages SET
+    let rows = q.fetch_all(session.as_mut()).await?;
+    Ok(rows)
+}
+
+#[instrument(skip(session, message), fields(message_id = %message.message_id))]
+pub async fn update_message(session: &mut DbSession, message: &Message) -> Result<()> {
+    sqlx::query(
+        r#"UPDATE messages SET
                content_type = $3, content_text = $4, attachment_url = $5,
                attachment_file = $6, sticker_id = $7, alt_text = $8,
                metadata = $9, updated_at = NOW(), is_edited = $10, history = $11
                WHERE message_id = $1 AND sent_at = $2"#,
-        )
-        .bind(&message.message_id)
-        .bind(message.sent_at)
-        .bind(&message.content_type)
-        .bind(&message.content_text)
-        .bind(&message.attachment_url)
-        .bind(&message.attachment_file)
-        .bind(&message.sticker_id)
-        .bind(&message.alt_text)
-        .bind(&message.metadata)
-        .bind(message.is_edited)
-        .bind(&message.history)
-        .execute(self.session.as_mut())
-        .await?;
-        Ok(())
-    }
+    )
+    .bind(&message.message_id)
+    .bind(message.sent_at)
+    .bind(&message.content_type)
+    .bind(&message.content_text)
+    .bind(&message.attachment_url)
+    .bind(&message.attachment_file)
+    .bind(&message.sticker_id)
+    .bind(&message.alt_text)
+    .bind(&message.metadata)
+    .bind(message.is_edited)
+    .bind(&message.history)
+    .execute(session.as_mut())
+    .await?;
+    Ok(())
+}
 
-    #[instrument(skip(self, payload), fields(message_id = %message_id))]
-    pub async fn update_message_from_payload(
-        &mut self,
-        message_id: &str,
-        payload: &serde_json::Value,
-    ) -> Result<()> {
-        if let Some(content) = payload.get("message").and_then(|m| m.get("content")) {
-            if content.get("type").and_then(|v| v.as_str()) == Some("recalled") {
-                lilium_database::queries::messages::mark_recalled(self.session.as_mut(), message_id)
-                    .await
-            } else {
-                let sent_at = payload
-                    .get("message")
-                    .and_then(|m| m.get("sent_at").or_else(|| m.get("sentAt")))
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                    .map(|dt| dt.with_timezone(&chrono::Utc));
+#[instrument(skip(session, payload), fields(message_id = %message_id))]
+pub async fn update_message_from_payload(
+    session: &mut DbSession,
+    message_id: &str,
+    payload: &serde_json::Value,
+) -> Result<()> {
+    if let Some(content) = payload.get("message").and_then(|m| m.get("content")) {
+        if content.get("type").and_then(|v| v.as_str()) == Some("recalled") {
+            set_message_recalled(session, message_id).await
+        } else {
+            let sent_at = payload
+                .get("message")
+                .and_then(|m| m.get("sent_at").or_else(|| m.get("sentAt")))
+                .and_then(|v| v.as_str())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&chrono::Utc));
 
-                if let Some(sent_at) = sent_at {
-                    let existing = lilium_database::queries::messages::get_by_id_at(
-                        self.session.as_mut(),
-                        message_id,
-                        sent_at,
-                    )
-                    .await?;
-                    if existing.is_none() {
-                        return Ok(());
-                    }
-                    if let Some(text) = content.get("text").and_then(|v| v.as_str()) {
-                        lilium_database::queries::messages::update_content(
-                            self.session.as_mut(),
-                            message_id,
-                            text,
-                        )
-                        .await
-                    } else {
-                        Ok(())
-                    }
+            if let Some(sent_at) = sent_at {
+                let existing = get_message_by_id_at(session, message_id, sent_at).await?;
+                if existing.is_none() {
+                    return Ok(());
+                }
+                if let Some(text) = content.get("text").and_then(|v| v.as_str()) {
+                    update_message_content(session, message_id, text).await
                 } else {
                     Ok(())
                 }
+            } else {
+                Ok(())
             }
-        } else {
-            Ok(())
         }
-    }
-
-    #[instrument(skip(self), fields(message_id = %message_id, has_deleted_by = deleted_by.is_some()))]
-    pub async fn mark_deleted(&mut self, message_id: &str, deleted_by: Option<&str>) -> Result<()> {
-        sqlx::query(
-            r#"UPDATE messages
-               SET is_deleted = true, deleted_at = NOW(), deleted_by = $2, updated_at = NOW()
-               WHERE message_id = $1"#,
-        )
-        .bind(message_id)
-        .bind(deleted_by)
-        .execute(self.session.as_mut())
-        .await?;
+    } else {
         Ok(())
     }
+}
 
-    #[instrument(skip(self, message_ids), fields(message_count = message_ids.len(), has_deleted_by = deleted_by.is_some()))]
-    pub async fn mark_deleted_batch(
-        &mut self,
-        message_ids: &[String],
-        deleted_by: Option<&str>,
-    ) -> Result<i64> {
-        if message_ids.is_empty() {
-            return Ok(0);
-        }
-        let result = sqlx::query(
-            r#"UPDATE messages
+#[instrument(skip(session), fields(message_id = %message_id, has_deleted_by = deleted_by.is_some()))]
+pub async fn mark_deleted(
+    session: &mut DbSession,
+    message_id: &str,
+    deleted_by: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        r#"UPDATE messages
+               SET is_deleted = true, deleted_at = NOW(), deleted_by = $2, updated_at = NOW()
+               WHERE message_id = $1"#,
+    )
+    .bind(message_id)
+    .bind(deleted_by)
+    .execute(session.as_mut())
+    .await?;
+    Ok(())
+}
+
+#[instrument(skip(session, message_ids), fields(message_count = message_ids.len(), has_deleted_by = deleted_by.is_some()))]
+pub async fn mark_deleted_batch(
+    session: &mut DbSession,
+    message_ids: &[String],
+    deleted_by: Option<&str>,
+) -> Result<i64> {
+    if message_ids.is_empty() {
+        return Ok(0);
+    }
+    let result = sqlx::query(
+        r#"UPDATE messages
                SET is_deleted = true, deleted_at = NOW(), deleted_by = $2, updated_at = NOW()
                WHERE message_id = ANY($1)"#,
-        )
-        .bind(message_ids)
-        .bind(deleted_by)
-        .execute(self.session.as_mut())
-        .await?;
-        Ok(result.rows_affected() as i64)
+    )
+    .bind(message_ids)
+    .bind(deleted_by)
+    .execute(session.as_mut())
+    .await?;
+    Ok(result.rows_affected() as i64)
+}
+
+#[instrument(skip(session), fields(message_id = %message_id))]
+pub async fn mark_recalled(session: &mut DbSession, message_id: &str) -> Result<()> {
+    set_message_recalled(session, message_id).await
+}
+
+#[instrument(skip(session, message_ids), fields(message_count = message_ids.len()))]
+pub async fn mark_recalled_batch(session: &mut DbSession, message_ids: &[String]) -> Result<i64> {
+    if message_ids.is_empty() {
+        return Ok(0);
+    }
+    let result = sqlx::query(
+        "UPDATE messages SET is_recalled = true, updated_at = NOW() WHERE message_id = ANY($1)",
+    )
+    .bind(message_ids)
+    .execute(session.as_mut())
+    .await?;
+    Ok(result.rows_affected() as i64)
+}
+
+#[instrument(skip(session, messages), fields(message_count = messages.len()))]
+pub async fn batch_create(session: &mut DbSession, messages: &[Message]) -> Result<i64> {
+    if messages.is_empty() {
+        return Ok(0);
     }
 
-    #[instrument(skip(self), fields(message_id = %message_id))]
-    pub async fn mark_recalled(&mut self, message_id: &str) -> Result<()> {
-        lilium_database::queries::messages::mark_recalled(self.session.as_mut(), message_id).await
+    let mut sql = String::from(
+        "INSERT INTO messages (message_id, room_id, sent_at, sent_by, content_type, content_text, attachment_url, attachment_file, sticker_id, alt_text, metadata, raw_data, source, created_at, updated_at, is_deleted, deleted_at, deleted_by, is_recalled, is_edited, history, reference_message_id, reference_data) VALUES ",
+    );
+    let mut param_idx = 0u32;
+    let mut value_rows: Vec<String> = Vec::new();
+    const COLS_PER_ROW: u32 = 23;
+
+    for _i in 0..messages.len() {
+        let base = param_idx;
+        let col_nums: Vec<String> = (1..=COLS_PER_ROW)
+            .map(|o| format!("${}", base + o))
+            .collect();
+        value_rows.push(format!("({})", col_nums.join(",")));
+        param_idx += COLS_PER_ROW;
     }
 
-    #[instrument(skip(self, message_ids), fields(message_count = message_ids.len()))]
-    pub async fn mark_recalled_batch(&mut self, message_ids: &[String]) -> Result<i64> {
-        if message_ids.is_empty() {
-            return Ok(0);
-        }
-        let result = sqlx::query(
-            "UPDATE messages SET is_recalled = true, updated_at = NOW() WHERE message_id = ANY($1)",
-        )
-        .bind(message_ids)
-        .execute(self.session.as_mut())
-        .await?;
-        Ok(result.rows_affected() as i64)
+    sql.push_str(&value_rows.join(", "));
+
+    let mut q = sqlx::query(&sql);
+    for msg in messages {
+        q = q
+            .bind(&msg.message_id)
+            .bind(&msg.room_id)
+            .bind(msg.sent_at)
+            .bind(&msg.sent_by)
+            .bind(&msg.content_type)
+            .bind(&msg.content_text)
+            .bind(&msg.attachment_url)
+            .bind(&msg.attachment_file)
+            .bind(&msg.sticker_id)
+            .bind(&msg.alt_text)
+            .bind(&msg.metadata)
+            .bind(&msg.raw_data)
+            .bind(&msg.source)
+            .bind(msg.created_at)
+            .bind(msg.updated_at)
+            .bind(msg.is_deleted)
+            .bind(msg.deleted_at)
+            .bind(&msg.deleted_by)
+            .bind(msg.is_recalled)
+            .bind(msg.is_edited)
+            .bind(&msg.history)
+            .bind(&msg.reference_message_id)
+            .bind(&msg.reference_data);
     }
 
-    #[instrument(skip(self, messages), fields(message_count = messages.len()))]
-    pub async fn batch_create(&mut self, messages: &[Message]) -> Result<i64> {
-        if messages.is_empty() {
-            return Ok(0);
-        }
+    let result = q.execute(session.as_mut()).await?;
+    Ok(result.rows_affected() as i64)
+}
 
-        let mut sql = String::from(
-            "INSERT INTO messages (message_id, room_id, sent_at, sent_by, content_type, content_text, attachment_url, attachment_file, sticker_id, alt_text, metadata, raw_data, source, created_at, updated_at, is_deleted, deleted_at, deleted_by, is_recalled, is_edited, history, reference_message_id, reference_data) VALUES ",
-        );
-        let mut param_idx = 0u32;
-        let mut value_rows: Vec<String> = Vec::new();
-        const COLS_PER_ROW: u32 = 23;
+#[instrument(skip(session), fields(room_id = %room_id))]
+pub async fn get_latest_message_time(
+    session: &mut DbSession,
+    room_id: &str,
+) -> Result<Option<DateTime<Utc>>> {
+    sqlx::query_scalar(
+        "SELECT sent_at FROM messages WHERE room_id = $1 ORDER BY sent_at DESC LIMIT 1",
+    )
+    .bind(room_id)
+    .fetch_optional(session.as_mut())
+    .await
+    .map_err(anyhow::Error::from)
+}
 
-        for _i in 0..messages.len() {
-            let base = param_idx;
-            let col_nums: Vec<String> = (1..=COLS_PER_ROW)
-                .map(|o| format!("${}", base + o))
-                .collect();
-            value_rows.push(format!("({})", col_nums.join(",")));
-            param_idx += COLS_PER_ROW;
-        }
+#[instrument(skip(session), fields(room_id = %room_id))]
+pub async fn get_earliest_message_time(
+    session: &mut DbSession,
+    room_id: &str,
+) -> Result<Option<DateTime<Utc>>> {
+    sqlx::query_scalar(
+        "SELECT sent_at FROM messages WHERE room_id = $1 ORDER BY sent_at ASC LIMIT 1",
+    )
+    .bind(room_id)
+    .fetch_optional(session.as_mut())
+    .await
+    .map_err(anyhow::Error::from)
+}
 
-        sql.push_str(&value_rows.join(", "));
+#[instrument(skip(session, filters), fields(has_gps_only = filters.gps_only.unwrap_or(false)))]
+pub async fn count_messages(
+    session: &mut DbSession,
+    filters: &MessageFilters,
+) -> Result<MessageCounts> {
+    let query_parts = build_query_parts(filters, false);
 
-        let mut q = sqlx::query(&sql);
-        for msg in messages {
-            q = q
-                .bind(&msg.message_id)
-                .bind(&msg.room_id)
-                .bind(msg.sent_at)
-                .bind(&msg.sent_by)
-                .bind(&msg.content_type)
-                .bind(&msg.content_text)
-                .bind(&msg.attachment_url)
-                .bind(&msg.attachment_file)
-                .bind(&msg.sticker_id)
-                .bind(&msg.alt_text)
-                .bind(&msg.metadata)
-                .bind(&msg.raw_data)
-                .bind(&msg.source)
-                .bind(msg.created_at)
-                .bind(msg.updated_at)
-                .bind(msg.is_deleted)
-                .bind(msg.deleted_at)
-                .bind(&msg.deleted_by)
-                .bind(msg.is_recalled)
-                .bind(msg.is_edited)
-                .bind(&msg.history)
-                .bind(&msg.reference_message_id)
-                .bind(&msg.reference_data);
-        }
-
-        let result = q.execute(self.session.as_mut()).await?;
-        Ok(result.rows_affected() as i64)
-    }
-
-    #[instrument(skip(self), fields(room_id = %room_id))]
-    pub async fn get_latest_message_time(
-        &mut self,
-        room_id: &str,
-    ) -> Result<Option<DateTime<Utc>>> {
-        sqlx::query_scalar(
-            "SELECT sent_at FROM messages WHERE room_id = $1 ORDER BY sent_at DESC LIMIT 1",
-        )
-        .bind(room_id)
-        .fetch_optional(self.session.as_mut())
-        .await
-        .map_err(anyhow::Error::from)
-    }
-
-    #[instrument(skip(self), fields(room_id = %room_id))]
-    pub async fn get_earliest_message_time(
-        &mut self,
-        room_id: &str,
-    ) -> Result<Option<DateTime<Utc>>> {
-        sqlx::query_scalar(
-            "SELECT sent_at FROM messages WHERE room_id = $1 ORDER BY sent_at ASC LIMIT 1",
-        )
-        .bind(room_id)
-        .fetch_optional(self.session.as_mut())
-        .await
-        .map_err(anyhow::Error::from)
-    }
-
-    #[instrument(skip(self, filters), fields(has_gps_only = filters.gps_only.unwrap_or(false)))]
-    pub async fn count_messages(&mut self, filters: &MessageFilters) -> Result<MessageCounts> {
-        let query_parts = build_query_parts(filters, false);
-
-        if query_parts.params.is_empty()
-            && query_parts.conditions.is_empty()
-            && !filters.gps_only.unwrap_or(false)
-        {
-            let row = sqlx::query_as::<_, (i64, i64, i64, i64)>(
-                "SELECT COALESCE(SUM(message_count), 0)::bigint,
+    if query_parts.params.is_empty()
+        && query_parts.conditions.is_empty()
+        && !filters.gps_only.unwrap_or(false)
+    {
+        let row = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+            "SELECT COALESCE(SUM(message_count), 0)::bigint,
                         COALESCE(SUM(deleted_count), 0)::bigint,
                         COALESCE(SUM(recalled_count), 0)::bigint,
                         COALESCE(SUM(edited_count), 0)::bigint
                  FROM rooms",
-            )
-            .fetch_one(self.session.as_mut())
-            .await?;
+        )
+        .fetch_one(session.as_mut())
+        .await?;
 
-            return Ok(MessageCounts {
-                total_messages: row.0,
-                deleted_messages: row.1,
-                recalled_messages: row.2,
-                edited_messages: row.3,
-            });
-        }
-
-        let sql = format!(
-            "SELECT COUNT(*)::bigint,
-                    COALESCE(SUM(CASE WHEN m.is_deleted THEN 1 ELSE 0 END), 0)::bigint,
-                    COALESCE(SUM(CASE WHEN m.is_recalled THEN 1 ELSE 0 END), 0)::bigint,
-                    COALESCE(SUM(CASE WHEN m.is_edited THEN 1 ELSE 0 END), 0)::bigint
-             FROM messages m{} WHERE 1=1{}",
-            query_parts.joins, query_parts.conditions,
-        );
-
-        let mut q = sqlx::query_as::<_, (i64, i64, i64, i64)>(&sql);
-        for p in &query_parts.params {
-            q = match p {
-                BindVal::Text(v) => q.bind(v.clone()),
-                BindVal::Timestamp(v) => q.bind(*v),
-                BindVal::Bool(v) => q.bind(*v),
-                BindVal::TextArray(v) => q.bind(v.clone()),
-            };
-        }
-
-        let row = q.fetch_one(self.session.as_mut()).await?;
-
-        Ok(MessageCounts {
+        return Ok(MessageCounts {
             total_messages: row.0,
             deleted_messages: row.1,
             recalled_messages: row.2,
             edited_messages: row.3,
-        })
+        });
     }
+
+    let sql = format!(
+        "SELECT COUNT(*)::bigint,
+                    COALESCE(SUM(CASE WHEN m.is_deleted THEN 1 ELSE 0 END), 0)::bigint,
+                    COALESCE(SUM(CASE WHEN m.is_recalled THEN 1 ELSE 0 END), 0)::bigint,
+                    COALESCE(SUM(CASE WHEN m.is_edited THEN 1 ELSE 0 END), 0)::bigint
+             FROM messages m{} WHERE 1=1{}",
+        query_parts.joins, query_parts.conditions,
+    );
+
+    let mut q = sqlx::query_as::<_, (i64, i64, i64, i64)>(&sql);
+    for p in &query_parts.params {
+        q = match p {
+            BindVal::Text(v) => q.bind(v.clone()),
+            BindVal::Timestamp(v) => q.bind(*v),
+            BindVal::Bool(v) => q.bind(*v),
+            BindVal::TextArray(v) => q.bind(v.clone()),
+        };
+    }
+
+    let row = q.fetch_one(session.as_mut()).await?;
+
+    Ok(MessageCounts {
+        total_messages: row.0,
+        deleted_messages: row.1,
+        recalled_messages: row.2,
+        edited_messages: row.3,
+    })
 }
 
 impl sqlx::FromRow<'_, sqlx::postgres::PgRow> for EnrichedMessage {
@@ -2133,865 +2195,501 @@ mod tests {
             }
         }
 
-        #[tokio::test]
-        async fn service_struct_can_be_created() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut _svc = MessageService::new(session);
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("service_struct_can_be_created");
+        macro_rules! message_db_test {
+            ($name:ident, $session:ident, $body:block) => {
+                #[tokio::test]
+                async fn $name() {
+                    let test_db = lilium_test_fixtures::TestDb::acquire(
+                        lilium_test_fixtures::FixtureProfile::Message,
+                    )
+                    .await
+                    .expect("init message db");
+
+                    lilium_database::transaction!(test_db.database(), |$session| $body)
+                        .await
+                        .expect(stringify!($name));
+                }
+            };
         }
 
-        #[tokio::test]
-        async fn get_messages_no_filters() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let filters = MessageFilters::default();
-                        let pagination = PaginationParams {
-                            limit: 100,
-                            per_page: 100,
-                            cursor: None,
-                            reverse: false,
-                            page: None,
-                            sort_by: None,
-                        };
-                        let result = svc
-                            .get_messages(&filters, &pagination, true)
-                            .await
-                            .expect("query");
-                        assert!(result.data.len() <= 100);
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("get_messages_no_filters");
-        }
+        message_db_test!(message_exists_can_be_called_directly, session, {
+            let exists = message_exists(session, "__nonexistent__")
+                .await
+                .expect("query");
+            assert!(!exists);
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn get_messages_ordered_newest_first() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let filters = MessageFilters::default();
-                        let pagination = PaginationParams {
-                            limit: 100,
-                            per_page: 100,
-                            cursor: None,
-                            reverse: false,
-                            page: None,
-                            sort_by: None,
-                        };
-                        let result = svc
-                            .get_messages(&filters, &pagination, true)
-                            .await
-                            .expect("query");
-                        for i in 0..result.data.len().saturating_sub(1) {
-                            assert!(result.data[i].sent_at >= result.data[i + 1].sent_at);
-                        }
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("get_messages_ordered_newest_first");
-        }
+        message_db_test!(get_messages_no_filters, session, {
+            let filters = MessageFilters::default();
+            let pagination = PaginationParams {
+                limit: 100,
+                per_page: 100,
+                cursor: None,
+                reverse: false,
+                page: None,
+                sort_by: None,
+            };
+            let result = get_messages(session, &filters, &pagination, true)
+                .await
+                .expect("query");
+            assert!(result.data.len() <= 100);
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn get_messages_reverse_order() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let filters = MessageFilters::default();
-                        let pagination = PaginationParams {
-                            limit: 100,
-                            per_page: 100,
-                            cursor: None,
-                            reverse: true,
-                            page: None,
-                            sort_by: None,
-                        };
-                        let result = svc
-                            .get_messages(&filters, &pagination, true)
-                            .await
-                            .expect("query");
-                        for i in 0..result.data.len().saturating_sub(1) {
-                            assert!(result.data[i].sent_at <= result.data[i + 1].sent_at);
-                        }
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("get_messages_reverse_order");
-        }
+        message_db_test!(get_messages_ordered_newest_first, session, {
+            let filters = MessageFilters::default();
+            let pagination = PaginationParams {
+                limit: 100,
+                per_page: 100,
+                cursor: None,
+                reverse: false,
+                page: None,
+                sort_by: None,
+            };
+            let result = get_messages(session, &filters, &pagination, true)
+                .await
+                .expect("query");
+            for i in 0..result.data.len().saturating_sub(1) {
+                assert!(result.data[i].sent_at >= result.data[i + 1].sent_at);
+            }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn filter_by_room() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let filters = MessageFilters {
-                            room_id: Some("room1".into()),
-                            ..Default::default()
-                        };
-                        let pagination = PaginationParams {
-                            limit: 100,
-                            per_page: 100,
-                            cursor: None,
-                            reverse: false,
-                            page: None,
-                            sort_by: None,
-                        };
-                        let result = svc
-                            .get_messages(&filters, &pagination, true)
-                            .await
-                            .expect("query");
-                        assert!(result.data.iter().all(|m| m.room_id == "room1"));
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("filter_by_room");
-        }
+        message_db_test!(get_messages_reverse_order, session, {
+            let filters = MessageFilters::default();
+            let pagination = PaginationParams {
+                limit: 100,
+                per_page: 100,
+                cursor: None,
+                reverse: true,
+                page: None,
+                sort_by: None,
+            };
+            let result = get_messages(session, &filters, &pagination, true)
+                .await
+                .expect("query");
+            for i in 0..result.data.len().saturating_sub(1) {
+                assert!(result.data[i].sent_at <= result.data[i + 1].sent_at);
+            }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn filter_by_user() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let filters = MessageFilters {
-                            user_id: Some("user1".into()),
-                            ..Default::default()
-                        };
-                        let pagination = PaginationParams {
-                            limit: 100,
-                            per_page: 100,
-                            cursor: None,
-                            reverse: false,
-                            page: None,
-                            sort_by: None,
-                        };
-                        let result = svc
-                            .get_messages(&filters, &pagination, true)
-                            .await
-                            .expect("query");
-                        assert!(result.data.iter().all(|m| m.sent_by == "user1"));
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("filter_by_user");
-        }
+        message_db_test!(filter_by_room, session, {
+            let filters = MessageFilters {
+                room_id: Some("room1".into()),
+                ..Default::default()
+            };
+            let pagination = PaginationParams {
+                limit: 100,
+                per_page: 100,
+                cursor: None,
+                reverse: false,
+                page: None,
+                sort_by: None,
+            };
+            let result = get_messages(session, &filters, &pagination, true)
+                .await
+                .expect("query");
+            assert!(result.data.iter().all(|m| m.room_id == "room1"));
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn filter_by_content_types() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let filters = MessageFilters {
-                            content_types: Some(vec!["text".into()]),
-                            ..Default::default()
-                        };
-                        let pagination = PaginationParams {
-                            limit: 100,
-                            per_page: 100,
-                            cursor: None,
-                            reverse: false,
-                            page: None,
-                            sort_by: None,
-                        };
-                        let result = svc
-                            .get_messages(&filters, &pagination, true)
-                            .await
-                            .expect("query");
-                        assert!(result.data.iter().all(|m| m.content_type == "text"));
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("filter_by_content_types");
-        }
+        message_db_test!(filter_by_user, session, {
+            let filters = MessageFilters {
+                user_id: Some("user1".into()),
+                ..Default::default()
+            };
+            let pagination = PaginationParams {
+                limit: 100,
+                per_page: 100,
+                cursor: None,
+                reverse: false,
+                page: None,
+                sort_by: None,
+            };
+            let result = get_messages(session, &filters, &pagination, true)
+                .await
+                .expect("query");
+            assert!(result.data.iter().all(|m| m.sent_by == "user1"));
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn filter_deleted_messages() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let filters = MessageFilters {
-                            message_types: Some(vec!["deleted".into()]),
-                            ..Default::default()
-                        };
-                        let pagination = PaginationParams {
-                            limit: 100,
-                            per_page: 100,
-                            cursor: None,
-                            reverse: false,
-                            page: None,
-                            sort_by: None,
-                        };
-                        let result = svc
-                            .get_messages(&filters, &pagination, true)
-                            .await
-                            .expect("query");
-                        assert!(result.data.iter().all(|m| m.is_deleted));
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("filter_deleted_messages");
-        }
+        message_db_test!(filter_by_content_types, session, {
+            let filters = MessageFilters {
+                content_types: Some(vec!["text".into()]),
+                ..Default::default()
+            };
+            let pagination = PaginationParams {
+                limit: 100,
+                per_page: 100,
+                cursor: None,
+                reverse: false,
+                page: None,
+                sort_by: None,
+            };
+            let result = get_messages(session, &filters, &pagination, true)
+                .await
+                .expect("query");
+            assert!(result.data.iter().all(|m| m.content_type == "text"));
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn filter_recalled_messages() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let filters = MessageFilters {
-                            message_types: Some(vec!["recalled".into()]),
-                            ..Default::default()
-                        };
-                        let pagination = PaginationParams {
-                            limit: 100,
-                            per_page: 100,
-                            cursor: None,
-                            reverse: false,
-                            page: None,
-                            sort_by: None,
-                        };
-                        let result = svc
-                            .get_messages(&filters, &pagination, true)
-                            .await
-                            .expect("query");
-                        assert!(result.data.iter().all(|m| m.is_recalled));
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("filter_recalled_messages");
-        }
+        message_db_test!(filter_deleted_messages, session, {
+            let filters = MessageFilters {
+                message_types: Some(vec!["deleted".into()]),
+                ..Default::default()
+            };
+            let pagination = PaginationParams {
+                limit: 100,
+                per_page: 100,
+                cursor: None,
+                reverse: false,
+                page: None,
+                sort_by: None,
+            };
+            let result = get_messages(session, &filters, &pagination, true)
+                .await
+                .expect("query");
+            assert!(result.data.iter().all(|m| m.is_deleted));
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn filter_by_time_range() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let start = Utc.with_ymd_and_hms(2024, 1, 1, 10, 0, 0).unwrap();
-                        let end = Utc.with_ymd_and_hms(2024, 1, 1, 14, 0, 0).unwrap();
-                        let filters = MessageFilters {
-                            start_time: Some(start),
-                            end_time: Some(end),
-                            ..Default::default()
-                        };
-                        let pagination = PaginationParams {
-                            limit: 100,
-                            per_page: 100,
-                            cursor: None,
-                            reverse: false,
-                            page: None,
-                            sort_by: None,
-                        };
-                        let result = svc
-                            .get_messages(&filters, &pagination, true)
-                            .await
-                            .expect("query");
-                        for m in &result.data {
-                            assert!(m.sent_at >= start);
-                            assert!(m.sent_at <= end);
-                        }
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("filter_by_time_range");
-        }
+        message_db_test!(filter_recalled_messages, session, {
+            let filters = MessageFilters {
+                message_types: Some(vec!["recalled".into()]),
+                ..Default::default()
+            };
+            let pagination = PaginationParams {
+                limit: 100,
+                per_page: 100,
+                cursor: None,
+                reverse: false,
+                page: None,
+                sort_by: None,
+            };
+            let result = get_messages(session, &filters, &pagination, true)
+                .await
+                .expect("query");
+            assert!(result.data.iter().all(|m| m.is_recalled));
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn filter_has_attachment() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let filters = MessageFilters {
-                            has_attachment: Some(true),
-                            ..Default::default()
-                        };
-                        let pagination = PaginationParams {
-                            limit: 100,
-                            per_page: 100,
-                            cursor: None,
-                            reverse: false,
-                            page: None,
-                            sort_by: None,
-                        };
-                        let result = svc
-                            .get_messages(&filters, &pagination, true)
-                            .await
-                            .expect("query");
-                        assert!(result.data.iter().all(|m| m.attachment_file.is_some()));
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("filter_has_attachment");
-        }
+        message_db_test!(filter_by_time_range, session, {
+            let start = Utc.with_ymd_and_hms(2024, 1, 1, 10, 0, 0).unwrap();
+            let end = Utc.with_ymd_and_hms(2024, 1, 1, 14, 0, 0).unwrap();
+            let filters = MessageFilters {
+                start_time: Some(start),
+                end_time: Some(end),
+                ..Default::default()
+            };
+            let pagination = PaginationParams {
+                limit: 100,
+                per_page: 100,
+                cursor: None,
+                reverse: false,
+                page: None,
+                sort_by: None,
+            };
+            let result = get_messages(session, &filters, &pagination, true)
+                .await
+                .expect("query");
+            for m in &result.data {
+                assert!(m.sent_at >= start);
+                assert!(m.sent_at <= end);
+            }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn filter_has_reference() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let filters = MessageFilters {
-                            has_reference: Some(true),
-                            ..Default::default()
-                        };
-                        let pagination = PaginationParams {
-                            limit: 100,
-                            per_page: 100,
-                            cursor: None,
-                            reverse: false,
-                            page: None,
-                            sort_by: None,
-                        };
-                        let result = svc
-                            .get_messages(&filters, &pagination, true)
-                            .await
-                            .expect("query");
-                        assert!(result.data.iter().all(|m| m.reference_message_id.is_some()));
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("filter_has_reference");
-        }
+        message_db_test!(filter_has_attachment, session, {
+            let filters = MessageFilters {
+                has_attachment: Some(true),
+                ..Default::default()
+            };
+            let pagination = PaginationParams {
+                limit: 100,
+                per_page: 100,
+                cursor: None,
+                reverse: false,
+                page: None,
+                sort_by: None,
+            };
+            let result = get_messages(session, &filters, &pagination, true)
+                .await
+                .expect("query");
+            assert!(result.data.iter().all(|m| m.attachment_file.is_some()));
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn filter_combined() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let filters = MessageFilters {
-                            room_id: Some("room1".into()),
-                            user_id: Some("user1".into()),
-                            content_types: Some(vec!["text".into()]),
-                            ..Default::default()
-                        };
-                        let pagination = PaginationParams {
-                            limit: 100,
-                            per_page: 100,
-                            cursor: None,
-                            reverse: false,
-                            page: None,
-                            sort_by: None,
-                        };
-                        let result = svc
-                            .get_messages(&filters, &pagination, true)
-                            .await
-                            .expect("query");
-                        for m in &result.data {
-                            assert_eq!(m.room_id, "room1");
-                            assert_eq!(m.sent_by, "user1");
-                            assert_eq!(m.content_type, "text");
-                        }
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("filter_combined");
-        }
+        message_db_test!(filter_has_reference, session, {
+            let filters = MessageFilters {
+                has_reference: Some(true),
+                ..Default::default()
+            };
+            let pagination = PaginationParams {
+                limit: 100,
+                per_page: 100,
+                cursor: None,
+                reverse: false,
+                page: None,
+                sort_by: None,
+            };
+            let result = get_messages(session, &filters, &pagination, true)
+                .await
+                .expect("query");
+            assert!(result.data.iter().all(|m| m.reference_message_id.is_some()));
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn pagination_first_page() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let filters = MessageFilters::default();
-                        let pagination = PaginationParams {
-                            limit: 3,
-                            per_page: 3,
-                            cursor: None,
-                            reverse: false,
-                            page: None,
-                            sort_by: None,
-                        };
-                        let result = svc
-                            .get_messages(&filters, &pagination, true)
-                            .await
-                            .expect("query");
-                        assert!(result.data.len() <= 3);
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("pagination_first_page");
-        }
+        message_db_test!(filter_combined, session, {
+            let filters = MessageFilters {
+                room_id: Some("room1".into()),
+                user_id: Some("user1".into()),
+                content_types: Some(vec!["text".into()]),
+                ..Default::default()
+            };
+            let pagination = PaginationParams {
+                limit: 100,
+                per_page: 100,
+                cursor: None,
+                reverse: false,
+                page: None,
+                sort_by: None,
+            };
+            let result = get_messages(session, &filters, &pagination, true)
+                .await
+                .expect("query");
+            for m in &result.data {
+                assert_eq!(m.room_id, "room1");
+                assert_eq!(m.sent_by, "user1");
+                assert_eq!(m.content_type, "text");
+            }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn pagination_with_cursor_no_overlap() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let filters = MessageFilters::default();
-                        let p1 = PaginationParams {
-                            limit: 3,
-                            per_page: 3,
-                            cursor: None,
-                            reverse: false,
-                            page: None,
-                            sort_by: None,
-                        };
-                        let page1 = svc.get_messages(&filters, &p1, true).await.expect("page1");
-                        if let Some(ref cursor) = page1.next_cursor {
-                            let p2 = PaginationParams {
-                                limit: 3,
-                                per_page: 3,
-                                cursor: Some(cursor.clone()),
-                                reverse: false,
-                                page: None,
-                                sort_by: None,
-                            };
-                            let page2 = svc.get_messages(&filters, &p2, true).await.expect("page2");
-                            let ids1: std::collections::HashSet<_> =
-                                page1.data.iter().map(|m| m.message_id.clone()).collect();
-                            let ids2: std::collections::HashSet<_> =
-                                page2.data.iter().map(|m| m.message_id.clone()).collect();
-                            assert!(ids1.intersection(&ids2).next().is_none());
-                        }
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("pagination_with_cursor_no_overlap");
-        }
+        message_db_test!(pagination_first_page, session, {
+            let filters = MessageFilters::default();
+            let pagination = PaginationParams {
+                limit: 3,
+                per_page: 3,
+                cursor: None,
+                reverse: false,
+                page: None,
+                sort_by: None,
+            };
+            let result = get_messages(session, &filters, &pagination, true)
+                .await
+                .expect("query");
+            assert!(result.data.len() <= 3);
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn empty_database_returns_none() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let filters = MessageFilters {
-                            room_id: Some("__nonexistent_room__".into()),
-                            ..Default::default()
-                        };
-                        let pagination = PaginationParams {
-                            limit: 10,
-                            per_page: 10,
-                            cursor: None,
-                            reverse: false,
-                            page: None,
-                            sort_by: None,
-                        };
-                        let result = svc
-                            .get_messages(&filters, &pagination, true)
-                            .await
-                            .expect("query");
-                        assert!(result.data.is_empty());
-                        assert!(result.next_cursor.is_none());
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("empty_database_returns_none");
-        }
+        message_db_test!(pagination_with_cursor_no_overlap, session, {
+            let filters = MessageFilters::default();
+            let p1 = PaginationParams {
+                limit: 3,
+                per_page: 3,
+                cursor: None,
+                reverse: false,
+                page: None,
+                sort_by: None,
+            };
+            let page1 = get_messages(session, &filters, &p1, true)
+                .await
+                .expect("page1");
+            if let Some(ref cursor) = page1.next_cursor {
+                let p2 = PaginationParams {
+                    limit: 3,
+                    per_page: 3,
+                    cursor: Some(cursor.clone()),
+                    reverse: false,
+                    page: None,
+                    sort_by: None,
+                };
+                let page2 = get_messages(session, &filters, &p2, true)
+                    .await
+                    .expect("page2");
+                let ids1: std::collections::HashSet<_> =
+                    page1.data.iter().map(|m| m.message_id.clone()).collect();
+                let ids2: std::collections::HashSet<_> =
+                    page2.data.iter().map(|m| m.message_id.clone()).collect();
+                assert!(ids1.intersection(&ids2).next().is_none());
+            }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn get_by_id_nonexistent() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let result = svc.get_by_id("__nonexistent__", true).await.expect("query");
-                        assert!(result.is_none());
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("get_by_id_nonexistent");
-        }
+        message_db_test!(empty_database_returns_none, session, {
+            let filters = MessageFilters {
+                room_id: Some("__nonexistent_room__".into()),
+                ..Default::default()
+            };
+            let pagination = PaginationParams {
+                limit: 10,
+                per_page: 10,
+                cursor: None,
+                reverse: false,
+                page: None,
+                sort_by: None,
+            };
+            let result = get_messages(session, &filters, &pagination, true)
+                .await
+                .expect("query");
+            assert!(result.data.is_empty());
+            assert!(result.next_cursor.is_none());
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn message_exists_false() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let exists = svc.message_exists("__nonexistent__").await.expect("query");
-                        assert!(!exists);
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("message_exists_false");
-        }
+        message_db_test!(get_by_id_nonexistent, session, {
+            let result = get_by_id(session, "__nonexistent__", true)
+                .await
+                .expect("query");
+            assert!(result.is_none());
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn get_before_nonexistent_returns_empty() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let messages = svc.get_before("__nonexistent__", 5).await.expect("query");
-                        assert!(messages.is_empty());
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("get_before_nonexistent_returns_empty");
-        }
+        message_db_test!(message_exists_false, session, {
+            let exists = message_exists(session, "__nonexistent__")
+                .await
+                .expect("query");
+            assert!(!exists);
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn get_after_nonexistent_returns_empty() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let messages = svc.get_after("__nonexistent__", 5).await.expect("query");
-                        assert!(messages.is_empty());
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("get_after_nonexistent_returns_empty");
-        }
+        message_db_test!(get_before_nonexistent_returns_empty, session, {
+            let messages = get_before(session, "__nonexistent__", 5)
+                .await
+                .expect("query");
+            assert!(messages.is_empty());
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn get_context_nonexistent_returns_none() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let result = svc
-                            .get_context("__nonexistent__", 2, 2)
-                            .await
-                            .expect("query");
-                        assert!(result.is_none());
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("get_context_nonexistent_returns_none");
-        }
+        message_db_test!(get_after_nonexistent_returns_empty, session, {
+            let messages = get_after(session, "__nonexistent__", 5)
+                .await
+                .expect("query");
+            assert!(messages.is_empty());
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn get_latest_message_time_empty_room() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let result = svc
-                            .get_latest_message_time("__nonexistent__")
-                            .await
-                            .expect("query");
-                        assert!(result.is_none());
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("get_latest_message_time_empty_room");
-        }
+        message_db_test!(get_context_nonexistent_returns_none, session, {
+            let result = get_context(session, "__nonexistent__", 2, 2)
+                .await
+                .expect("query");
+            assert!(result.is_none());
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn get_earliest_message_time_empty_room() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let result = svc
-                            .get_earliest_message_time("__nonexistent__")
-                            .await
-                            .expect("query");
-                        assert!(result.is_none());
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("get_earliest_message_time_empty_room");
-        }
+        message_db_test!(get_latest_message_time_empty_room, session, {
+            let result = get_latest_message_time(session, "__nonexistent__")
+                .await
+                .expect("query");
+            assert!(result.is_none());
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn batch_create_empty_list_returns_zero() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let count = svc.batch_create(&[]).await.expect("batch create");
-                        assert_eq!(count, 0);
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("batch_create_empty_list_returns_zero");
-        }
+        message_db_test!(get_earliest_message_time_empty_room, session, {
+            let result = get_earliest_message_time(session, "__nonexistent__")
+                .await
+                .expect("query");
+            assert!(result.is_none());
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn batch_create_if_missing_empty() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let rows = svc.batch_create_if_missing(&[]).await.expect("batch");
-                        assert!(rows.is_empty());
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("batch_create_if_missing_empty");
-        }
+        message_db_test!(batch_create_empty_list_returns_zero, session, {
+            let count = batch_create(session, &[]).await.expect("batch create");
+            assert_eq!(count, 0);
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn enrich_batch_empty() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let result = svc.enrich_batch(&[]).await.expect("enrich");
-                        assert!(result.is_empty());
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("enrich_batch_empty");
-        }
+        message_db_test!(batch_create_if_missing_empty, session, {
+            let rows = batch_create_if_missing(session, &[]).await.expect("batch");
+            assert!(rows.is_empty());
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn mark_deleted_batch_empty_returns_zero() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let count = svc
-                            .mark_deleted_batch(&[], None)
-                            .await
-                            .expect("mark deleted");
-                        assert_eq!(count, 0);
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("mark_deleted_batch_empty_returns_zero");
-        }
+        message_db_test!(enrich_batch_empty, session, {
+            let result = enrich_batch(session, &[]).await.expect("enrich");
+            assert!(result.is_empty());
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn mark_recalled_batch_empty_returns_zero() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let count = svc.mark_recalled_batch(&[]).await.expect("mark recalled");
-                        assert_eq!(count, 0);
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("mark_recalled_batch_empty_returns_zero");
-        }
+        message_db_test!(mark_deleted_batch_empty_returns_zero, session, {
+            let count = mark_deleted_batch(session, &[], None)
+                .await
+                .expect("mark deleted");
+            assert_eq!(count, 0);
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn get_deleted_messages() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let messages = svc.get_deleted_messages(None, 10).await.expect("query");
-                        for m in &messages {
-                            assert!(m.is_deleted || m.is_recalled);
-                        }
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("get_deleted_messages");
-        }
+        message_db_test!(mark_recalled_batch_empty_returns_zero, session, {
+            let count = mark_recalled_batch(session, &[])
+                .await
+                .expect("mark recalled");
+            assert_eq!(count, 0);
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn get_deleted_messages_with_room() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let messages = svc
-                            .get_deleted_messages(Some("room1"), 10)
-                            .await
-                            .expect("query");
-                        for m in &messages {
-                            assert!(m.is_deleted || m.is_recalled);
-                        }
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("get_deleted_messages_with_room");
-        }
+        message_db_test!(get_deleted_messages, session, {
+            let messages = super::get_deleted_messages(session, None, 10)
+                .await
+                .expect("query");
+            for m in &messages {
+                assert!(m.is_deleted || m.is_recalled);
+            }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn get_room_stats_returns_stats() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let stats = svc.get_room_stats("room1").await.expect("query");
-                        assert!(stats.total >= 0);
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("get_room_stats_returns_stats");
-        }
+        message_db_test!(get_deleted_messages_with_room, session, {
+            let messages = super::get_deleted_messages(session, Some("room1"), 10)
+                .await
+                .expect("query");
+            for m in &messages {
+                assert!(m.is_deleted || m.is_recalled);
+            }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn get_user_stats_returns_stats() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let stats = svc.get_user_stats("user1").await.expect("query");
-                        assert!(stats.total >= 0);
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("get_user_stats_returns_stats");
-        }
+        message_db_test!(get_room_stats_returns_stats, session, {
+            let stats = get_room_stats(session, "room1").await.expect("query");
+            assert!(stats.total >= 0);
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn count_messages_with_filters() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let filters = MessageFilters {
-                            room_id: Some("room1".into()),
-                            ..Default::default()
-                        };
-                        let counts = svc.count_messages(&filters).await.expect("count");
-                        assert!(counts.total_messages >= 0);
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("count_messages_with_filters");
-        }
+        message_db_test!(get_user_stats_returns_stats, session, {
+            let stats = get_user_stats(session, "user1").await.expect("query");
+            assert!(stats.total >= 0);
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn count_messages_no_filters_uses_rooms_table() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let counts = svc
-                            .count_messages(&MessageFilters::default())
-                            .await
-                            .expect("count");
-                        assert!(counts.total_messages >= 0);
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("count_messages_no_filters_uses_rooms_table");
-        }
+        message_db_test!(count_messages_with_filters, session, {
+            let filters = MessageFilters {
+                room_id: Some("room1".into()),
+                ..Default::default()
+            };
+            let counts = count_messages(session, &filters).await.expect("count");
+            assert!(counts.total_messages >= 0);
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn create_message_if_missing_duplicate() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let msg = test_message();
-                        let first = svc.create_message_if_missing(&msg).await.expect("first");
-                        let second = svc.create_message_if_missing(&msg).await.expect("second");
-                        assert!(first);
-                        assert!(!second);
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("create_message_if_missing_duplicate");
-        }
+        message_db_test!(count_messages_no_filters_uses_rooms_table, session, {
+            let counts = count_messages(session, &MessageFilters::default())
+                .await
+                .expect("count");
+            assert!(counts.total_messages >= 0);
+            Ok(())
+        });
+
+        message_db_test!(create_message_if_missing_duplicate, session, {
+            let msg = test_message();
+            let first = create_message_if_missing(session, &msg)
+                .await
+                .expect("first");
+            let second = create_message_if_missing(session, &msg)
+                .await
+                .expect("second");
+            assert!(first);
+            assert!(!second);
+            Ok(())
+        });
     }
 }
