@@ -1,5 +1,5 @@
 use anyhow::Result;
-use lilium_database::DbPool;
+use lilium_database::{Database, DbPool};
 use lilium_database::pool::SessionFuture;
 use lilium_database::{DbSession, DbSessionContext};
 
@@ -32,16 +32,11 @@ impl TestDb {
     pub async fn acquire(profile: FixtureProfile) -> Result<Self> {
         let connection = connect_test_database().await;
 
-        connection
-            .with_session_context(|session| {
-                Box::pin(async move {
-                    let mut session = session;
-                    prepare_database(&mut session, profile).await
-                })
-            })
-            .await?;
-
-        let database = lilium_database::Database::create(connection.database_config()).await?;
+        let database = Database::create(connection.database_config()).await?;
+        lilium_database::transaction!(database, |session| {
+            prepare_database(session, profile).await
+        })
+        .await?;
 
         Ok(Self {
             database,
