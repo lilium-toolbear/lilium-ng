@@ -1,5 +1,5 @@
 use anyhow::Result;
-use lilium_database::DbPool;
+use lilium_database::Database;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod config;
@@ -20,8 +20,9 @@ async fn main() -> Result<()> {
     let config = config::Config::load()?;
     tracing::info!("Starting lilium-event-processor");
 
-    // Connect to database - do NOT run migrations
-    let pool = DbPool::connect_from_env("DATABASE_URL", config.database.pool_size).await?;
+    // Create database runtime - do NOT run migrations
+    let db = Database::create(config.database.clone().into()).await?;
+    let pool = db.raw_pool().clone();
 
     let processor = processor::EventProcessor::new(
         pool,

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use lilium_database::DbPool;
+use lilium_database::Database;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod arbiter;
@@ -23,9 +23,10 @@ async fn main() -> Result<()> {
     let config = config::Config::load()?;
     tracing::info!("Starting lilium-spider");
 
-    // Connect to database - do NOT run migrations
+    // Create database runtime - do NOT run migrations
     // Migrations are managed separately by Alembic in the Python project
-    let pool = DbPool::connect_from_env("DATABASE_URL", config.database.pool_size).await?;
+    let db = Database::create(config.database.clone().into()).await?;
+    let pool = db.raw_pool().clone();
 
     let arbiter = arbiter::Arbiter::new(config, pool);
     arbiter.run().await
