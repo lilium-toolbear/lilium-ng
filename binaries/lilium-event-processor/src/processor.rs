@@ -10,7 +10,7 @@ use tracing::{error, info, warn};
 
 #[cfg(not(test))]
 use lilium_common::LiliumError;
-use lilium_database::{Database, DbSession, DbSessionContext};
+use lilium_database::{Database, DbSession};
 use lilium_models::ingestion::WebSocketEvent;
 #[cfg(not(test))]
 use lilium_services::account_service as account;
@@ -219,9 +219,8 @@ impl EventProcessor {
         let processor_id = self.processor_id.clone();
         let events = events.to_vec();
         lilium_database::transaction!(self.database, |session| {
-            let mut session = DbSessionContext::new(session);
             Self::process_batch_inner(
-                &mut session,
+                session,
                 events,
                 processor_id,
                 start_cursor_id,
@@ -265,7 +264,7 @@ impl EventProcessor {
     }
 
     async fn process_batch_inner(
-        session: &mut DbSessionContext<'_>,
+        session: &mut DbSession,
         events: Vec<WebSocketEvent>,
         processor_id: String,
         start_cursor_id: i64,
@@ -340,7 +339,7 @@ impl EventProcessor {
     }
 
     async fn collect_updates_from_events(
-        session: &mut DbSessionContext<'_>,
+        session: &mut DbSession,
         events: &[WebSocketEvent],
     ) -> Result<(Vec<(String, String, String)>, Vec<String>)> {
         let mut user_fetch_collector = Vec::new();
@@ -358,7 +357,7 @@ impl EventProcessor {
     }
 
     async fn sync_users(
-        session: &mut DbSessionContext<'_>,
+        session: &mut DbSession,
         user_fetch_collector: &[(String, String, String)],
     ) -> Result<()> {
         if user_fetch_collector.is_empty() {
@@ -422,7 +421,7 @@ impl EventProcessor {
     }
 
     async fn sync_media(
-        session: &mut DbSessionContext<'_>,
+        session: &mut DbSession,
         media_message_ids: &[String],
     ) -> Result<()> {
         if media_message_ids.is_empty() {
@@ -451,7 +450,7 @@ impl EventProcessor {
     }
 
     async fn process_event(
-        session: &mut DbSessionContext<'_>,
+        session: &mut DbSession,
         event: &WebSocketEvent,
         user_fetch_collector: &mut Vec<(String, String, String)>,
     ) -> Result<Option<String>> {
@@ -640,7 +639,7 @@ mod tests {
     }
 
     async fn room_member_row(
-        session: &mut DbSessionContext<'_>,
+        session: &mut DbSession,
         room_id: &str,
         user_id: &str,
     ) -> Result<Option<RoomMember>> {
