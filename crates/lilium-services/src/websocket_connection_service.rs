@@ -297,197 +297,194 @@ mod tests {
 
     #[tokio::test]
     async fn test_acquire_connection_lock_creates_connection_record() {
-        lilium_test_fixtures::with_db_session(
+        let test_db = lilium_test_fixtures::TestDb::acquire(
             lilium_test_fixtures::FixtureProfile::WebsocketConnection,
-            |session| {
-                Box::pin(async move {
-                    let mut session = session;
-                    let lock_id = acquire_connection_lock(&mut session, "user_test_acquire")
-                        .await
-                        .unwrap();
-                    assert!(lock_id >= 0);
-                    Ok(())
-                })
-            },
         )
+        .await
+        .expect("init websocket db");
+
+        lilium_database::transaction!(test_db.database(), |session| {
+            let lock_id = acquire_connection_lock(session, "user_test_acquire")
+                .await
+                .unwrap();
+            assert!(lock_id >= 0);
+            Ok(())
+        })
         .await
         .expect("test_acquire_connection_lock_creates_connection_record");
     }
 
     #[tokio::test]
     async fn test_release_connection_lock_deletes_record() {
-        lilium_test_fixtures::with_db_session(
+        let test_db = lilium_test_fixtures::TestDb::acquire(
             lilium_test_fixtures::FixtureProfile::WebsocketConnection,
-            |session| {
-                Box::pin(async move {
-                    let mut session = session;
-                    let lock_id = acquire_connection_lock(&mut session, "user_test_release")
-                        .await
-                        .unwrap();
-                    release_connection_lock(&mut session, lock_id)
-                        .await
-                        .unwrap();
-                    Ok(())
-                })
-            },
         )
+        .await
+        .expect("init websocket db");
+
+        lilium_database::transaction!(test_db.database(), |session| {
+            let lock_id = acquire_connection_lock(session, "user_test_release")
+                .await
+                .unwrap();
+            release_connection_lock(session, lock_id).await.unwrap();
+            Ok(())
+        })
         .await
         .expect("test_release_connection_lock_deletes_record");
     }
 
     #[tokio::test]
     async fn test_update_heartbeat_updates_timestamp() {
-        lilium_test_fixtures::with_db_session(
+        let test_db = lilium_test_fixtures::TestDb::acquire(
             lilium_test_fixtures::FixtureProfile::WebsocketConnection,
-            |session| {
-                Box::pin(async move {
-                    let mut session = session;
-                    let lock_id = acquire_connection_lock(&mut session, "user_test_heartbeat")
-                        .await
-                        .unwrap();
-                    update_heartbeat(&mut session, lock_id).await.unwrap();
-                    Ok(())
-                })
-            },
         )
+        .await
+        .expect("init websocket db");
+
+        lilium_database::transaction!(test_db.database(), |session| {
+            let lock_id = acquire_connection_lock(session, "user_test_heartbeat")
+                .await
+                .unwrap();
+            update_heartbeat(session, lock_id).await.unwrap();
+            Ok(())
+        })
         .await
         .expect("test_update_heartbeat_updates_timestamp");
     }
 
     #[tokio::test]
     async fn test_get_active_connections_returns_all_connections() {
-        lilium_test_fixtures::with_db_session(
+        let test_db = lilium_test_fixtures::TestDb::acquire(
             lilium_test_fixtures::FixtureProfile::WebsocketConnection,
-            |session| {
-                Box::pin(async move {
-                    let mut session = session;
-                    let lock1 = acquire_connection_lock(&mut session, "user_test_active1")
-                        .await
-                        .unwrap();
-                    let lock2 = acquire_connection_lock(&mut session, "user_test_active2")
-                        .await
-                        .unwrap();
-                    let connections = get_active_connections(&mut session, None).await.unwrap();
-                    assert!(connections.len() >= 2);
-                    let lock_ids: Vec<i64> = connections.iter().map(|c| c.lock_id).collect();
-                    assert!(lock_ids.contains(&lock1));
-                    assert!(lock_ids.contains(&lock2));
-                    Ok(())
-                })
-            },
         )
+        .await
+        .expect("init websocket db");
+
+        lilium_database::transaction!(test_db.database(), |session| {
+            let lock1 = acquire_connection_lock(session, "user_test_active1")
+                .await
+                .unwrap();
+            let lock2 = acquire_connection_lock(session, "user_test_active2")
+                .await
+                .unwrap();
+            let connections = get_active_connections(session, None).await.unwrap();
+            assert!(connections.len() >= 2);
+            let lock_ids: Vec<i64> = connections.iter().map(|c| c.lock_id).collect();
+            assert!(lock_ids.contains(&lock1));
+            assert!(lock_ids.contains(&lock2));
+            Ok(())
+        })
         .await
         .expect("test_get_active_connections_returns_all_connections");
     }
 
     #[tokio::test]
     async fn test_get_active_connections_filters_by_credential() {
-        lilium_test_fixtures::with_db_session(
+        let test_db = lilium_test_fixtures::TestDb::acquire(
             lilium_test_fixtures::FixtureProfile::WebsocketConnection,
-            |session| {
-                Box::pin(async move {
-                    let mut session = session;
-                    acquire_connection_lock(&mut session, "user_test_filter1")
-                        .await
-                        .unwrap();
-                    acquire_connection_lock(&mut session, "user_test_filter2")
-                        .await
-                        .unwrap();
-                    let connections =
-                        get_active_connections(&mut session, Some("user_test_filter1"))
-                            .await
-                            .unwrap();
-                    assert_eq!(connections.len(), 1);
-                    assert_eq!(connections[0].account_user_id, "user_test_filter1");
-                    Ok(())
-                })
-            },
         )
+        .await
+        .expect("init websocket db");
+
+        lilium_database::transaction!(test_db.database(), |session| {
+            acquire_connection_lock(session, "user_test_filter1")
+                .await
+                .unwrap();
+            acquire_connection_lock(session, "user_test_filter2")
+                .await
+                .unwrap();
+            let connections = get_active_connections(session, Some("user_test_filter1"))
+                .await
+                .unwrap();
+            assert_eq!(connections.len(), 1);
+            assert_eq!(connections[0].account_user_id, "user_test_filter1");
+            Ok(())
+        })
         .await
         .expect("test_get_active_connections_filters_by_credential");
     }
 
     #[tokio::test]
     async fn test_is_credential_in_use_returns_true_when_locked() {
-        lilium_test_fixtures::with_db_session(
+        let test_db = lilium_test_fixtures::TestDb::acquire(
             lilium_test_fixtures::FixtureProfile::WebsocketConnection,
-            |session| {
-                Box::pin(async move {
-                    let mut session = session;
-                    assert!(
-                        !is_credential_in_use(&mut session, "user_test_in_use")
-                            .await
-                            .unwrap()
-                    );
-                    acquire_connection_lock(&mut session, "user_test_in_use")
-                        .await
-                        .unwrap();
-                    assert!(
-                        is_credential_in_use(&mut session, "user_test_in_use")
-                            .await
-                            .unwrap()
-                    );
-                    Ok(())
-                })
-            },
         )
+        .await
+        .expect("init websocket db");
+
+        lilium_database::transaction!(test_db.database(), |session| {
+            assert!(
+                !is_credential_in_use(session, "user_test_in_use")
+                    .await
+                    .unwrap()
+            );
+            acquire_connection_lock(session, "user_test_in_use")
+                .await
+                .unwrap();
+            assert!(
+                is_credential_in_use(session, "user_test_in_use")
+                    .await
+                    .unwrap()
+            );
+            Ok(())
+        })
         .await
         .expect("test_is_credential_in_use_returns_true_when_locked");
     }
 
     #[tokio::test]
     async fn test_is_credential_in_use_returns_false_when_not_locked() {
-        lilium_test_fixtures::with_db_session(
+        let test_db = lilium_test_fixtures::TestDb::acquire(
             lilium_test_fixtures::FixtureProfile::WebsocketConnection,
-            |session| {
-                Box::pin(async move {
-                    let mut session = session;
-                    assert!(
-                        !is_credential_in_use(&mut session, "user_test_not_in_use")
-                            .await
-                            .unwrap()
-                    );
-                    Ok(())
-                })
-            },
         )
+        .await
+        .expect("init websocket db");
+
+        lilium_database::transaction!(test_db.database(), |session| {
+            assert!(
+                !is_credential_in_use(session, "user_test_not_in_use")
+                    .await
+                    .unwrap()
+            );
+            Ok(())
+        })
         .await
         .expect("test_is_credential_in_use_returns_false_when_not_locked");
     }
 
     #[tokio::test]
     async fn test_cleanup_stale_connections_removes_old_records() {
-        lilium_test_fixtures::with_db_session(
+        let test_db = lilium_test_fixtures::TestDb::acquire(
             lilium_test_fixtures::FixtureProfile::WebsocketConnection,
-            |session| {
-                Box::pin(async move {
-                    let mut session = session;
-                    let cleaned = cleanup_stale_connections(&mut session, 300).await.unwrap();
-                    assert!(cleaned >= 0);
-                    Ok(())
-                })
-            },
         )
+        .await
+        .expect("init websocket db");
+
+        lilium_database::transaction!(test_db.database(), |session| {
+            let cleaned = cleanup_stale_connections(session, 300).await.unwrap();
+            assert!(cleaned >= 0);
+            Ok(())
+        })
         .await
         .expect("test_cleanup_stale_connections_removes_old_records");
     }
 
     #[tokio::test]
     async fn test_cleanup_stale_connections_preserves_fresh_records() {
-        lilium_test_fixtures::with_db_session(
+        let test_db = lilium_test_fixtures::TestDb::acquire(
             lilium_test_fixtures::FixtureProfile::WebsocketConnection,
-            |session| {
-                Box::pin(async move {
-                    let mut session = session;
-                    let _lock_id = acquire_connection_lock(&mut session, "user_test_fresh")
-                        .await
-                        .unwrap();
-                    let cleaned = cleanup_stale_connections(&mut session, 60).await.unwrap();
-                    assert_eq!(cleaned, 0);
-                    Ok(())
-                })
-            },
         )
+        .await
+        .expect("init websocket db");
+
+        lilium_database::transaction!(test_db.database(), |session| {
+            let _lock_id = acquire_connection_lock(session, "user_test_fresh")
+                .await
+                .unwrap();
+            let cleaned = cleanup_stale_connections(session, 60).await.unwrap();
+            assert_eq!(cleaned, 0);
+            Ok(())
+        })
         .await
         .expect("test_cleanup_stale_connections_preserves_fresh_records");
     }
@@ -501,19 +498,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_acquire_cleans_up_stale_record() {
-        lilium_test_fixtures::with_db_session(
+        let test_db = lilium_test_fixtures::TestDb::acquire(
             lilium_test_fixtures::FixtureProfile::WebsocketConnection,
-            |session| {
-                Box::pin(async move {
-                    let mut session = session;
-                    let _lock_id = acquire_connection_lock(&mut session, "user_test_stale")
-                        .await
-                        .unwrap();
-                    assert!(_lock_id >= 0);
-                    Ok(())
-                })
-            },
         )
+        .await
+        .expect("init websocket db");
+
+        lilium_database::transaction!(test_db.database(), |session| {
+            let _lock_id = acquire_connection_lock(session, "user_test_stale")
+                .await
+                .unwrap();
+            assert!(_lock_id >= 0);
+            Ok(())
+        })
         .await
         .expect("test_acquire_cleans_up_stale_record");
     }
