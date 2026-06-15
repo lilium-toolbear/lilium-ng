@@ -20,5 +20,16 @@
       "suggestion": 0
     },
     "scope": "all Rust source files"
+  },
+  {
+    "date": "2026-06-15",
+    "mode": "PR Review",
+    "score": 95,
+    "findings": {
+      "critical": 0,
+      "warning": 1,
+      "suggestion": 0
+    },
+    "scope": "database-layer refactor branch changes vs refactor plan"
   }
 ]
