@@ -82,11 +82,11 @@ The fixture pool leases one database per active test unit, resets and seeds
 before handing out a lease, returns the lease synchronously on drop, and resets
 again on the next acquire.
 
-## Current Compatibility Boundary
+## Current Boundary
 
-`lilium-database::pool::DbPool` remains as low-level infrastructure used by
-`Database` and `lilium-test-fixtures`. It is not re-exported from the
-`lilium_database` root and is not used by production binaries or services.
+`DbPool` remains private low-level infrastructure inside `lilium-database`.
+Production binaries, services, and test fixtures use `Database`, `DbSession`,
+`RawDbConnection`, and `TestDb`.
 
 `DbSessionContext`, callback session helpers, lazy/env pool constructors, and
 `queries` have been removed.

@@ -30,8 +30,8 @@ fixtures, and stateless service functions.
 - Migrated service and event-processor database tests off callback fixtures.
 - Removed callback helpers `with_db_session` and `with_db_session_and_pool`.
 - Removed `DbSessionContext`, context session helpers, boxed helper shims, and unused lazy/env pool constructors.
-- Removed the root `lilium_database::DbPool` re-export. Low-level `pool::DbPool`
-  remains for `Database` internals and test-fixture infrastructure.
+- Removed `DbPool` from the public API. It remains private infrastructure inside
+  `lilium-database`.
 
 ## Verified
 
@@ -57,5 +57,5 @@ rg -n "DbSessionContext|with_db_session|with_db_session_and_pool|with_session_co
   mechanically rewritten to SeaORM entities in this implementation pass.
 - Raw SQL remains in services where it owns PostgreSQL-specific behavior or
   where ORM migration is still pending.
-- `pool::DbPool` is low-level infrastructure, not the production application
+- `DbPool` is private low-level infrastructure, not the production application
   entry point.
