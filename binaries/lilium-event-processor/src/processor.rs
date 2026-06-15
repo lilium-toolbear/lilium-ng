@@ -1,16 +1,16 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 #[cfg(not(test))]
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::sync::Arc;
 use tokio::sync::Notify;
-use tokio::time::{sleep, Duration, Instant};
+use tokio::time::{Duration, Instant, sleep};
 use tracing::{error, info, warn};
 
 #[cfg(not(test))]
 use lilium_common::LiliumError;
-use lilium_database::{DbPool, DbSessionContext};
+use lilium_database::{Database, DbSessionContext};
 use lilium_models::ingestion::WebSocketEvent;
 #[cfg(not(test))]
 use lilium_services::account_service::AccountService;
@@ -22,7 +22,7 @@ use lilium_services::user::UserService;
 
 pub struct EventProcessor {
     processor_id: String,
-    pool: DbPool,
+    database: Database,
     batch_size: usize,
     polling_interval: Duration,
     max_retries: u32,
@@ -35,14 +35,14 @@ pub struct EventProcessor {
 
 impl EventProcessor {
     pub fn new(
-        pool: DbPool,
+        database: Database,
         processor_id: String,
         batch_size: usize,
         polling_interval_secs: u64,
     ) -> Self {
         Self {
             processor_id,
-            pool,
+            database,
             batch_size,
             polling_interval: Duration::from_secs(polling_interval_secs),
             max_retries: 3,
@@ -114,14 +114,11 @@ impl EventProcessor {
     async fn fetch_batch(&self) -> Result<(Vec<WebSocketEvent>, i64, Option<DateTime<Utc>>)> {
         let processor_id = self.processor_id.clone();
         let batch_size = self.batch_size as i64;
-        self.pool
-            .with_session_context(|session| {
-                Box::pin(async move {
-                    let mut session = session;
-                    Self::fetch_batch_inner(&mut session, processor_id, batch_size).await
-                })
-            })
-            .await
+        lilium_database::transaction!(self.database, |session| {
+            let mut session = DbSessionContext::new(session);
+            Self::fetch_batch_inner(&mut session, processor_id, batch_size).await
+        })
+        .await
     }
 
     async fn process_batch_with_retry(
@@ -222,22 +219,19 @@ impl EventProcessor {
         start_cursor_timestamp: Option<DateTime<Utc>>,
     ) -> Result<()> {
         let processor_id = self.processor_id.clone();
-        self.pool
-            .with_session_context(|session| {
-                let events = events.to_vec();
-                Box::pin(async move {
-                    let mut session = session;
-                    Self::process_batch_inner(
-                        &mut session,
-                        events,
-                        processor_id,
-                        start_cursor_id,
-                        start_cursor_timestamp,
-                    )
-                    .await
-                })
-            })
+        let events = events.to_vec();
+        lilium_database::transaction!(self.database, |session| {
+            let mut session = DbSessionContext::new(session);
+            Self::process_batch_inner(
+                &mut session,
+                events,
+                processor_id,
+                start_cursor_id,
+                start_cursor_timestamp,
+            )
             .await
+        })
+        .await
     }
 
     async fn skip_batch(
@@ -255,15 +249,11 @@ impl EventProcessor {
         let last_timestamp = batch_last_timestamp.or(cursor_timestamp);
 
         let processor_id = self.processor_id.clone();
-        self.pool
-            .with_session_context(|session| {
-                Box::pin(async move {
-                    let mut session = session;
-                    Self::skip_batch_inner(&mut session, processor_id, last_id, last_timestamp)
-                        .await
-                })
-            })
-            .await
+        lilium_database::transaction!(self.database, |session| {
+            let mut session = DbSessionContext::new(session);
+            Self::skip_batch_inner(&mut session, processor_id, last_id, last_timestamp).await
+        })
+        .await
     }
 
     async fn fetch_batch_inner(
@@ -642,7 +632,7 @@ mod tests {
     use lilium_models::dzmm::room_member::RoomMember;
     use lilium_services::event::EventProcessorOffsetService;
     use lilium_services::message::MessageService;
-    use lilium_test_fixtures::{with_db_session, FixtureProfile};
+    use lilium_test_fixtures::{FixtureProfile, TestDb, with_db_session};
     use sqlx::query_as;
 
     fn utc(ts: &str) -> DateTime<Utc> {
@@ -860,23 +850,16 @@ mod tests {
 
     #[tokio::test]
     async fn batch_retry_falls_back_to_per_event_processing() {
-        let pool = lilium_test_fixtures::connect_test_database().await;
-        pool.with_session_context(|session| {
-            Box::pin(async move {
-                let mut session = session;
-                lilium_test_fixtures::prepare_database(
-                    &mut session,
-                    lilium_test_fixtures::FixtureProfile::Event,
-                )
-                .await?;
-                Ok(())
-            })
-        })
-        .await
-        .expect("init event db");
+        let test_db = TestDb::acquire(FixtureProfile::Event)
+            .await
+            .expect("init event db");
 
-        let mut processor =
-            EventProcessor::new(pool.inner().clone(), "test_processor".to_string(), 10, 60);
+        let mut processor = EventProcessor::new(
+            test_db.database().clone(),
+            "test_processor".to_string(),
+            10,
+            60,
+        );
         processor.max_retries = 0;
 
         let events = vec![
@@ -901,10 +884,12 @@ mod tests {
             .await
             .expect("fallback processing");
 
-        let offset = pool
-            .with_session_context(|session| {
+        let offset = test_db
+            .database()
+            .transaction(|session| {
                 Box::pin(async move {
-                    let mut offset_service = EventProcessorOffsetService::new(session);
+                    let mut offset_service =
+                        EventProcessorOffsetService::new(DbSessionContext::new(session));
                     offset_service
                         .get_offset("test_processor")
                         .await

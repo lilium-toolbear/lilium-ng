@@ -1,9 +1,9 @@
 use anyhow::Result;
 use lilium_api_client::websocket::WsClient;
-use lilium_database::DbPool;
+use lilium_database::{Database, DbSessionContext};
 use lilium_services::account_service::AccountService;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
 use tracing::{error, info, warn};
 
@@ -11,7 +11,7 @@ use crate::ingestion::{DiskSpillBuffer, EventIngestor, EventWriter};
 
 pub struct Worker {
     account_id: String,
-    pool: DbPool,
+    database: Database,
     queue_size: usize,
     batch_size: usize,
     buffer_dir: std::path::PathBuf,
@@ -22,7 +22,7 @@ pub struct Worker {
 impl Worker {
     pub fn new(
         account_id: String,
-        pool: DbPool,
+        database: Database,
         queue_size: usize,
         batch_size: usize,
         buffer_dir: std::path::PathBuf,
@@ -31,7 +31,7 @@ impl Worker {
     ) -> Self {
         Self {
             account_id,
-            pool,
+            database,
             queue_size,
             batch_size,
             buffer_dir,
@@ -54,14 +54,14 @@ impl Worker {
         let ingestor = Arc::new(ingestor);
 
         // Create event writer
-        let writer = EventWriter::new(self.pool.clone(), ingestor.clone(), rx, self.batch_size);
+        let writer = EventWriter::new(self.database.clone(), ingestor.clone(), rx, self.batch_size);
 
         let stop_event = Arc::new(AtomicBool::new(false));
         let writer_stop = stop_event.clone();
         let writer_fut = writer.run(&writer_stop);
 
         let ws_account = self.account_id.clone();
-        let ws_pool = self.pool.clone();
+        let ws_database = self.database.clone();
         let ws_ingestor = ingestor.clone();
         let ws_url = self.websocket_url.clone();
         let ws_shutdown = shutdown.clone();
@@ -69,7 +69,7 @@ impl Worker {
         let ws_delay = self.reconnect_delay_ms;
         let ws_fut = Self::run_websocket(
             ws_account,
-            ws_pool,
+            ws_database,
             ws_url,
             ws_delay,
             ws_ingestor,
@@ -100,21 +100,20 @@ impl Worker {
         Ok(())
     }
 
-    async fn load_cookie_header(pool: &DbPool, account_id: &str) -> Result<Option<String>> {
-        pool.with_session_context(|session| {
-            let account_id = account_id.to_string();
-            Box::pin(async move {
-                let mut svc = AccountService::new(session);
-                let account = svc.get_account(&account_id).await?;
-                Ok(account.and_then(|a| a.cookies))
-            })
+    async fn load_cookie_header(database: &Database, account_id: &str) -> Result<Option<String>> {
+        let account_id = account_id.to_string();
+        lilium_database::transaction!(database, |session| {
+            let session = DbSessionContext::new(session);
+            let mut svc = AccountService::new(session);
+            let account = svc.get_account(&account_id).await?;
+            Ok(account.and_then(|a| a.cookies))
         })
         .await
     }
 
     async fn run_websocket(
         account_id: String,
-        pool: DbPool,
+        database: Database,
         websocket_url: String,
         reconnect_delay_ms: u64,
         ingestor: Arc<EventIngestor>,
@@ -122,7 +121,7 @@ impl Worker {
         shutdown: Arc<Notify>,
     ) -> Result<()> {
         info!(account = %account_id, "WebSocket connection starting");
-        let cookie_header = Self::load_cookie_header(&pool, &account_id).await?;
+        let cookie_header = Self::load_cookie_header(&database, &account_id).await?;
 
         loop {
             if stop_event.load(Ordering::Relaxed) {

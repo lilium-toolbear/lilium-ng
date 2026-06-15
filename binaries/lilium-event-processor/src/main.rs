@@ -22,10 +22,9 @@ async fn main() -> Result<()> {
 
     // Create database runtime - do NOT run migrations
     let db = Database::create(config.database.clone().into()).await?;
-    let pool = db.raw_pool().clone();
 
     let processor = processor::EventProcessor::new(
-        pool,
+        db,
         "event_processor_main".to_string(),
         config.processor.batch_size,
         config.processor.polling_interval_secs,
