@@ -158,83 +158,92 @@ mod tests {
                 .as_nanos()
         );
 
-        {
-            let mut conn = db.raw_connection().await.unwrap();
-            sqlx::query(&format!(
-                "CREATE TABLE {table_name} (id BIGINT PRIMARY KEY, note TEXT NOT NULL)"
-            ))
-            .execute(conn.as_mut())
-            .await
-            .unwrap();
-            sqlx::query(&format!(
-                "INSERT INTO {table_name} (id, note) VALUES (1, 'raw connection row')"
-            ))
-            .execute(conn.as_mut())
-            .await
-            .unwrap();
-            let raw_count: i64 = sqlx::query_scalar(&format!(
-                "SELECT COUNT(*) FROM {table_name}"
-            ))
-            .fetch_one(conn.as_mut())
-            .await
-            .unwrap();
-            assert_eq!(raw_count, 1);
-        }
+        async fn run_transaction_api_scenario(db: &Database, table_name: &str) -> anyhow::Result<()> {
+            {
+                let mut conn = db.raw_connection().await?;
+                sqlx::query(&format!(
+                    "CREATE TABLE {table_name} (id BIGINT PRIMARY KEY, note TEXT NOT NULL)"
+                ))
+                .execute(conn.as_mut())
+                .await?;
+                sqlx::query(&format!(
+                    "INSERT INTO {table_name} (id, note) VALUES (1, 'raw connection row')"
+                ))
+                .execute(conn.as_mut())
+                .await?;
+                let raw_count: i64 = sqlx::query_scalar(&format!(
+                    "SELECT COUNT(*) FROM {table_name}"
+                ))
+                .fetch_one(conn.as_mut())
+                .await?;
+                anyhow::ensure!(raw_count == 1, "raw connection did not observe its own insert");
+            }
 
-        let committed_table_name = table_name.clone();
-        lilium_database::transaction!(db, |session| {
-            sqlx::query(&format!(
-                "INSERT INTO {committed_table_name} (id, note) VALUES (2, 'committed row')"
-            ))
-            .execute(session.as_mut())
-            .await
-            .unwrap();
-            Ok(())
-        })
-        .await
-        .unwrap();
-
-        {
-            let mut conn = db.raw_connection().await.unwrap();
-            let committed_count: i64 = sqlx::query_scalar(&format!(
-                "SELECT COUNT(*) FROM {table_name}"
-            ))
-            .fetch_one(conn.as_mut())
-            .await
-            .unwrap();
-            assert_eq!(committed_count, 2);
-        }
-
-        let rollback_table_name = table_name.clone();
-        let rollback_result: anyhow::Result<()> = db
-            .transaction(|session| {
-                Box::pin(async move {
-                    sqlx::query(&format!(
-                        "INSERT INTO {rollback_table_name} (id, note) VALUES (3, 'rollback row')"
-                    ))
-                    .execute(session.as_mut())
-                    .await
-                    .unwrap();
-                    Err(anyhow::anyhow!("force rollback"))
-                })
+            let committed_table_name = table_name.to_owned();
+            lilium_database::transaction!(db, |session| {
+                sqlx::query(&format!(
+                    "INSERT INTO {committed_table_name} (id, note) VALUES (2, 'committed row')"
+                ))
+                .execute(session.as_mut())
+                .await?;
+                Ok(())
             })
-            .await;
-        assert!(rollback_result.is_err());
+            .await?;
+
+            {
+                let mut conn = db.raw_connection().await?;
+                let committed_count: i64 = sqlx::query_scalar(&format!(
+                    "SELECT COUNT(*) FROM {table_name}"
+                ))
+                .fetch_one(conn.as_mut())
+                .await?;
+                anyhow::ensure!(
+                    committed_count == 2,
+                    "committed transaction row was not visible through raw SQL"
+                );
+            }
+
+            let rollback_table_name = table_name.to_owned();
+            let rollback_result: anyhow::Result<()> = db
+                .transaction(|session| {
+                    Box::pin(async move {
+                        sqlx::query(&format!(
+                            "INSERT INTO {rollback_table_name} (id, note) VALUES (3, 'rollback row')"
+                        ))
+                        .execute(session.as_mut())
+                        .await?;
+                        Err(anyhow::anyhow!("force rollback"))
+                    })
+                })
+                .await;
+            anyhow::ensure!(rollback_result.is_err(), "rollback transaction unexpectedly succeeded");
+
+            {
+                let mut conn = db.raw_connection().await?;
+                let visible_count: i64 = sqlx::query_scalar(&format!(
+                    "SELECT COUNT(*) FROM {table_name}"
+                ))
+                .fetch_one(conn.as_mut())
+                .await?;
+                anyhow::ensure!(
+                    visible_count == 2,
+                    "rolled back row became visible through raw SQL"
+                );
+            }
+
+            Ok(())
+        }
+
+        let result = run_transaction_api_scenario(&db, &table_name).await;
 
         {
             let mut conn = db.raw_connection().await.unwrap();
-            let visible_count: i64 = sqlx::query_scalar(&format!(
-                "SELECT COUNT(*) FROM {table_name}"
-            ))
-            .fetch_one(conn.as_mut())
-            .await
-            .unwrap();
-            assert_eq!(visible_count, 2);
-
-            sqlx::query(&format!("DROP TABLE {table_name}"))
+            sqlx::query(&format!("DROP TABLE IF EXISTS {table_name}"))
                 .execute(conn.as_mut())
                 .await
                 .unwrap();
         }
+
+        result.unwrap();
     }
 }
