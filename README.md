@@ -1,33 +1,31 @@
 # Lilium NG
 
-DZMM.ai 监控和归档系统的 Rust 重写版本。
+DZMM/Lilium 后端的 Rust 重写版本。
 
 ## 目标
 
-用 Rust 重写整个 DZMM 系统，同时偿还技术债：
+用 Rust 重写核心摄入和事件处理链路，同时偿还技术债：
 
-- 内存降低 10-20x
 - tokio 多线程真正并行处理
 - 类型安全贯穿全栈
 - 模块边界清晰，无循环依赖
-- 核心逻辑纯函数化
+- 数据库、服务层、外部 API 边界显式
 
 ## 架构
 
-```
+```text
 crates/
-├── lilium-common/       # 共享工具、错误类型、常量
-├── lilium-models/       # 数据模型
-├── lilium-database/     # 数据库层
-├── lilium-api-client/   # API 客户端
-├── lilium-core/         # 纯业务逻辑
-└── lilium-services/     # 服务层
+├── lilium-common/        # 共享工具、错误类型、常量
+├── lilium-models/        # 数据模型
+├── lilium-database/      # Database runtime、ORM entities、raw SQL session
+├── lilium-test-fixtures/ # 测试数据库租约、reset、seed profiles
+├── lilium-api-client/    # DZMM HTTP 和 Socket.IO 客户端
+├── lilium-core/          # 纯业务逻辑
+└── lilium-services/      # 服务层编排
 
 binaries/
-├── lilium-spider/       # WebSocket 摄入服务
-├── lilium-bot/          # 聊天机器人
-├── lilium-web/          # Web UI 后端
-└── lilium-cli/          # 命令行工具
+├── lilium-spider/          # WebSocket 摄入服务
+└── lilium-event-processor/ # WebSocket 事件处理服务
 ```
 
 ## 技术栈
@@ -35,13 +33,12 @@ binaries/
 | 用途 | 选择 |
 |------|------|
 | 异步运行时 | tokio |
-| 数据库 | sqlx (PostgreSQL) |
-| WebSocket | tungstenite |
+| 数据库 | SQLx + SeaORM (PostgreSQL) |
+| WebSocket | rust_socketio fork |
 | HTTP | reqwest |
-| Web | axum |
 | 序列化 | serde + serde_json |
 | 配置 | dotenvy + 环境变量 |
-| 日志 | tracing |
+| 可观测性 | tracing + Sentry |
 | CLI | clap |
 
 ## 开发
@@ -56,14 +53,6 @@ cargo test
 # 运行 spider
 cargo run --bin lilium-spider
 
-# 运行 bot
-cargo run --bin lilium-bot
+# 运行事件处理器
+cargo run --bin lilium-event-processor
 ```
-
-## 文档
-
-- [交接文档](docs/HANDOFF.md)
-- [测试迁移目标](docs/TEST_MIGRATION_GOAL.md)
-- [Rust 代码审计最新状态](docs/rust-code-audit.md)
-- [Python 入口点 parity 审计](docs/python-parity-entrypoint-audit.md)
-- [Python 代码库逐文件分析](docs/python-analysis/README.md)

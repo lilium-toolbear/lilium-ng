@@ -5,12 +5,13 @@ This repository is a Rust workspace for the Lilium NG rewrite. Core code lives u
 
 - `crates/lilium-common`: shared utilities, constants, and error types
 - `crates/lilium-models`: data models and row mappings
-- `crates/lilium-database`: pool/session management and SQL helpers
+- `crates/lilium-database`: Database runtime, SeaORM entities, and raw SQL sessions
 - `crates/lilium-test-fixtures`: test-only database leasing, reset, and fixture profiles
 - `crates/lilium-core`: pure business logic
 - `crates/lilium-services`: service-layer orchestration
 - `binaries/lilium-spider` and `binaries/lilium-event-processor`: executable entry points
-- `docs/`: parity audits, migration notes, and handoff documents
+- `docs/database-layer-plan.md`: current database layer architecture spec
+- `docs/python-to-rust-migration-sop.md`: required Python-to-Rust parity workflow
 
 Keep tests close to the code they verify. Use `crates/lilium-test-fixtures` for DB-backed integration tests.
 
