@@ -170,9 +170,7 @@ impl TestDatabasePool {
         let options = build_test_database_options(&database_url)?;
         let pool = DbPool::connect_with_options(options, 1).await?;
 
-        pool.with_session_context(|mut session| {
-            Box::pin(async move { reset_database(&mut session).await })
-        })
+        pool.with_session(|session| Box::pin(async move { reset_database(session).await }))
         .await
     }
 }
