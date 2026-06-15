@@ -433,9 +433,9 @@ impl EventProcessor {
             return Ok(());
         }
 
-        let mut media_service = MediaService::new(DbSessionContext::new(session));
+        let media_service = MediaService::new();
         media_service
-            .download_media_batch(media_message_ids)
+            .download_media_batch(session, media_message_ids)
             .await
             .map(|_| ())
     }

@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
-use lilium_database::DbSessionContext;
+use lilium_database::DbSession;
 use reqwest::{
     header::{CONTENT_TYPE, LOCATION},
     redirect::Policy,
@@ -25,22 +25,19 @@ use tracing::{info, warn};
 /// Limitation: the Python pipeline also performs GPS extraction and audio
 /// duration metadata enrichment. That requires other crates and is not part of
 /// this service yet.
-pub struct MediaService<'a> {
-    session: DbSessionContext<'a>,
+pub struct MediaService {
     data_path: PathBuf,
     client: Client,
 }
 
-impl<'a> MediaService<'a> {
-    #[instrument(skip(session))]
-    pub fn new(session: DbSessionContext<'a>) -> Self {
-        Self::with_data_path(session, PathBuf::from("./data"))
+impl MediaService {
+    pub fn new() -> Self {
+        Self::with_data_path(PathBuf::from("./data"))
     }
 
-    #[instrument(skip(session), fields(data_path = %data_path.display()))]
-    pub fn with_data_path(session: DbSessionContext<'a>, data_path: PathBuf) -> Self {
+    #[instrument(fields(data_path = %data_path.display()))]
+    pub fn with_data_path(data_path: PathBuf) -> Self {
         Self {
-            session,
             data_path,
             client: build_http_client(),
         }
@@ -50,8 +47,12 @@ impl<'a> MediaService<'a> {
     ///
     /// The result paths are stored relative to `data_path`, which matches the
     /// Python contract more closely than the old absolute-path behavior.
-    #[instrument(skip(self, message_ids), fields(message_count = message_ids.len()))]
-    pub async fn download_media_batch(&mut self, message_ids: &[String]) -> Result<(i64, i64)> {
+    #[instrument(skip(self, session, message_ids), fields(message_count = message_ids.len()))]
+    pub async fn download_media_batch(
+        &self,
+        session: &mut DbSession,
+        message_ids: &[String],
+    ) -> Result<(i64, i64)> {
         if message_ids.is_empty() {
             return Ok((0, 0));
         }
@@ -72,7 +73,7 @@ impl<'a> MediaService<'a> {
                FROM messages WHERE message_id = ANY($1)"#,
         )
         .bind(message_ids)
-        .fetch_all(self.session.as_mut())
+        .fetch_all(session.as_mut())
         .await?;
 
         let mut to_download: Vec<(String, DateTime<Utc>, String, String)> = Vec::new();
@@ -142,7 +143,7 @@ impl<'a> MediaService<'a> {
             match sqlx::query("UPDATE messages SET attachment_file = $1 WHERE message_id = $2")
                 .bind(&file_path)
                 .bind(&message_id)
-                .execute(self.session.as_mut())
+                .execute(session.as_mut())
                 .await
             {
                 Ok(_) => {
