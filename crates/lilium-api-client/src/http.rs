@@ -4,31 +4,40 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use crate::config::{ApiClientConfig, dzmm_local_address_from_env};
+use anyhow::{Context, Result, bail};
+use base64::Engine;
 use rand::RngExt;
 use reqwest::{
-    header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE, COOKIE, ORIGIN, REFERER, SET_COOKIE},
-    multipart::{Form, Part},
     Client, Method, StatusCode,
+    header::{ACCEPT, CONTENT_TYPE, COOKIE, HeaderMap, HeaderValue, ORIGIN, REFERER, SET_COOKIE},
+    multipart::{Form, Part},
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tracing::instrument;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
-const BASE_URL: &str = "https://www.dzmm.ai";
-
 const DZMM_HEADERS: &[(&str, &str)] = &[
-    ("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"),
+    (
+        "User-Agent",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+    ),
     ("Accept-Language", "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7"),
     ("Accept-Encoding", "gzip, deflate"),
     ("Cache-Control", "no-cache"),
     ("Pragma", "no-cache"),
-    ("Sec-Ch-Ua", "\"Chromium\";v=\"148\", \"Brave\";v=\"148\", \"Not/A)Brand\";v=\"99\""),
+    (
+        "Sec-Ch-Ua",
+        "\"Chromium\";v=\"148\", \"Brave\";v=\"148\", \"Not/A)Brand\";v=\"99\"",
+    ),
     ("Sec-Ch-Ua-Arch", "\"arm\""),
     ("Sec-Ch-Ua-Bitness", "\"64\""),
-    ("Sec-Ch-Ua-Full-Version-List", "\"Chromium\";v=\"148.0.0.0\", \"Brave\";v=\"148.0.0.0\", \"Not/A)Brand\";v=\"99.0.0.0\""),
+    (
+        "Sec-Ch-Ua-Full-Version-List",
+        "\"Chromium\";v=\"148.0.0.0\", \"Brave\";v=\"148.0.0.0\", \"Not/A)Brand\";v=\"99.0.0.0\"",
+    ),
     ("Sec-Ch-Ua-Mobile", "?0"),
     ("Sec-Ch-Ua-Model", "\"\""),
     ("Sec-Ch-Ua-Platform", "\"macOS\""),
@@ -47,6 +56,15 @@ fn generate_string(length: usize) -> String {
             GENERATE_STRING_CHARSET[idx] as char
         })
         .collect()
+}
+
+fn normalize_base_url(base_url: &str) -> Result<String> {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        bail!("API base_url must not be empty");
+    }
+    Url::parse(trimmed).context("Invalid API base_url")?;
+    Ok(trimmed.to_string())
 }
 
 fn is_trpc_business_forbidden(body_text: &str) -> bool {
@@ -474,6 +492,7 @@ type CookieRefreshCallback =
 
 pub struct DzmmApi {
     client: Client,
+    base_url: String,
     email: Option<String>,
     password: Option<String>,
     signin_code: Option<String>,
@@ -511,6 +530,44 @@ impl DzmmApi {
         auto_refresh: bool,
         on_cookies_refreshed: Option<CookieRefreshCallback>,
     ) -> Result<Self> {
+        Self::new_with_config(
+            ApiClientConfig::default(),
+            email,
+            password,
+            signin_code,
+            signin_code_image,
+            signin_code_image_mime,
+            cookies,
+            user_id,
+            auto_refresh,
+            on_cookies_refreshed,
+        )
+    }
+
+    #[instrument(
+        skip(
+            email,
+            password,
+            signin_code,
+            signin_code_image,
+            signin_code_image_mime,
+            cookies,
+            on_cookies_refreshed
+        ),
+        fields(user_id = ?user_id.as_deref(), auto_refresh, base_url = %config.base_url)
+    )]
+    pub fn new_with_config(
+        config: ApiClientConfig,
+        email: Option<String>,
+        password: Option<String>,
+        signin_code: Option<String>,
+        signin_code_image: Option<Vec<u8>>,
+        signin_code_image_mime: Option<String>,
+        cookies: Option<String>,
+        user_id: Option<String>,
+        auto_refresh: bool,
+        on_cookies_refreshed: Option<CookieRefreshCallback>,
+    ) -> Result<Self> {
         let cookie_map = if let Some(ref c) = cookies {
             let map: HashMap<String, String> = c
                 .split(';')
@@ -528,14 +585,19 @@ impl DzmmApi {
             HashMap::new()
         };
 
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .cookie_store(true)
+        let mut client_builder = Client::builder()
+            .timeout(Duration::from_secs(config.request_timeout_secs))
+            .cookie_store(true);
+        if let Some(local_address) = dzmm_local_address_from_env()? {
+            client_builder = client_builder.local_address(local_address);
+        }
+        let client = client_builder
             .build()
             .context("Failed to build HTTP client")?;
 
         Ok(Self {
             client,
+            base_url: normalize_base_url(&config.base_url)?,
             email,
             password,
             signin_code,
@@ -548,6 +610,10 @@ impl DzmmApi {
             refresh_lock: Arc::new(Mutex::new(())),
             cookie_map: Arc::new(Mutex::new(cookie_map)),
         })
+    }
+
+    fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     #[instrument(skip(self))]
@@ -591,7 +657,7 @@ impl DzmmApi {
         let _guard = self.refresh_lock.lock().await;
         info!("Refreshing authentication cookies...");
 
-        let token_url = format!("{}/api/auth/token", BASE_URL);
+        let token_url = format!("{}/api/auth/token", self.base_url());
         match self
             .client
             .get(&token_url)
@@ -655,7 +721,7 @@ impl DzmmApi {
 
         self.clear_cookies().await;
 
-        let sign_in_url = format!("{}/api/auth/sign-in", BASE_URL);
+        let sign_in_url = format!("{}/api/auth/sign-in", self.base_url());
         let body = json!({"email": email, "password": password});
 
         let sign_in_response = self
@@ -677,7 +743,7 @@ impl DzmmApi {
 
         info!("Sign-in successful");
 
-        let token_url = format!("{}/api/auth/token", BASE_URL);
+        let token_url = format!("{}/api/auth/token", self.base_url());
         let token_response = self
             .client
             .get(&token_url)
@@ -716,7 +782,11 @@ impl DzmmApi {
 
         self.clear_cookies().await;
 
-        let url = format!("{}/api/auth/sign-in-code/{}", BASE_URL, encrypted_token);
+        let url = format!(
+            "{}/api/auth/sign-in-code/{}",
+            self.base_url(),
+            encrypted_token
+        );
         let response = self
             .client
             .get(&url)
@@ -772,7 +842,7 @@ impl DzmmApi {
             .context("Failed to build multipart part")?;
         let form = Form::new().part("image", part);
 
-        let url = format!("{}/api/auth/sign-in-code/scan", BASE_URL);
+        let url = format!("{}/api/auth/sign-in-code/scan", self.base_url());
         let response = self
             .client
             .post(&url)
@@ -827,9 +897,9 @@ impl DzmmApi {
         headers.insert("Sec-Fetch-Dest", HeaderValue::from_static("empty"));
         headers.insert("Sec-Fetch-Mode", HeaderValue::from_static("cors"));
         headers.insert("Sec-Fetch-Site", HeaderValue::from_static("same-origin"));
-        headers.insert(ORIGIN, HeaderValue::from_static(BASE_URL));
+        headers.insert(ORIGIN, HeaderValue::from_str(self.base_url()).unwrap());
 
-        let referer = format!("{}/chat", BASE_URL);
+        let referer = format!("{}/chat", self.base_url());
         headers.insert(REFERER, HeaderValue::from_str(&referer).unwrap());
 
         if let Some(extra) = extra_headers {
@@ -872,7 +942,7 @@ impl DzmmApi {
         extra_headers: Option<&[(&str, &str)]>,
         timeout: Option<Duration>,
     ) -> Result<(StatusCode, Vec<u8>, HeaderMap)> {
-        let mut url = Url::parse(&format!("{}{}", BASE_URL, endpoint))?;
+        let mut url = Url::parse(&format!("{}{}", self.base_url(), endpoint))?;
         if let Some(q) = query {
             url.query_pairs_mut().extend_pairs(q.iter());
         }
@@ -1367,7 +1437,7 @@ impl DzmmApi {
             .context("Failed to build multipart part")?;
         let form = Form::new().part("file".to_string(), part);
 
-        let url = format!("{}/api/group-chat/{}/avatar", BASE_URL, chatroom_id);
+        let url = format!("{}/api/group-chat/{}/avatar", self.base_url(), chatroom_id);
         let response = self
             .client
             .put(&url)
@@ -2036,7 +2106,7 @@ impl DzmmApi {
     ) -> Result<String> {
         let tag_ids = tag_ids.unwrap_or(&[]);
         let dimension = dimension.unwrap_or("3:2");
-        let model = model.unwrap_or("vivid");
+        let model = model.unwrap_or("iroha");
         let negative_prompt = negative_prompt.unwrap_or(
             "low quality, blurry, deformed, text, signature, watermark, multiple limbs, extra fingers, ugly",
         );
@@ -2048,13 +2118,11 @@ impl DzmmApi {
         }
 
         let payload = json!({
-            "json": {
-                "prompt": cleaned_prompt,
-                "tagIds": tag_ids,
-                "dimension": dimension,
-                "negativePrompt": negative_prompt,
-                "model": model,
-            }
+            "prompt": cleaned_prompt,
+            "tagIds": tag_ids,
+            "dimension": dimension,
+            "negativePrompt": negative_prompt,
+            "model": model,
         });
 
         info!(
@@ -2067,7 +2135,7 @@ impl DzmmApi {
         let response = self
             ._request(
                 Method::POST,
-                "/api/trpc/draw.image.generate",
+                "/api/gamefy/draw",
                 None,
                 Some(&payload),
                 None,
@@ -2076,21 +2144,9 @@ impl DzmmApi {
             )
             .await?;
 
-        let data = if let Some(obj) = response.as_object() {
-            obj.get("result")
-                .and_then(|r| r.get("data"))
-                .and_then(|d| d.get("json"))
-                .cloned()
-                .unwrap_or(response)
-        } else {
-            response
-        };
+        let data = response;
 
-        if !data
-            .get("success")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
+        if data.get("success").and_then(|v| v.as_bool()) == Some(false) {
             bail!("Image generation failed: {}", data);
         }
 
@@ -2109,14 +2165,11 @@ impl DzmmApi {
     }
 
     pub async fn poll_generation_task(&self, task_id: &str) -> Result<Value> {
-        let input_param = serde_json::to_string(&json!({"json": {"taskId": task_id}}))?;
-        let encoded = urlencoding(&input_param);
-
         let response = self
             ._request(
                 Method::GET,
-                &format!("/api/trpc/draw.image.taskStatus?input={}", encoded),
-                None,
+                "/api/gamefy/draw/status",
+                Some(&[("taskId", task_id)]),
                 None,
                 None,
                 None,
@@ -2124,15 +2177,21 @@ impl DzmmApi {
             )
             .await?;
 
-        let data = if let Some(obj) = response.as_object() {
-            obj.get("result")
-                .and_then(|r| r.get("data"))
-                .and_then(|d| d.get("json"))
-                .cloned()
-                .unwrap_or(response)
+        let mut data = if let Some(task) = response.get("task").filter(|v| v.is_object()) {
+            task.clone()
         } else {
             response
         };
+
+        if let Some(obj) = data.as_object_mut() {
+            let fallback_task_id = obj
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(task_id)
+                .to_string();
+            obj.entry("taskId".to_string())
+                .or_insert_with(|| Value::String(fallback_task_id));
+        }
 
         let status = data
             .get("status")
@@ -2149,7 +2208,7 @@ impl DzmmApi {
         negative_prompt: Option<&str>,
         model: Option<&str>,
     ) -> Result<(Option<Vec<u8>>, Option<String>)> {
-        let model = model.unwrap_or("vivid");
+        let model = model.unwrap_or("iroha");
 
         let task_id = self
             .start_image_generation(
@@ -2189,7 +2248,7 @@ impl DzmmApi {
                 }
 
                 let relative_url = output_images.unwrap()[0].as_str().unwrap_or("");
-                let temp_image_url = format!("{}{}", BASE_URL, relative_url);
+                let temp_image_url = format!("{}{}", self.base_url(), relative_url);
                 info!("Downloading image from: {}", temp_image_url);
 
                 let download_response = self
@@ -2242,54 +2301,34 @@ impl DzmmApi {
     pub async fn upload_reference_image(
         &self,
         image_bytes: &[u8],
-        filename: Option<&str>,
+        _filename: Option<&str>,
         content_type: Option<&str>,
     ) -> Result<String> {
-        let filename = filename.unwrap_or("reference.jpg");
         let content_type = content_type.unwrap_or("image/jpeg");
+        let mime_type = content_type
+            .split(';')
+            .next()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("image/jpeg");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(image_bytes);
+        let payload = json!({
+            "image": format!("data:{};base64,{}", mime_type, encoded)
+        });
 
-        let part = Part::bytes(image_bytes.to_vec())
-            .file_name(filename.to_string())
-            .mime_str(content_type)
-            .context("Failed to build multipart part")?;
-        let form = Form::new().part("file".to_string(), part);
+        let data = self
+            ._request(
+                Method::POST,
+                "/api/gamefy/draw/upload-reference",
+                None,
+                Some(&payload),
+                None,
+                Some(&[("Content-Type", "application/json")]),
+                None,
+            )
+            .await?;
 
-        self.rate_limiter.lock().await.wait().await;
-
-        let url = format!("{}/api/draw/upload-reference", BASE_URL);
-        let mut headers = self.build_headers(None);
-        headers.insert(
-            "x-dzmm-request-id",
-            HeaderValue::from_str(&generate_string(10)).unwrap(),
-        );
-
-        let response = self
-            .client
-            .post(&url)
-            .headers(headers)
-            .multipart(form)
-            .send()
-            .await
-            .context("Upload reference image failed")?;
-
-        self.merge_response_cookies(response.headers()).await;
-
-        if !response.status().is_success() {
-            bail!(
-                "Reference image upload failed with status: {}",
-                response.status()
-            );
-        }
-
-        let data: Value = response
-            .json()
-            .await
-            .context("Failed to parse upload response")?;
-        if !data
-            .get("success")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
+        if data.get("success").and_then(|v| v.as_bool()) == Some(false) {
             bail!("Reference image upload failed: {}", data);
         }
 
@@ -2329,18 +2368,16 @@ impl DzmmApi {
         let model = model.unwrap_or("nalang-dream");
 
         let payload = json!({
-            "json": {
-                "prompt": prompt,
-                "images": image_urls,
-                "imageSize": {"width": image_width.unwrap_or(1024), "height": image_height.unwrap_or(1024)},
-                "numInferenceSteps": num_inference_steps.unwrap_or(30),
-                "textGuidanceScale": text_guidance_scale.unwrap_or(5.0),
-                "imageGuidanceScale": image_guidance_scale.unwrap_or(6.0),
-                "numImages": num_images.unwrap_or(1),
-                "enableSafetyChecker": enable_safety_checker.unwrap_or(true),
-                "model": model,
-                "tagIds": tag_ids,
-            }
+            "prompt": prompt,
+            "images": image_urls,
+            "imageSize": {"width": image_width.unwrap_or(1024), "height": image_height.unwrap_or(1024)},
+            "numInferenceSteps": num_inference_steps.unwrap_or(30),
+            "textGuidanceScale": text_guidance_scale.unwrap_or(5.0),
+            "imageGuidanceScale": image_guidance_scale.unwrap_or(6.0),
+            "numImages": num_images.unwrap_or(1),
+            "enableSafetyChecker": enable_safety_checker.unwrap_or(true),
+            "model": model,
+            "tagIds": tag_ids,
         });
 
         info!(
@@ -2352,7 +2389,7 @@ impl DzmmApi {
         let response = self
             ._request(
                 Method::POST,
-                "/api/trpc/draw.image.edit",
+                "/api/gamefy/draw/edit",
                 None,
                 Some(&payload),
                 None,
@@ -2361,21 +2398,9 @@ impl DzmmApi {
             )
             .await?;
 
-        let data = if let Some(obj) = response.as_object() {
-            obj.get("result")
-                .and_then(|r| r.get("data"))
-                .and_then(|d| d.get("json"))
-                .cloned()
-                .unwrap_or(response)
-        } else {
-            response
-        };
+        let data = response;
 
-        if !data
-            .get("success")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
+        if data.get("success").and_then(|v| v.as_bool()) == Some(false) {
             bail!("Image edit failed: {}", data);
         }
 
@@ -2454,7 +2479,7 @@ impl DzmmApi {
                 }
 
                 let relative_url = output_images.unwrap()[0].as_str().unwrap_or("");
-                let temp_image_url = format!("{}{}", BASE_URL, relative_url);
+                let temp_image_url = format!("{}{}", self.base_url(), relative_url);
                 info!("Downloading edited image from: {}", temp_image_url);
 
                 let download_response = self
@@ -2506,19 +2531,258 @@ fn build_file_upload_form(name: &str, data: Vec<u8>, filename: &str, mime_type: 
     Form::new().part(name.to_string(), part)
 }
 
-fn urlencoding(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
-            _ => format!("%{:02X}", c as u8),
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::parse_dzmm_local_address;
     use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[derive(Debug, Clone)]
+    struct RecordedRequest {
+        method: String,
+        target: String,
+        body: Vec<u8>,
+    }
+
+    fn test_api(base_url: String) -> DzmmApi {
+        let mut api = DzmmApi::new_with_config(
+            ApiClientConfig {
+                base_url,
+                ..ApiClientConfig::default()
+            },
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        api.rate_limiter = Arc::new(Mutex::new(RateLimiter {
+            min_delay: 0.0,
+            max_delay: 0.0,
+            batch_size: 1,
+            batch_delay: 0.0,
+            request_count: 0,
+        }));
+        api
+    }
+
+    async fn read_request(stream: &mut tokio::net::TcpStream) -> RecordedRequest {
+        let mut data = Vec::new();
+        let mut buf = [0u8; 1024];
+        let header_end = loop {
+            let n = stream.read(&mut buf).await.unwrap();
+            assert_ne!(n, 0, "connection closed before headers");
+            data.extend_from_slice(&buf[..n]);
+            if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+        };
+
+        let headers = String::from_utf8_lossy(&data[..header_end]);
+        let mut lines = headers.lines();
+        let request_line = lines.next().unwrap();
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap().to_string();
+        let target = parts.next().unwrap().to_string();
+        let content_length = lines
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+
+        while data.len() < header_end + content_length {
+            let n = stream.read(&mut buf).await.unwrap();
+            assert_ne!(n, 0, "connection closed before body");
+            data.extend_from_slice(&buf[..n]);
+        }
+
+        RecordedRequest {
+            method,
+            target,
+            body: data[header_end..header_end + content_length].to_vec(),
+        }
+    }
+
+    async fn write_json_response(stream: &mut tokio::net::TcpStream, body: Value) {
+        let body = body.to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    }
+
+    async fn write_image_response(stream: &mut tokio::net::TcpStream, body: &[u8]) {
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(header.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+    }
+
+    async fn spawn_gamefy_server(
+        expected_requests: usize,
+    ) -> (String, tokio::task::JoinHandle<Vec<RecordedRequest>>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let mut recorded = Vec::new();
+            for _ in 0..expected_requests {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut stream).await;
+                match request.target.as_str() {
+                    "/api/gamefy/draw" => {
+                        write_json_response(&mut stream, json!({"taskId": "task-123"})).await;
+                    }
+                    "/api/gamefy/draw/upload-reference" => {
+                        write_json_response(
+                            &mut stream,
+                            json!({"url": "https://example.com/reference.png"}),
+                        )
+                        .await;
+                    }
+                    "/api/gamefy/draw/edit" => {
+                        write_json_response(&mut stream, json!({"taskId": "task-456"})).await;
+                    }
+                    "/api/gamefy/draw/status?taskId=task-123" => {
+                        write_json_response(
+                            &mut stream,
+                            json!({
+                                "task": {
+                                    "id": "task-123",
+                                    "status": "completed",
+                                    "outputImages": ["/api/draw/image/task-123?index=0"],
+                                    "createdAt": "2026-06-15T00:00:00.000Z"
+                                }
+                            }),
+                        )
+                        .await;
+                    }
+                    "/api/gamefy/draw/status?taskId=task-456" => {
+                        write_json_response(
+                            &mut stream,
+                            json!({
+                                "task": {
+                                    "id": "task-456",
+                                    "status": "completed",
+                                    "outputImages": ["/api/draw/image/task-456?index=0"],
+                                    "createdAt": "2026-06-15T00:00:00.000Z"
+                                }
+                            }),
+                        )
+                        .await;
+                    }
+                    "/api/draw/image/task-123?index=0" => {
+                        write_image_response(&mut stream, b"generated-image-bytes").await;
+                    }
+                    "/api/draw/image/task-456?index=0" => {
+                        write_image_response(&mut stream, b"edited-image-bytes").await;
+                    }
+                    other => panic!("unexpected request target: {other}"),
+                }
+                recorded.push(request);
+            }
+            recorded
+        });
+        (base_url, handle)
+    }
+
+    #[test]
+    fn test_parse_dzmm_local_address_values() {
+        assert_eq!(parse_dzmm_local_address(None).unwrap(), None);
+        assert_eq!(parse_dzmm_local_address(Some("")).unwrap(), None);
+        assert_eq!(parse_dzmm_local_address(Some(" auto ")).unwrap(), None);
+        assert_eq!(
+            parse_dzmm_local_address(Some("0.0.0.0")).unwrap(),
+            Some("0.0.0.0".parse().unwrap())
+        );
+        assert_eq!(
+            parse_dzmm_local_address(Some("::")).unwrap(),
+            Some("::".parse().unwrap())
+        );
+        assert!(parse_dzmm_local_address(Some("127.0.0.1")).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_gamefy_generate_uses_base_url_flat_payload_and_iroha_default() {
+        let (base_url, handle) = spawn_gamefy_server(3).await;
+        let api = test_api(base_url);
+
+        let (image_bytes, mime_type) = api
+            .generate_image("prompt", Some("1:1"), None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(image_bytes.unwrap(), b"generated-image-bytes");
+        assert_eq!(mime_type.unwrap(), "image/png");
+
+        let records = handle.await.unwrap();
+        assert_eq!(records[0].method, "POST");
+        assert_eq!(records[0].target, "/api/gamefy/draw");
+        let payload: Value = serde_json::from_slice(&records[0].body).unwrap();
+        assert_eq!(payload["prompt"], json!("prompt"));
+        assert_eq!(payload["dimension"], json!("1:1"));
+        assert_eq!(payload["model"], json!("iroha"));
+        assert!(payload.get("json").is_none());
+        assert_eq!(records[1].target, "/api/gamefy/draw/status?taskId=task-123");
+        assert_eq!(records[2].target, "/api/draw/image/task-123?index=0");
+    }
+
+    #[tokio::test]
+    async fn test_gamefy_edit_uploads_reference_as_data_url_and_uses_rest_endpoints() {
+        let (base_url, handle) = spawn_gamefy_server(4).await;
+        let api = test_api(base_url);
+
+        let (image_bytes, mime_type) = api
+            .edit_image(
+                "edit prompt",
+                b"reference-bytes",
+                Some("image/png"),
+                Some(512),
+                Some(256),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(image_bytes.unwrap(), b"edited-image-bytes");
+        assert_eq!(mime_type.unwrap(), "image/png");
+
+        let records = handle.await.unwrap();
+        assert_eq!(records[0].method, "POST");
+        assert_eq!(records[0].target, "/api/gamefy/draw/upload-reference");
+        let upload_payload: Value = serde_json::from_slice(&records[0].body).unwrap();
+        assert_eq!(
+            upload_payload["image"],
+            json!("data:image/png;base64,cmVmZXJlbmNlLWJ5dGVz")
+        );
+
+        assert_eq!(records[1].method, "POST");
+        assert_eq!(records[1].target, "/api/gamefy/draw/edit");
+        let edit_payload: Value = serde_json::from_slice(&records[1].body).unwrap();
+        assert_eq!(edit_payload["prompt"], json!("edit prompt"));
+        assert_eq!(
+            edit_payload["images"],
+            json!(["https://example.com/reference.png"])
+        );
+        assert_eq!(
+            edit_payload["imageSize"],
+            json!({"width": 512, "height": 256})
+        );
+        assert_eq!(edit_payload["model"], json!("nalang-dream"));
+        assert!(edit_payload.get("json").is_none());
+        assert_eq!(records[2].target, "/api/gamefy/draw/status?taskId=task-456");
+        assert_eq!(records[3].target, "/api/draw/image/task-456?index=0");
+    }
 
     // ========================================================================
     // generate_string (6 tests)
@@ -2775,33 +3039,6 @@ mod tests {
             result,
             Some(("sb-rls-auth-token.0".to_string(), "value123".to_string()))
         );
-    }
-
-    // ========================================================================
-    // urlencoding (4 tests)
-    // ========================================================================
-
-    #[test]
-    fn test_urlencoding_alphanumeric() {
-        assert_eq!(urlencoding("abc123"), "abc123");
-    }
-
-    #[test]
-    fn test_urlencoding_special_chars() {
-        assert_eq!(urlencoding("hello world"), "hello%20world");
-    }
-
-    #[test]
-    fn test_urlencoding_safe_chars() {
-        assert_eq!(urlencoding("-_.~"), "-_.~");
-    }
-
-    #[test]
-    fn test_urlencoding_json_like() {
-        let input = r#"{"key":"value"}"#;
-        let result = urlencoding(input);
-        assert!(result.contains("%7B") || result.contains("%7b"));
-        assert!(result.contains("%7D") || result.contains("%7d"));
     }
 
     // ========================================================================
