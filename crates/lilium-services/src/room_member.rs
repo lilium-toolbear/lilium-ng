@@ -2,169 +2,158 @@ use std::collections::HashMap;
 
 use crate::Result;
 use chrono::{DateTime, Utc};
-use lilium_database::DbSessionContext;
+use lilium_database::DbSession;
 
 use lilium_models::dzmm::room_member::RoomMember;
 use tracing::instrument;
 
-pub struct RoomMemberService<'a> {
-    session: DbSessionContext<'a>,
+#[instrument(skip(session), fields(room_id = %room_id, user_id = %user_id))]
+pub async fn get_member_info(
+    session: &mut DbSession,
+    room_id: &str,
+    user_id: &str,
+) -> Result<Option<RoomMember>> {
+    let member = sqlx::query_as::<_, RoomMember>(
+        r#"SELECT room_id, user_id, role, joined_at, left_at, raw_data, created_at, updated_at
+           FROM room_members
+           WHERE room_id = $1 AND user_id = $2"#,
+    )
+    .bind(room_id)
+    .bind(user_id)
+    .fetch_optional(session.as_mut())
+    .await?;
+    Ok(member)
 }
 
-impl<'a> RoomMemberService<'a> {
-    #[instrument(skip(session))]
-    pub fn new(session: DbSessionContext<'a>) -> Self {
-        Self { session }
-    }
+#[instrument(skip(session), fields(room_id = %room_id, user_id = %user_id))]
+pub async fn is_member(session: &mut DbSession, room_id: &str, user_id: &str) -> Result<bool> {
+    let count: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*) FROM room_members
+           WHERE room_id = $1 AND user_id = $2 AND left_at IS NULL"#,
+    )
+    .bind(room_id)
+    .bind(user_id)
+    .fetch_one(session.as_mut())
+    .await?;
+    Ok(count > 0)
+}
 
-    #[instrument(skip(self), fields(room_id = %room_id, user_id = %user_id))]
-    pub async fn get_member_info(
-        &mut self,
-        room_id: &str,
-        user_id: &str,
-    ) -> Result<Option<RoomMember>> {
-        let member = sqlx::query_as::<_, RoomMember>(
-            r#"SELECT room_id, user_id, role, joined_at, left_at, raw_data, created_at, updated_at
-               FROM room_members
-               WHERE room_id = $1 AND user_id = $2"#,
-        )
-        .bind(room_id)
-        .bind(user_id)
-        .fetch_optional(self.session.as_mut())
-        .await?;
-        Ok(member)
+#[instrument(skip(session, user_ids), fields(room_id = %room_id, user_count = user_ids.len(), has_account_user_id = _account_user_id.is_some()))]
+pub async fn get_active_members_by_ids(
+    session: &mut DbSession,
+    room_id: &str,
+    user_ids: &[String],
+    _account_user_id: Option<&str>,
+) -> Result<HashMap<String, RoomMember>> {
+    if user_ids.is_empty() {
+        return Ok(HashMap::new());
     }
+    let members = sqlx::query_as::<_, RoomMember>(
+        r#"SELECT room_id, user_id, role, joined_at, left_at, raw_data, created_at, updated_at
+           FROM room_members
+           WHERE room_id = $1 AND user_id = ANY($2) AND left_at IS NULL"#,
+    )
+    .bind(room_id)
+    .bind(user_ids)
+    .fetch_all(session.as_mut())
+    .await?;
+    let map = members
+        .into_iter()
+        .map(|m| (m.user_id.clone(), m))
+        .collect();
+    Ok(map)
+}
 
-    #[instrument(skip(self), fields(room_id = %room_id, user_id = %user_id))]
-    pub async fn is_member(&mut self, room_id: &str, user_id: &str) -> Result<bool> {
-        let count: i64 = sqlx::query_scalar(
-            r#"SELECT COUNT(*) FROM room_members
-               WHERE room_id = $1 AND user_id = $2 AND left_at IS NULL"#,
-        )
-        .bind(room_id)
-        .bind(user_id)
-        .fetch_one(self.session.as_mut())
-        .await?;
-        Ok(count > 0)
-    }
+#[instrument(skip(session), fields(room_id = %room_id, user_id = %user_id, role = %role, has_joined_at = joined_at.is_some()))]
+pub async fn upsert_member(
+    session: &mut DbSession,
+    room_id: &str,
+    user_id: &str,
+    role: &str,
+    joined_at: Option<DateTime<Utc>>,
+) -> Result<()> {
+    let now = Utc::now();
+    sqlx::query(
+        r#"INSERT INTO room_members (room_id, user_id, role, joined_at, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $5)
+           ON CONFLICT (room_id, user_id) DO UPDATE SET
+               role = $3,
+               joined_at = $4,
+               left_at = NULL,
+               updated_at = EXCLUDED.updated_at"#,
+    )
+    .bind(room_id)
+    .bind(user_id)
+    .bind(role)
+    .bind(joined_at)
+    .bind(now)
+    .execute(session.as_mut())
+    .await?;
+    Ok(())
+}
 
-    #[instrument(skip(self, user_ids), fields(room_id = %room_id, user_count = user_ids.len(), has_account_user_id = _account_user_id.is_some()))]
-    pub async fn get_active_members_by_ids(
-        &mut self,
-        room_id: &str,
-        user_ids: &[String],
-        _account_user_id: Option<&str>,
-    ) -> Result<HashMap<String, RoomMember>> {
-        if user_ids.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let members = sqlx::query_as::<_, RoomMember>(
-            r#"SELECT room_id, user_id, role, joined_at, left_at, raw_data, created_at, updated_at
-               FROM room_members
-               WHERE room_id = $1 AND user_id = ANY($2) AND left_at IS NULL"#,
-        )
-        .bind(room_id)
-        .bind(user_ids)
-        .fetch_all(self.session.as_mut())
-        .await?;
-        let map = members
-            .into_iter()
-            .map(|m| (m.user_id.clone(), m))
-            .collect();
-        Ok(map)
-    }
+#[instrument(skip(session), fields(room_id = %room_id, user_id = %user_id, role = %role, has_joined_at = joined_at.is_some()))]
+pub async fn upsert_member_simple(
+    session: &mut DbSession,
+    room_id: &str,
+    user_id: &str,
+    role: &str,
+    joined_at: Option<DateTime<Utc>>,
+) -> Result<()> {
+    upsert_member(session, room_id, user_id, role, joined_at).await
+}
 
-    #[instrument(skip(self), fields(room_id = %room_id, user_id = %user_id, role = %role, has_joined_at = joined_at.is_some()))]
-    pub async fn upsert_member(
-        &mut self,
-        room_id: &str,
-        user_id: &str,
-        role: &str,
-        joined_at: Option<DateTime<Utc>>,
-    ) -> Result<()> {
-        let now = Utc::now();
-        sqlx::query(
-            r#"INSERT INTO room_members (room_id, user_id, role, joined_at, created_at, updated_at)
-               VALUES ($1, $2, $3, $4, $5, $5)
-               ON CONFLICT (room_id, user_id) DO UPDATE SET
-                   role = $3,
-                   joined_at = $4,
-                   left_at = NULL,
-                   updated_at = EXCLUDED.updated_at"#,
-        )
-        .bind(room_id)
-        .bind(user_id)
-        .bind(role)
-        .bind(joined_at)
-        .bind(now)
-        .execute(self.session.as_mut())
-        .await?;
-        Ok(())
-    }
+#[instrument(skip(session), fields(room_id = %room_id, user_id = %user_id, has_left_at = left_at.is_some()))]
+pub async fn mark_member_left(
+    session: &mut DbSession,
+    room_id: &str,
+    user_id: &str,
+    left_at: Option<DateTime<Utc>>,
+) -> Result<bool> {
+    let result = sqlx::query(
+        r#"UPDATE room_members SET left_at = $3
+           WHERE room_id = $1 AND user_id = $2 AND left_at IS NULL"#,
+    )
+    .bind(room_id)
+    .bind(user_id)
+    .bind(left_at)
+    .execute(session.as_mut())
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
 
-    #[instrument(skip(self), fields(room_id = %room_id, user_id = %user_id, role = %role, has_joined_at = joined_at.is_some()))]
-    pub async fn upsert_member_simple(
-        &mut self,
-        room_id: &str,
-        user_id: &str,
-        role: &str,
-        joined_at: Option<DateTime<Utc>>,
-    ) -> Result<()> {
-        self.upsert_member(room_id, user_id, role, joined_at).await
-    }
+#[instrument(skip(session), fields(room_id = %room_id))]
+pub async fn get_member_count(session: &mut DbSession, room_id: &str) -> Result<i64> {
+    let count: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*) FROM room_members
+           WHERE room_id = $1 AND left_at IS NULL"#,
+    )
+    .bind(room_id)
+    .fetch_one(session.as_mut())
+    .await?;
+    Ok(count)
+}
 
-    #[instrument(skip(self), fields(room_id = %room_id, user_id = %user_id, has_left_at = left_at.is_some()))]
-    pub async fn mark_member_left(
-        &mut self,
-        room_id: &str,
-        user_id: &str,
-        left_at: Option<DateTime<Utc>>,
-    ) -> Result<bool> {
-        let result = sqlx::query(
-            r#"UPDATE room_members SET left_at = $3
-               WHERE room_id = $1 AND user_id = $2 AND left_at IS NULL"#,
-        )
-        .bind(room_id)
-        .bind(user_id)
-        .bind(left_at)
-        .execute(self.session.as_mut())
-        .await?;
-        Ok(result.rows_affected() > 0)
-    }
-
-    #[instrument(skip(self), fields(room_id = %room_id))]
-    pub async fn get_member_count(&mut self, room_id: &str) -> Result<i64> {
-        let count: i64 = sqlx::query_scalar(
-            r#"SELECT COUNT(*) FROM room_members
-               WHERE room_id = $1 AND left_at IS NULL"#,
-        )
-        .bind(room_id)
-        .fetch_one(self.session.as_mut())
-        .await?;
-        Ok(count)
-    }
-
-    #[instrument(skip(self), fields(room_id = %room_id, limit, offset))]
-    pub async fn get_room_members(
-        &mut self,
-        room_id: &str,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<RoomMember>> {
-        let members = sqlx::query_as::<_, RoomMember>(
-            r#"SELECT room_id, user_id, role, joined_at, left_at, raw_data, created_at, updated_at
-               FROM room_members
-               WHERE room_id = $1 AND left_at IS NULL
-               ORDER BY joined_at ASC NULLS LAST
-               LIMIT $2 OFFSET $3"#,
-        )
-        .bind(room_id)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(self.session.as_mut())
-        .await?;
-        Ok(members)
-    }
+#[instrument(skip(session), fields(room_id = %room_id, limit, offset))]
+pub async fn get_room_members(
+    session: &mut DbSession,
+    room_id: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<RoomMember>> {
+    let members = sqlx::query_as::<_, RoomMember>(
+        r#"SELECT room_id, user_id, role, joined_at, left_at, raw_data, created_at, updated_at
+           FROM room_members
+           WHERE room_id = $1 AND left_at IS NULL
+           ORDER BY joined_at ASC NULLS LAST
+           LIMIT $2 OFFSET $3"#,
+    )
+    .bind(room_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(session.as_mut())
+    .await?;
+    Ok(members)
 }
 
 #[cfg(test)]
@@ -249,33 +238,17 @@ mod tests {
         use chrono::Utc;
 
         #[tokio::test]
-        async fn service_struct_can_be_created() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::RoomMember,
-                |session| {
-                    Box::pin(async move {
-                        let mut _svc = RoomMemberService::new(session);
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("service struct create")
-        }
-
-        #[tokio::test]
         async fn get_member_info_existing() {
             lilium_test_fixtures::with_db_session(
                 lilium_test_fixtures::FixtureProfile::RoomMember,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = RoomMemberService::new(session);
+                        let mut session = session;
                         let now = Utc::now();
-                        svc.upsert_member("test_r", "test_u", "member", Some(now))
+                        upsert_member(&mut session, "test_r", "test_u", "member", Some(now))
                             .await
                             .expect("upsert");
-                        let member = svc
-                            .get_member_info("test_r", "test_u")
+                        let member = get_member_info(&mut session, "test_r", "test_u")
                             .await
                             .expect("query");
                         assert!(member.is_some());
@@ -298,9 +271,8 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::RoomMember,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = RoomMemberService::new(session);
-                        let member = svc
-                            .get_member_info("__no_room__", "__no_user__")
+                        let mut session = session;
+                        let member = get_member_info(&mut session, "__no_room__", "__no_user__")
                             .await
                             .expect("query");
                         assert!(member.is_none());
@@ -318,13 +290,12 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::RoomMember,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = RoomMemberService::new(session);
+                        let mut session = session;
                         let now = Utc::now();
-                        svc.upsert_member("test_r1", "test_u", "member", Some(now))
+                        upsert_member(&mut session, "test_r1", "test_u", "member", Some(now))
                             .await
                             .expect("upsert");
-                        let member = svc
-                            .get_member_info("test_r2", "test_u")
+                        let member = get_member_info(&mut session, "test_r2", "test_u")
                             .await
                             .expect("query");
                         assert!(member.is_none());
@@ -342,15 +313,22 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::RoomMember,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = RoomMemberService::new(session);
+                        let mut session = session;
                         let now = Utc::now();
-                        svc.upsert_member("test_is_member", "test_u", "member", Some(now))
-                            .await
-                            .expect("upsert");
-                        assert!(svc
-                            .is_member("test_is_member", "test_u")
-                            .await
-                            .expect("query"));
+                        upsert_member(
+                            &mut session,
+                            "test_is_member",
+                            "test_u",
+                            "member",
+                            Some(now),
+                        )
+                        .await
+                        .expect("upsert");
+                        assert!(
+                            is_member(&mut session, "test_is_member", "test_u")
+                                .await
+                                .expect("query")
+                        );
                         Ok(())
                     })
                 },
@@ -365,11 +343,12 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::RoomMember,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = RoomMemberService::new(session);
-                        assert!(!svc
-                            .is_member("__no_room__", "__no_user__")
-                            .await
-                            .expect("query"));
+                        let mut session = session;
+                        assert!(
+                            !is_member(&mut session, "__no_room__", "__no_user__")
+                                .await
+                                .expect("query")
+                        );
                         Ok(())
                     })
                 },
@@ -384,19 +363,19 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::RoomMember,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = RoomMemberService::new(session);
+                        let mut session = session;
                         let now = Utc::now();
-                        svc.upsert_member("test_active", "test_u1", "member", Some(now))
+                        upsert_member(&mut session, "test_active", "test_u1", "member", Some(now))
                             .await
                             .expect("upsert");
-                        let members = svc
-                            .get_active_members_by_ids(
-                                "test_active",
-                                &["test_u1".into(), "test_u1".into()],
-                                None,
-                            )
-                            .await
-                            .expect("query");
+                        let members = get_active_members_by_ids(
+                            &mut session,
+                            "test_active",
+                            &["test_u1".into(), "test_u1".into()],
+                            None,
+                        )
+                        .await
+                        .expect("query");
                         assert_eq!(members.len(), 1);
                         assert!(members.contains_key("test_u1"));
                         Ok(())
@@ -413,9 +392,8 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::RoomMember,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = RoomMemberService::new(session);
-                        let members = svc
-                            .get_active_members_by_ids("test_r", &[], None)
+                        let mut session = session;
+                        let members = get_active_members_by_ids(&mut session, "test_r", &[], None)
                             .await
                             .expect("query");
                         assert!(members.is_empty());
@@ -433,13 +411,18 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::RoomMember,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = RoomMemberService::new(session);
+                        let mut session = session;
                         let now = Utc::now();
-                        svc.upsert_member("test_new_r", "test_new_u", "member", Some(now))
-                            .await
-                            .expect("upsert");
-                        let member = svc
-                            .get_member_info("test_new_r", "test_new_u")
+                        upsert_member(
+                            &mut session,
+                            "test_new_r",
+                            "test_new_u",
+                            "member",
+                            Some(now),
+                        )
+                        .await
+                        .expect("upsert");
+                        let member = get_member_info(&mut session, "test_new_r", "test_new_u")
                             .await
                             .expect("query");
                         assert!(member.is_some());
@@ -457,16 +440,21 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::RoomMember,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = RoomMemberService::new(session);
+                        let mut session = session;
                         let now = Utc::now();
-                        svc.upsert_member("test_upd_r", "test_upd_u", "member", Some(now))
-                            .await
-                            .expect("upsert member");
-                        svc.upsert_member("test_upd_r", "test_upd_u", "admin", Some(now))
+                        upsert_member(
+                            &mut session,
+                            "test_upd_r",
+                            "test_upd_u",
+                            "member",
+                            Some(now),
+                        )
+                        .await
+                        .expect("upsert member");
+                        upsert_member(&mut session, "test_upd_r", "test_upd_u", "admin", Some(now))
                             .await
                             .expect("upsert admin");
-                        let member = svc
-                            .get_member_info("test_upd_r", "test_upd_u")
+                        let member = get_member_info(&mut session, "test_upd_r", "test_upd_u")
                             .await
                             .expect("query");
                         assert_eq!(member.unwrap().role.as_deref(), Some("admin"));
@@ -484,9 +472,10 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::RoomMember,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = RoomMemberService::new(session);
+                        let mut session = session;
                         let now = Utc::now();
-                        svc.upsert_member_simple(
+                        upsert_member_simple(
+                            &mut session,
                             "test_simple_r",
                             "test_simple_u",
                             "creator",
@@ -494,10 +483,10 @@ mod tests {
                         )
                         .await
                         .expect("upsert");
-                        let member = svc
-                            .get_member_info("test_simple_r", "test_simple_u")
-                            .await
-                            .expect("query");
+                        let member =
+                            get_member_info(&mut session, "test_simple_r", "test_simple_u")
+                                .await
+                                .expect("query");
                         assert_eq!(member.unwrap().role.as_deref(), Some("creator"));
                         Ok(())
                     })
@@ -513,15 +502,27 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::RoomMember,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = RoomMemberService::new(session);
+                        let mut session = session;
                         let now = Utc::now();
-                        svc.upsert_member("test_rejoin_r", "test_rejoin_u", "member", Some(now))
-                            .await
-                            .expect("upsert");
-                        svc.mark_member_left("test_rejoin_r", "test_rejoin_u", Some(Utc::now()))
-                            .await
-                            .expect("mark left");
-                        svc.upsert_member_simple(
+                        upsert_member(
+                            &mut session,
+                            "test_rejoin_r",
+                            "test_rejoin_u",
+                            "member",
+                            Some(now),
+                        )
+                        .await
+                        .expect("upsert");
+                        mark_member_left(
+                            &mut session,
+                            "test_rejoin_r",
+                            "test_rejoin_u",
+                            Some(Utc::now()),
+                        )
+                        .await
+                        .expect("mark left");
+                        upsert_member_simple(
+                            &mut session,
                             "test_rejoin_r",
                             "test_rejoin_u",
                             "member",
@@ -529,10 +530,10 @@ mod tests {
                         )
                         .await
                         .expect("rejoin");
-                        let member = svc
-                            .get_member_info("test_rejoin_r", "test_rejoin_u")
-                            .await
-                            .expect("query");
+                        let member =
+                            get_member_info(&mut session, "test_rejoin_r", "test_rejoin_u")
+                                .await
+                                .expect("query");
                         assert!(member.unwrap().left_at.is_none());
                         Ok(())
                     })
@@ -548,19 +549,28 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::RoomMember,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = RoomMemberService::new(session);
+                        let mut session = session;
                         let now = Utc::now();
-                        svc.upsert_member("test_leave_r", "test_leave_u", "member", Some(now))
-                            .await
-                            .expect("upsert");
+                        upsert_member(
+                            &mut session,
+                            "test_leave_r",
+                            "test_leave_u",
+                            "member",
+                            Some(now),
+                        )
+                        .await
+                        .expect("upsert");
                         let left_at = Utc::now();
-                        let marked = svc
-                            .mark_member_left("test_leave_r", "test_leave_u", Some(left_at))
-                            .await
-                            .expect("mark left");
+                        let marked = mark_member_left(
+                            &mut session,
+                            "test_leave_r",
+                            "test_leave_u",
+                            Some(left_at),
+                        )
+                        .await
+                        .expect("mark left");
                         assert!(marked);
-                        let member = svc
-                            .get_member_info("test_leave_r", "test_leave_u")
+                        let member = get_member_info(&mut session, "test_leave_r", "test_leave_u")
                             .await
                             .expect("query");
                         assert!(member.unwrap().left_at.is_some());
@@ -578,11 +588,11 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::RoomMember,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = RoomMemberService::new(session);
-                        let marked = svc
-                            .mark_member_left("__no_room__", "__no_user__", None)
-                            .await
-                            .expect("mark left");
+                        let mut session = session;
+                        let marked =
+                            mark_member_left(&mut session, "__no_room__", "__no_user__", None)
+                                .await
+                                .expect("mark left");
                         assert!(!marked);
                         Ok(())
                     })
@@ -598,8 +608,10 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::RoomMember,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = RoomMemberService::new(session);
-                        let count = svc.get_member_count("__empty_room__").await.expect("count");
+                        let mut session = session;
+                        let count = get_member_count(&mut session, "__empty_room__")
+                            .await
+                            .expect("count");
                         assert_eq!(count, 0);
                         Ok(())
                     })
@@ -615,18 +627,20 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::RoomMember,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = RoomMemberService::new(session);
+                        let mut session = session;
                         let now = Utc::now();
-                        svc.upsert_member("test_count_r", "test_u1", "member", Some(now))
+                        upsert_member(&mut session, "test_count_r", "test_u1", "member", Some(now))
                             .await
                             .expect("upsert u1");
-                        svc.upsert_member("test_count_r", "test_u2", "member", Some(now))
+                        upsert_member(&mut session, "test_count_r", "test_u2", "member", Some(now))
                             .await
                             .expect("upsert u2");
-                        svc.upsert_member("test_count_r", "test_u3", "member", Some(now))
+                        upsert_member(&mut session, "test_count_r", "test_u3", "member", Some(now))
                             .await
                             .expect("upsert u3");
-                        let count = svc.get_member_count("test_count_r").await.expect("count");
+                        let count = get_member_count(&mut session, "test_count_r")
+                            .await
+                            .expect("count");
                         assert_eq!(count, 3);
                         Ok(())
                     })
@@ -642,16 +656,15 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::RoomMember,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = RoomMemberService::new(session);
+                        let mut session = session;
                         let now = Utc::now();
-                        svc.upsert_member("test_list_r", "test_u1", "member", Some(now))
+                        upsert_member(&mut session, "test_list_r", "test_u1", "member", Some(now))
                             .await
                             .expect("upsert");
-                        svc.upsert_member("test_list_r", "test_u2", "admin", Some(now))
+                        upsert_member(&mut session, "test_list_r", "test_u2", "admin", Some(now))
                             .await
                             .expect("upsert");
-                        let members = svc
-                            .get_room_members("test_list_r", 100, 0)
+                        let members = get_room_members(&mut session, "test_list_r", 100, 0)
                             .await
                             .expect("query");
                         assert_eq!(members.len(), 2);
@@ -673,9 +686,8 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::RoomMember,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = RoomMemberService::new(session);
-                        let members = svc
-                            .get_room_members("__empty_room__", 100, 0)
+                        let mut session = session;
+                        let members = get_room_members(&mut session, "__empty_room__", 100, 0)
                             .await
                             .expect("query");
                         assert!(members.is_empty());
@@ -693,16 +705,15 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::RoomMember,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = RoomMemberService::new(session);
+                        let mut session = session;
                         let now = Utc::now();
-                        svc.upsert_member("test_room_a", "test_u1", "member", Some(now))
+                        upsert_member(&mut session, "test_room_a", "test_u1", "member", Some(now))
                             .await
                             .expect("upsert");
-                        svc.upsert_member("test_room_b", "test_u2", "member", Some(now))
+                        upsert_member(&mut session, "test_room_b", "test_u2", "member", Some(now))
                             .await
                             .expect("upsert");
-                        let members = svc
-                            .get_room_members("test_room_a", 100, 0)
+                        let members = get_room_members(&mut session, "test_room_a", 100, 0)
                             .await
                             .expect("query");
                         assert_eq!(members.len(), 1);
