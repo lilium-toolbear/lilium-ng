@@ -26,8 +26,7 @@ async fn main() -> Result<()> {
     // Create database runtime - do NOT run migrations
     // Migrations are managed separately by Alembic in the Python project
     let db = Database::create(config.database.clone().into()).await?;
-    let pool = db.raw_pool().clone();
 
-    let arbiter = arbiter::Arbiter::new(config, pool);
+    let arbiter = arbiter::Arbiter::new(config, db);
     arbiter.run().await
 }
