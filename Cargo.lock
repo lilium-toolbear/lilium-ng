@@ -3020,7 +3020,6 @@ dependencies = [
  "base64",
  "bytes",
  "futures-util",
- "http 1.4.2",
  "log",
  "native-tls",
  "rand 0.8.6",
@@ -3030,7 +3029,6 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-tungstenite",
- "tungstenite",
  "url",
 ]
 
