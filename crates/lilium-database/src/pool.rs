@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use sqlx::{pool::PoolConnection, PgPool, Postgres};
+use sqlx::{PgPool, Postgres, pool::PoolConnection};
 use std::future::Future;
 use std::pin::Pin;
 use tracing::instrument;

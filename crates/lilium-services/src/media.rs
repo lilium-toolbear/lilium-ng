@@ -1,17 +1,17 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use lilium_database::DbSession;
 use reqwest::{
+    Client, Method, Url,
     header::{CONTENT_TYPE, LOCATION},
     redirect::Policy,
-    Client, Method, Url,
 };
 use std::io::ErrorKind;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
-use tokio::time::{sleep, Duration as TokioDuration};
+use tokio::time::{Duration as TokioDuration, sleep};
 use tracing::instrument;
 use tracing::{info, warn};
 

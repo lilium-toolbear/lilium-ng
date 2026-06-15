@@ -282,40 +282,48 @@ mod tests {
 
     #[test]
     fn test_requires_account() {
-        assert!(ControlCommand {
-            action: ControlAction::Reload,
-            account_user_id: None,
-            reason: String::new(),
-            data: None,
-        }
-        .requires_account());
+        assert!(
+            ControlCommand {
+                action: ControlAction::Reload,
+                account_user_id: None,
+                reason: String::new(),
+                data: None,
+            }
+            .requires_account()
+        );
 
-        assert!(!ControlCommand {
-            action: ControlAction::Status,
-            account_user_id: None,
-            reason: String::new(),
-            data: None,
-        }
-        .requires_account());
+        assert!(
+            !ControlCommand {
+                action: ControlAction::Status,
+                account_user_id: None,
+                reason: String::new(),
+                data: None,
+            }
+            .requires_account()
+        );
     }
 
     #[test]
     fn test_is_arbiter_action() {
-        assert!(ControlCommand {
-            action: ControlAction::Status,
-            account_user_id: None,
-            reason: String::new(),
-            data: None,
-        }
-        .is_arbiter_action());
+        assert!(
+            ControlCommand {
+                action: ControlAction::Status,
+                account_user_id: None,
+                reason: String::new(),
+                data: None,
+            }
+            .is_arbiter_action()
+        );
 
-        assert!(!ControlCommand {
-            action: ControlAction::Reload,
-            account_user_id: None,
-            reason: String::new(),
-            data: None,
-        }
-        .is_arbiter_action());
+        assert!(
+            !ControlCommand {
+                action: ControlAction::Reload,
+                account_user_id: None,
+                reason: String::new(),
+                data: None,
+            }
+            .is_arbiter_action()
+        );
     }
 
     #[test]

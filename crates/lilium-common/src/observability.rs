@@ -1,4 +1,4 @@
-use sentry::protocol::{map::Map, Context, Event, Value};
+use sentry::protocol::{Context, Event, Value, map::Map};
 use sentry::{ClientInitGuard, ClientOptions};
 use std::borrow::Cow;
 use std::env;

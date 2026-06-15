@@ -4,8 +4,8 @@ use crate::pool::normalize_database_url;
 use crate::transaction::TransactionFuture;
 use anyhow::{Context, Result};
 use sea_orm::{DatabaseConnection, SqlxPostgresConnector};
-use sqlx::{pool::PoolConnection, Postgres};
 use sqlx::postgres::PgPoolOptions;
+use sqlx::{Postgres, pool::PoolConnection};
 use std::ops::{Deref, DerefMut};
 use std::time::Duration;
 use tracing::instrument;
@@ -97,8 +97,8 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sea_orm::ConnectionTrait;
     use crate as lilium_database;
+    use sea_orm::ConnectionTrait;
 
     #[test]
     fn from_url_sets_connection_and_max_connections() {
@@ -152,7 +152,10 @@ mod tests {
                 .as_nanos()
         );
 
-        async fn run_transaction_api_scenario(db: &Database, table_name: &str) -> anyhow::Result<()> {
+        async fn run_transaction_api_scenario(
+            db: &Database,
+            table_name: &str,
+        ) -> anyhow::Result<()> {
             {
                 let mut conn = db.raw_connection().await?;
                 sqlx::query(&format!(
@@ -165,12 +168,14 @@ mod tests {
                 ))
                 .execute(conn.as_mut())
                 .await?;
-                let raw_count: i64 = sqlx::query_scalar(&format!(
-                    "SELECT COUNT(*) FROM {table_name}"
-                ))
-                .fetch_one(conn.as_mut())
-                .await?;
-                anyhow::ensure!(raw_count == 1, "raw connection did not observe its own insert");
+                let raw_count: i64 =
+                    sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table_name}"))
+                        .fetch_one(conn.as_mut())
+                        .await?;
+                anyhow::ensure!(
+                    raw_count == 1,
+                    "raw connection did not observe its own insert"
+                );
             }
 
             let committed_table_name = table_name.to_owned();
@@ -186,11 +191,10 @@ mod tests {
 
             {
                 let mut conn = db.raw_connection().await?;
-                let committed_count: i64 = sqlx::query_scalar(&format!(
-                    "SELECT COUNT(*) FROM {table_name}"
-                ))
-                .fetch_one(conn.as_mut())
-                .await?;
+                let committed_count: i64 =
+                    sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table_name}"))
+                        .fetch_one(conn.as_mut())
+                        .await?;
                 anyhow::ensure!(
                     committed_count == 2,
                     "committed transaction row was not visible through raw SQL"
@@ -210,15 +214,17 @@ mod tests {
                     })
                 })
                 .await;
-            anyhow::ensure!(rollback_result.is_err(), "rollback transaction unexpectedly succeeded");
+            anyhow::ensure!(
+                rollback_result.is_err(),
+                "rollback transaction unexpectedly succeeded"
+            );
 
             {
                 let mut conn = db.raw_connection().await?;
-                let visible_count: i64 = sqlx::query_scalar(&format!(
-                    "SELECT COUNT(*) FROM {table_name}"
-                ))
-                .fetch_one(conn.as_mut())
-                .await?;
+                let visible_count: i64 =
+                    sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table_name}"))
+                        .fetch_one(conn.as_mut())
+                        .await?;
                 anyhow::ensure!(
                     visible_count == 2,
                     "rolled back row became visible through raw SQL"
