@@ -3,7 +3,7 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{pool::PoolConnection, PgPool, Postgres};
 use std::borrow::Borrow;
 use std::future::Future;
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::pin::Pin;
 use tracing::instrument;
 
@@ -45,31 +45,6 @@ impl std::ops::DerefMut for DbSession {
     }
 }
 
-#[derive(Debug)]
-pub struct DbSessionContext<'a> {
-    session: &'a mut DbSession,
-}
-
-impl<'a> DbSessionContext<'a> {
-    pub fn new(session: &'a mut DbSession) -> Self {
-        Self { session }
-    }
-}
-
-impl<'a> Deref for DbSessionContext<'a> {
-    type Target = DbSession;
-
-    fn deref(&self) -> &Self::Target {
-        self.session
-    }
-}
-
-impl<'a> DerefMut for DbSessionContext<'a> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.session
-    }
-}
-
 pub(crate) fn normalize_database_url(url: &str) -> String {
     let url = url.trim();
     if let Some(rest) = url.strip_prefix("postgresql://") {
@@ -82,12 +57,6 @@ pub(crate) fn normalize_database_url(url: &str) -> String {
 impl DbPool {
     pub(crate) fn from_pg_pool(inner: PgPool) -> Self {
         Self { inner }
-    }
-
-    #[deprecated(note = "compatibility shim; use DbPool::connect and remove after session API migration")]
-    #[instrument(skip(url), fields(pool_size))]
-    pub async fn connect_with_session(url: &str, pool_size: u32) -> Result<Self> {
-        Self::connect(url, pool_size).await
     }
 
     #[instrument(skip(url), fields(pool_size))]
@@ -108,27 +77,6 @@ impl DbPool {
             .connect_with(options)
             .await
             .with_context(|| "failed to connect database with explicit options")?;
-        Ok(Self { inner: pool })
-    }
-
-    #[instrument(fields(env_var = var_name, pool_size))]
-    pub async fn connect_from_env(var_name: &str, pool_size: u32) -> Result<Self> {
-        let db_url = std::env::var(var_name)
-            .with_context(|| format!("required env var '{var_name}' is missing"))?;
-        Self::connect(&db_url, pool_size).await
-    }
-
-    #[instrument(skip(url))]
-    pub async fn connect_lazy(url: &str) -> Result<Self> {
-        let normalized_url = normalize_database_url(url);
-        let pool = PgPool::connect_lazy(&normalized_url)
-            .with_context(|| "failed to create lazy database pool")?;
-        Ok(Self { inner: pool })
-    }
-
-    #[instrument(skip(options))]
-    pub async fn connect_lazy_with_options(options: PgConnectOptions) -> Result<Self> {
-        let pool = PgPoolOptions::new().connect_lazy_with(options);
         Ok(Self { inner: pool })
     }
 
@@ -191,31 +139,12 @@ impl DbPool {
         }
     }
 
-    async fn run_session_context<T, F>(&self, finish: SessionFinish, f: F) -> Result<T>
-    where
-        F: for<'a> FnOnce(DbSessionContext<'a>) -> SessionFuture<'a, T>,
-    {
-        self.run_session(finish, |session| {
-            let context = DbSessionContext::new(session);
-            f(context)
-        })
-        .await
-    }
-
     #[instrument(skip(self, f))]
     pub async fn with_session<T, F>(&self, f: F) -> Result<T>
     where
         F: for<'a> FnOnce(&'a mut DbSession) -> SessionFuture<'a, T>,
     {
         self.run_session(SessionFinish::Commit, f).await
-    }
-
-    #[instrument(skip(self, f))]
-    pub async fn with_session_context<T, F>(&self, f: F) -> Result<T>
-    where
-        F: for<'a> FnOnce(DbSessionContext<'a>) -> SessionFuture<'a, T>,
-    {
-        self.run_session_context(SessionFinish::Commit, f).await
     }
 
     #[instrument(skip(self, f))]
@@ -226,31 +155,6 @@ impl DbPool {
         self.run_session(SessionFinish::Rollback, f).await
     }
 
-    #[instrument(skip(self, f))]
-    pub async fn with_rollback_session_context<T, F>(&self, f: F) -> Result<T>
-    where
-        F: for<'a> FnOnce(DbSessionContext<'a>) -> SessionFuture<'a, T>,
-    {
-        self.run_session_context(SessionFinish::Rollback, f).await
-    }
-
-    #[deprecated(note = "compatibility shim; use DbPool::with_session and remove after session API migration")]
-    #[instrument(skip(self, f))]
-    pub async fn with_session_boxed<T, F>(&self, f: F) -> Result<T>
-    where
-        F: for<'a> FnOnce(&'a mut DbSession) -> SessionFuture<'a, T>,
-    {
-        self.with_session(f).await
-    }
-
-    #[deprecated(note = "compatibility shim; use DbPool::with_rollback_session and remove after session API migration")]
-    #[instrument(skip(self, f))]
-    pub async fn with_rollback_session_boxed<T, F>(&self, f: F) -> Result<T>
-    where
-        F: for<'a> FnOnce(&'a mut DbSession) -> SessionFuture<'a, T>,
-    {
-        self.with_rollback_session(f).await
-    }
 }
 
 impl Borrow<PgPool> for DbPool {

@@ -1,7 +1,6 @@
 use anyhow::Result;
 use lilium_database::{Database, DbPool};
-use lilium_database::pool::SessionFuture;
-use lilium_database::{DbSession, DbSessionContext};
+use lilium_database::DbSession;
 
 use crate::database::{TestDatabaseConnection, connect_test_database};
 use crate::reset::reset_database;
@@ -72,21 +71,6 @@ pub async fn prepare_database(session: &mut DbSession, profile: FixtureProfile) 
     Ok(())
 }
 
-pub async fn with_db_session<T, F>(profile: FixtureProfile, f: F) -> Result<T>
-where
-    F: for<'a> FnOnce(DbSessionContext<'a>) -> SessionFuture<'a, T> + Send + 'static,
-{
-    let pool = connect_test_database().await;
-    pool.with_rollback_session_context(|session| {
-        Box::pin(async move {
-            let mut session = session;
-            prepare_database(&mut session, profile).await?;
-            f(session).await
-        })
-    })
-    .await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,24 +95,4 @@ mod tests {
             "expected the live schema bootstrap to create public tables"
         );
     }
-}
-
-pub async fn with_db_session_and_pool<T, F>(profile: FixtureProfile, f: F) -> Result<T>
-where
-    F: for<'a> FnOnce(DbSessionContext<'a>, TestDatabaseConnection) -> SessionFuture<'a, T>
-        + Send
-        + 'static,
-{
-    let pool = connect_test_database().await;
-    let pool_for_callback = pool.clone();
-
-    pool.with_rollback_session_context(move |session| {
-        let pool_for_callback = pool_for_callback.clone();
-        Box::pin(async move {
-            let mut session = session;
-            prepare_database(&mut session, profile).await?;
-            f(session, pool_for_callback).await
-        })
-    })
-    .await
 }
