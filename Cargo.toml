@@ -46,7 +46,7 @@ sea-orm = { version = "1.1", features = [
 
 # WebSocket
 futures = "0.3"
-rust_socketio = { version = "0.6", features = ["async"] }
+rust_socketio = { git = "https://github.com/kuma-dzmm/rust-socketio", rev = "2a9c637acf43c622247753bf608304ed5ae5b657", features = ["async"] }
 tokio-tungstenite = { version = "0.29", features = ["native-tls"] }
 
 # HTTP
@@ -84,7 +84,3 @@ strum = { version = "0.28", features = ["derive"] }
 
 # 随机数
 rand = "0.10"
-
-[patch.crates-io]
-rust_engineio = { path = "third_party/rust-socketio/engineio" }
-rust_socketio = { path = "third_party/rust-socketio/socketio" }
