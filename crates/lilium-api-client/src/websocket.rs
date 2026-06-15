@@ -7,10 +7,10 @@ use lilium_models::ingestion::EventEnvelope;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::net::{TcpSocket, lookup_host};
+use tokio::net::{TcpSocket, TcpStream, lookup_host};
 use tokio::sync::Notify;
 use tokio_tungstenite::{
-    MaybeTlsStream, client_async, client_async_tls_with_config, connect_async,
+    MaybeTlsStream, WebSocketStream, client_async, client_async_tls_with_config, connect_async,
     tungstenite::{handshake::client::Response, http::Request},
 };
 use tracing::instrument;
@@ -377,7 +377,7 @@ where
 async fn connect_websocket_request(
     request: Request<()>,
     local_address: Option<IpAddr>,
-) -> Result<rust_socketio::AsyncWebsocketStream> {
+) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
     let Some(local_address) = local_address else {
         let (stream, _) = connect_async(request)
             .await
@@ -392,7 +392,7 @@ async fn connect_websocket_request(
 async fn connect_bound_websocket_request(
     request: Request<()>,
     local_address: IpAddr,
-) -> Result<(rust_socketio::AsyncWebsocketStream, Response)> {
+) -> Result<(WebSocketStream<MaybeTlsStream<TcpStream>>, Response)> {
     let uri = request.uri().clone();
     let scheme = uri.scheme_str().unwrap_or("ws");
     let host = uri
