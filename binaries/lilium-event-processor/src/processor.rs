@@ -420,10 +420,7 @@ impl EventProcessor {
         }
     }
 
-    async fn sync_media(
-        session: &mut DbSession,
-        media_message_ids: &[String],
-    ) -> Result<()> {
+    async fn sync_media(session: &mut DbSession, media_message_ids: &[String]) -> Result<()> {
         if media_message_ids.is_empty() {
             return Ok(());
         }
@@ -613,7 +610,7 @@ mod tests {
     use lilium_models::dzmm::room_member::RoomMember;
     use lilium_services::event;
     use lilium_services::message;
-    use lilium_test_fixtures::{FixtureProfile, TestDb, with_db_session};
+    use lilium_test_fixtures::{FixtureProfile, TestDb};
     use sqlx::query_as;
 
     fn utc(ts: &str) -> DateTime<Utc> {
@@ -657,56 +654,55 @@ mod tests {
 
     #[tokio::test]
     async fn message_new_system_join_updates_room_members() {
-        with_db_session(FixtureProfile::Shared, |session| {
-            Box::pin(async move {
-                let mut session = session;
-                let event = websocket_event(
-                    11,
-                    "message:new",
-                    "account_1",
-                    "2026-06-02T12:00:00Z",
-                    serde_json::json!({
-                        "chatroomId": "room_1",
-                        "message": {
-                            "message_id": "msg_join",
-                            "chatroom_id": "room_1",
-                            "sent_by": "user_joined",
-                            "sent_at": "2026-06-02T12:00:00Z",
-                            "content": {
-                                "type": "system",
-                                "text": "Alice 加入了群聊"
-                            }
+        let test_db = TestDb::acquire(FixtureProfile::Shared)
+            .await
+            .expect("init shared db");
+
+        lilium_database::transaction!(test_db.database(), |session| {
+            let event = websocket_event(
+                11,
+                "message:new",
+                "account_1",
+                "2026-06-02T12:00:00Z",
+                serde_json::json!({
+                    "chatroomId": "room_1",
+                    "message": {
+                        "message_id": "msg_join",
+                        "chatroom_id": "room_1",
+                        "sent_by": "user_joined",
+                        "sent_at": "2026-06-02T12:00:00Z",
+                        "content": {
+                            "type": "system",
+                            "text": "Alice 加入了群聊"
                         }
-                    }),
-                );
+                    }
+                }),
+            );
 
-                let mut user_fetch_collector = Vec::new();
-                let result =
-                    EventProcessor::process_event(&mut session, &event, &mut user_fetch_collector)
-                        .await
-                        .expect("process event");
+            let mut user_fetch_collector = Vec::new();
+            let result = EventProcessor::process_event(session, &event, &mut user_fetch_collector)
+                .await
+                .expect("process event");
 
-                assert!(result.is_none());
-                assert_eq!(
-                    user_fetch_collector,
-                    vec![(
-                        "account_1".to_string(),
-                        "user_joined".to_string(),
-                        "room_1".to_string()
-                    )]
-                );
+            assert!(result.is_none());
+            assert_eq!(
+                user_fetch_collector,
+                vec![(
+                    "account_1".to_string(),
+                    "user_joined".to_string(),
+                    "room_1".to_string()
+                )]
+            );
 
-                let mut member_session = session;
-                let member = room_member_row(&mut member_session, "room_1", "user_joined")
-                    .await?
-                    .expect("member row");
-                assert_eq!(member.room_id, "room_1");
-                assert_eq!(member.user_id, "user_joined");
-                assert_eq!(member.joined_at, Some(utc("2026-06-02T12:00:00Z")));
-                assert!(member.left_at.is_none());
+            let member = room_member_row(session, "room_1", "user_joined")
+                .await?
+                .expect("member row");
+            assert_eq!(member.room_id, "room_1");
+            assert_eq!(member.user_id, "user_joined");
+            assert_eq!(member.joined_at, Some(utc("2026-06-02T12:00:00Z")));
+            assert!(member.left_at.is_none());
 
-                Ok(())
-            })
+            Ok(())
         })
         .await
         .expect("message_new_system_join_updates_room_members");
@@ -714,43 +710,44 @@ mod tests {
 
     #[tokio::test]
     async fn group_member_left_marks_room_member_left() {
-        with_db_session(FixtureProfile::Shared, |session| {
-            Box::pin(async move {
-                let mut session = session;
-                room_member::upsert_member_simple(
-                    &mut session,
-                    "room_1",
-                    "user_left",
-                    "member",
-                    Some(utc("2026-06-01T00:00:00Z")),
-                )
-                .await?;
+        let test_db = TestDb::acquire(FixtureProfile::Shared)
+            .await
+            .expect("init shared db");
 
-                let event = websocket_event(
-                    12,
-                    "group:member-left",
-                    "account_1",
-                    "2026-06-02T12:30:00Z",
-                    serde_json::json!({
-                        "chatroomId": "room_1",
-                        "userId": "user_left"
-                    }),
-                );
+        lilium_database::transaction!(test_db.database(), |session| {
+            room_member::upsert_member_simple(
+                session,
+                "room_1",
+                "user_left",
+                "member",
+                Some(utc("2026-06-01T00:00:00Z")),
+            )
+            .await?;
 
-                let mut user_fetch_collector = Vec::new();
-                EventProcessor::process_event(&mut session, &event, &mut user_fetch_collector)
-                    .await
-                    .expect("process event");
+            let event = websocket_event(
+                12,
+                "group:member-left",
+                "account_1",
+                "2026-06-02T12:30:00Z",
+                serde_json::json!({
+                    "chatroomId": "room_1",
+                    "userId": "user_left"
+                }),
+            );
 
-                assert!(user_fetch_collector.is_empty());
+            let mut user_fetch_collector = Vec::new();
+            EventProcessor::process_event(session, &event, &mut user_fetch_collector)
+                .await
+                .expect("process event");
 
-                let member = room_member_row(&mut session, "room_1", "user_left")
-                    .await?
-                    .expect("member row");
-                assert_eq!(member.left_at, Some(utc("2026-06-02T12:30:00Z")));
+            assert!(user_fetch_collector.is_empty());
 
-                Ok(())
-            })
+            let member = room_member_row(session, "room_1", "user_left")
+                .await?
+                .expect("member row");
+            assert_eq!(member.left_at, Some(utc("2026-06-02T12:30:00Z")));
+
+            Ok(())
         })
         .await
         .expect("group_member_left_marks_room_member_left");
@@ -758,64 +755,65 @@ mod tests {
 
     #[tokio::test]
     async fn message_deleted_uses_deleted_by() {
-        with_db_session(FixtureProfile::Shared, |session| {
-            Box::pin(async move {
-                let mut session = session;
-                let sent_at = utc("2026-06-01T00:00:00Z");
-                let message = DzmmMessage {
-                    message_id: "msg_deleted".to_string(),
-                    room_id: "room_1".to_string(),
-                    sent_at,
-                    sent_by: "user_deleted".to_string(),
-                    content_type: "text".to_string(),
-                    content_text: Some("hello".to_string()),
-                    content_tsv: None,
-                    attachment_url: None,
-                    attachment_file: None,
-                    sticker_id: None,
-                    alt_text: None,
-                    metadata: None,
-                    raw_data: serde_json::json!({"message_id": "msg_deleted"}),
-                    source: "spider".to_string(),
-                    created_at: sent_at,
-                    updated_at: None,
-                    is_deleted: false,
-                    deleted_at: None,
-                    deleted_by: None,
-                    is_recalled: false,
-                    is_edited: false,
-                    history: None,
-                    reference_message_id: None,
-                    reference_data: None,
-                };
-                message::create_message(&mut session, &message).await?;
+        let test_db = TestDb::acquire(FixtureProfile::Shared)
+            .await
+            .expect("init shared db");
 
-                let event = websocket_event(
-                    13,
-                    "message:deleted",
-                    "account_1",
-                    "2026-06-02T13:00:00Z",
-                    serde_json::json!({
-                        "chatroomId": "room_1",
-                        "messageId": "msg_deleted",
-                        "deletedBy": "user_admin"
-                    }),
-                );
+        lilium_database::transaction!(test_db.database(), |session| {
+            let sent_at = utc("2026-06-01T00:00:00Z");
+            let message = DzmmMessage {
+                message_id: "msg_deleted".to_string(),
+                room_id: "room_1".to_string(),
+                sent_at,
+                sent_by: "user_deleted".to_string(),
+                content_type: "text".to_string(),
+                content_text: Some("hello".to_string()),
+                content_tsv: None,
+                attachment_url: None,
+                attachment_file: None,
+                sticker_id: None,
+                alt_text: None,
+                metadata: None,
+                raw_data: serde_json::json!({"message_id": "msg_deleted"}),
+                source: "spider".to_string(),
+                created_at: sent_at,
+                updated_at: None,
+                is_deleted: false,
+                deleted_at: None,
+                deleted_by: None,
+                is_recalled: false,
+                is_edited: false,
+                history: None,
+                reference_message_id: None,
+                reference_data: None,
+            };
+            message::create_message(session, &message).await?;
 
-                let mut user_fetch_collector = Vec::new();
-                EventProcessor::process_event(&mut session, &event, &mut user_fetch_collector)
-                    .await
-                    .expect("process event");
+            let event = websocket_event(
+                13,
+                "message:deleted",
+                "account_1",
+                "2026-06-02T13:00:00Z",
+                serde_json::json!({
+                    "chatroomId": "room_1",
+                    "messageId": "msg_deleted",
+                    "deletedBy": "user_admin"
+                }),
+            );
 
-                let updated = message::get_by_id_at(&mut session, "msg_deleted", sent_at, false)
-                    .await?
-                    .expect("message exists");
+            let mut user_fetch_collector = Vec::new();
+            EventProcessor::process_event(session, &event, &mut user_fetch_collector)
+                .await
+                .expect("process event");
 
-                assert!(updated.is_deleted);
-                assert_eq!(updated.deleted_by.as_deref(), Some("user_admin"));
+            let updated = message::get_by_id_at(session, "msg_deleted", sent_at, false)
+                .await?
+                .expect("message exists");
 
-                Ok(())
-            })
+            assert!(updated.is_deleted);
+            assert_eq!(updated.deleted_by.as_deref(), Some("user_admin"));
+
+            Ok(())
         })
         .await
         .expect("message_deleted_uses_deleted_by");
