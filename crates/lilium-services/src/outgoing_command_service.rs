@@ -503,157 +503,157 @@ mod tests {
 
         #[tokio::test]
         async fn test_create_command_defaults() {
-            lilium_test_fixtures::with_db_session(
+            let test_db = lilium_test_fixtures::TestDb::acquire(
                 lilium_test_fixtures::FixtureProfile::OutgoingCommand,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let cmd = create_command(
-                            &mut session,
-                            "user1",
-                            "message:send",
-                            serde_json::json!({"room_id": "room1", "text": "hello"}),
-                            true,
-                            None,
-                        )
-                        .await
-                        .unwrap();
-                        assert_eq!(cmd.account_user_id, "user1");
-                        assert_eq!(cmd.event, "message:send");
-                        assert!(cmd.require_ack);
-                        assert_eq!(cmd.max_attempts, 6);
-                        assert_eq!(cmd.status, status::PENDING);
-                        assert_eq!(cmd.attempt_count, 0);
-                        Ok(())
-                    })
-                },
             )
+            .await
+            .expect("init outgoing command db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                let cmd = create_command(
+                    session,
+                    "user1",
+                    "message:send",
+                    serde_json::json!({"room_id": "room1", "text": "hello"}),
+                    true,
+                    None,
+                )
+                .await
+                .unwrap();
+                assert_eq!(cmd.account_user_id, "user1");
+                assert_eq!(cmd.event, "message:send");
+                assert!(cmd.require_ack);
+                assert_eq!(cmd.max_attempts, 6);
+                assert_eq!(cmd.status, status::PENDING);
+                assert_eq!(cmd.attempt_count, 0);
+                Ok(())
+            })
             .await
             .expect("test_create_command_defaults");
         }
 
         #[tokio::test]
         async fn test_create_command_non_message_send_uses_standard_retry_budget() {
-            lilium_test_fixtures::with_db_session(
+            let test_db = lilium_test_fixtures::TestDb::acquire(
                 lilium_test_fixtures::FixtureProfile::OutgoingCommand,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let cmd = create_command(
-                            &mut session,
-                            "user1",
-                            "message:join-room",
-                            serde_json::json!({}),
-                            true,
-                            None,
-                        )
-                        .await
-                        .unwrap();
-                        assert_eq!(cmd.max_attempts, 3);
-                        Ok(())
-                    })
-                },
             )
+            .await
+            .expect("init outgoing command db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                let cmd = create_command(
+                    session,
+                    "user1",
+                    "message:join-room",
+                    serde_json::json!({}),
+                    true,
+                    None,
+                )
+                .await
+                .unwrap();
+                assert_eq!(cmd.max_attempts, 3);
+                Ok(())
+            })
             .await
             .expect("test_create_command_non_message_send_uses_standard_retry_budget");
         }
 
         #[tokio::test]
         async fn test_create_command_custom_params() {
-            lilium_test_fixtures::with_db_session(
+            let test_db = lilium_test_fixtures::TestDb::acquire(
                 lilium_test_fixtures::FixtureProfile::OutgoingCommand,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let cmd = create_command(
-                            &mut session,
-                            "user1",
-                            "test:event",
-                            serde_json::json!({}),
-                            false,
-                            Some(5),
-                        )
-                        .await
-                        .unwrap();
-                        assert!(!cmd.require_ack);
-                        assert_eq!(cmd.max_attempts, 5);
-                        Ok(())
-                    })
-                },
             )
+            .await
+            .expect("init outgoing command db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                let cmd = create_command(
+                    session,
+                    "user1",
+                    "test:event",
+                    serde_json::json!({}),
+                    false,
+                    Some(5),
+                )
+                .await
+                .unwrap();
+                assert!(!cmd.require_ack);
+                assert_eq!(cmd.max_attempts, 5);
+                Ok(())
+            })
             .await
             .expect("test_create_command_custom_params");
         }
 
         #[tokio::test]
         async fn test_create_command_returns_with_id() {
-            lilium_test_fixtures::with_db_session(
+            let test_db = lilium_test_fixtures::TestDb::acquire(
                 lilium_test_fixtures::FixtureProfile::OutgoingCommand,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let cmd = create_command(
-                            &mut session,
-                            "user1",
-                            "test:event",
-                            serde_json::json!({}),
-                            true,
-                            None,
-                        )
-                        .await
-                        .unwrap();
-                        assert!(cmd.id > 0);
-                        Ok(())
-                    })
-                },
             )
+            .await
+            .expect("init outgoing command db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                let cmd = create_command(
+                    session,
+                    "user1",
+                    "test:event",
+                    serde_json::json!({}),
+                    true,
+                    None,
+                )
+                .await
+                .unwrap();
+                assert!(cmd.id > 0);
+                Ok(())
+            })
             .await
             .expect("test_create_command_returns_with_id");
         }
 
         #[tokio::test]
         async fn test_create_multiple_commands_increments_id() {
-            lilium_test_fixtures::with_db_session(
+            let test_db = lilium_test_fixtures::TestDb::acquire(
                 lilium_test_fixtures::FixtureProfile::OutgoingCommand,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let cmd1 = create_command(
-                            &mut session,
-                            "user1",
-                            "event:a",
-                            serde_json::json!({"n": 1}),
-                            true,
-                            None,
-                        )
-                        .await
-                        .unwrap();
-                        let cmd2 = create_command(
-                            &mut session,
-                            "user1",
-                            "event:b",
-                            serde_json::json!({"n": 2}),
-                            true,
-                            None,
-                        )
-                        .await
-                        .unwrap();
-                        let cmd3 = create_command(
-                            &mut session,
-                            "user1",
-                            "event:c",
-                            serde_json::json!({"n": 3}),
-                            true,
-                            None,
-                        )
-                        .await
-                        .unwrap();
-                        assert!(cmd1.id < cmd2.id);
-                        assert!(cmd2.id < cmd3.id);
-                        Ok(())
-                    })
-                },
             )
+            .await
+            .expect("init outgoing command db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                let cmd1 = create_command(
+                    session,
+                    "user1",
+                    "event:a",
+                    serde_json::json!({"n": 1}),
+                    true,
+                    None,
+                )
+                .await
+                .unwrap();
+                let cmd2 = create_command(
+                    session,
+                    "user1",
+                    "event:b",
+                    serde_json::json!({"n": 2}),
+                    true,
+                    None,
+                )
+                .await
+                .unwrap();
+                let cmd3 = create_command(
+                    session,
+                    "user1",
+                    "event:c",
+                    serde_json::json!({"n": 3}),
+                    true,
+                    None,
+                )
+                .await
+                .unwrap();
+                assert!(cmd1.id < cmd2.id);
+                assert!(cmd2.id < cmd3.id);
+                Ok(())
+            })
             .await
             .expect("test_create_multiple_commands_increments_id");
         }
@@ -664,152 +664,152 @@ mod tests {
 
         #[tokio::test]
         async fn test_get_pending_commands_fifo_order() {
-            lilium_test_fixtures::with_db_session(
+            let test_db = lilium_test_fixtures::TestDb::acquire(
                 lilium_test_fixtures::FixtureProfile::OutgoingCommand,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let cmd1 = create_command(
-                            &mut session,
-                            "user1",
-                            "event:a",
-                            serde_json::json!({"n": 1}),
-                            true,
-                            None,
-                        )
-                        .await
-                        .unwrap();
-                        let cmd2 = create_command(
-                            &mut session,
-                            "user1",
-                            "event:b",
-                            serde_json::json!({"n": 2}),
-                            true,
-                            None,
-                        )
-                        .await
-                        .unwrap();
-                        let cmd3 = create_command(
-                            &mut session,
-                            "user1",
-                            "event:c",
-                            serde_json::json!({"n": 3}),
-                            true,
-                            None,
-                        )
-                        .await
-                        .unwrap();
-                        let pending = get_pending_commands(&mut session, "user1", 10)
-                            .await
-                            .unwrap();
-                        assert_eq!(pending.len(), 3);
-                        assert_eq!(pending[0].id, cmd1.id);
-                        assert_eq!(pending[1].id, cmd2.id);
-                        assert_eq!(pending[2].id, cmd3.id);
-                        Ok(())
-                    })
-                },
             )
+            .await
+            .expect("init outgoing command db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                let cmd1 = create_command(
+                    session,
+                    "user1",
+                    "event:a",
+                    serde_json::json!({"n": 1}),
+                    true,
+                    None,
+                )
+                .await
+                .unwrap();
+                let cmd2 = create_command(
+                    session,
+                    "user1",
+                    "event:b",
+                    serde_json::json!({"n": 2}),
+                    true,
+                    None,
+                )
+                .await
+                .unwrap();
+                let cmd3 = create_command(
+                    session,
+                    "user1",
+                    "event:c",
+                    serde_json::json!({"n": 3}),
+                    true,
+                    None,
+                )
+                .await
+                .unwrap();
+                let pending = get_pending_commands(session, "user1", 10)
+                    .await
+                    .unwrap();
+                assert_eq!(pending.len(), 3);
+                assert_eq!(pending[0].id, cmd1.id);
+                assert_eq!(pending[1].id, cmd2.id);
+                assert_eq!(pending[2].id, cmd3.id);
+                Ok(())
+            })
             .await
             .expect("test_get_pending_commands_fifo_order");
         }
 
         #[tokio::test]
         async fn test_get_pending_commands_filters_by_account() {
-            lilium_test_fixtures::with_db_session(
+            let test_db = lilium_test_fixtures::TestDb::acquire(
                 lilium_test_fixtures::FixtureProfile::OutgoingCommand,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        create_command(
-                            &mut session,
-                            "user1",
-                            "event:a",
-                            serde_json::json!({}),
-                            true,
-                            None,
-                        )
-                        .await
-                        .unwrap();
-                        create_command(
-                            &mut session,
-                            "user2",
-                            "event:b",
-                            serde_json::json!({}),
-                            true,
-                            None,
-                        )
-                        .await
-                        .unwrap();
-                        create_command(
-                            &mut session,
-                            "user1",
-                            "event:c",
-                            serde_json::json!({}),
-                            true,
-                            None,
-                        )
-                        .await
-                        .unwrap();
-                        let pending_user1 = get_pending_commands(&mut session, "user1", 10)
-                            .await
-                            .unwrap();
-                        assert_eq!(pending_user1.len(), 2);
-                        assert!(pending_user1.iter().all(|c| c.account_user_id == "user1"));
-                        Ok(())
-                    })
-                },
             )
+            .await
+            .expect("init outgoing command db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                create_command(
+                    session,
+                    "user1",
+                    "event:a",
+                    serde_json::json!({}),
+                    true,
+                    None,
+                )
+                .await
+                .unwrap();
+                create_command(
+                    session,
+                    "user2",
+                    "event:b",
+                    serde_json::json!({}),
+                    true,
+                    None,
+                )
+                .await
+                .unwrap();
+                create_command(
+                    session,
+                    "user1",
+                    "event:c",
+                    serde_json::json!({}),
+                    true,
+                    None,
+                )
+                .await
+                .unwrap();
+                let pending_user1 = get_pending_commands(session, "user1", 10)
+                    .await
+                    .unwrap();
+                assert_eq!(pending_user1.len(), 2);
+                assert!(pending_user1.iter().all(|c| c.account_user_id == "user1"));
+                Ok(())
+            })
             .await
             .expect("test_get_pending_commands_filters_by_account");
         }
 
         #[tokio::test]
         async fn test_get_pending_commands_respects_limit() {
-            lilium_test_fixtures::with_db_session(
+            let test_db = lilium_test_fixtures::TestDb::acquire(
                 lilium_test_fixtures::FixtureProfile::OutgoingCommand,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        for i in 0..5 {
-                            create_command(
-                                &mut session,
-                                "user1",
-                                &format!("event:{}", i),
-                                serde_json::json!({}),
-                                true,
-                                None,
-                            )
-                            .await
-                            .unwrap();
-                        }
-                        let pending = get_pending_commands(&mut session, "user1", 3)
-                            .await
-                            .unwrap();
-                        assert_eq!(pending.len(), 3);
-                        Ok(())
-                    })
-                },
             )
+            .await
+            .expect("init outgoing command db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                for i in 0..5 {
+                    create_command(
+                        session,
+                        "user1",
+                        &format!("event:{}", i),
+                        serde_json::json!({}),
+                        true,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                }
+                let pending = get_pending_commands(session, "user1", 3)
+                    .await
+                    .unwrap();
+                assert_eq!(pending.len(), 3);
+                Ok(())
+            })
             .await
             .expect("test_get_pending_commands_respects_limit");
         }
 
         #[tokio::test]
         async fn test_get_pending_commands_empty() {
-            lilium_test_fixtures::with_db_session(
+            let test_db = lilium_test_fixtures::TestDb::acquire(
                 lilium_test_fixtures::FixtureProfile::OutgoingCommand,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let pending = get_pending_commands(&mut session, "user_nonexistent", 10)
-                            .await
-                            .unwrap();
-                        assert!(pending.is_empty());
-                        Ok(())
-                    })
-                },
             )
+            .await
+            .expect("init outgoing command db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                let pending = get_pending_commands(session, "user_nonexistent", 10)
+                    .await
+                    .unwrap();
+                assert!(pending.is_empty());
+                Ok(())
+            })
             .await
             .expect("test_get_pending_commands_empty");
         }
@@ -820,17 +820,17 @@ mod tests {
 
         #[tokio::test]
         async fn test_get_command_missing() {
-            lilium_test_fixtures::with_db_session(
+            let test_db = lilium_test_fixtures::TestDb::acquire(
                 lilium_test_fixtures::FixtureProfile::OutgoingCommand,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let result = get_command(&mut session, 99999).await.unwrap();
-                        assert!(result.is_none());
-                        Ok(())
-                    })
-                },
             )
+            .await
+            .expect("init outgoing command db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                let result = get_command(session, 99999).await.unwrap();
+                assert!(result.is_none());
+                Ok(())
+            })
             .await
             .expect("test_get_command_missing");
         }
@@ -841,16 +841,16 @@ mod tests {
 
         #[tokio::test]
         async fn test_mark_processing_nonexistent_command() {
-            lilium_test_fixtures::with_db_session(
+            let test_db = lilium_test_fixtures::TestDb::acquire(
                 lilium_test_fixtures::FixtureProfile::OutgoingCommand,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        mark_processing(&mut session, 99999).await.unwrap();
-                        Ok(())
-                    })
-                },
             )
+            .await
+            .expect("init outgoing command db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                mark_processing(session, 99999).await.unwrap();
+                Ok(())
+            })
             .await
             .expect("test_mark_processing_nonexistent_command");
         }
@@ -861,16 +861,16 @@ mod tests {
 
         #[tokio::test]
         async fn test_mark_success_nonexistent_command() {
-            lilium_test_fixtures::with_db_session(
+            let test_db = lilium_test_fixtures::TestDb::acquire(
                 lilium_test_fixtures::FixtureProfile::OutgoingCommand,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        mark_success(&mut session, 99999, None).await.unwrap();
-                        Ok(())
-                    })
-                },
             )
+            .await
+            .expect("init outgoing command db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                mark_success(session, 99999, None).await.unwrap();
+                Ok(())
+            })
             .await
             .expect("test_mark_success_nonexistent_command");
         }
@@ -881,18 +881,16 @@ mod tests {
 
         #[tokio::test]
         async fn test_mark_failed_nonexistent_command() {
-            lilium_test_fixtures::with_db_session(
+            let test_db = lilium_test_fixtures::TestDb::acquire(
                 lilium_test_fixtures::FixtureProfile::OutgoingCommand,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        mark_failed(&mut session, 99999, "some error")
-                            .await
-                            .unwrap();
-                        Ok(())
-                    })
-                },
             )
+            .await
+            .expect("init outgoing command db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                mark_failed(session, 99999, "some error").await.unwrap();
+                Ok(())
+            })
             .await
             .expect("test_mark_failed_nonexistent_command");
         }
@@ -903,16 +901,16 @@ mod tests {
 
         #[tokio::test]
         async fn test_mark_timeout_nonexistent_command() {
-            lilium_test_fixtures::with_db_session(
+            let test_db = lilium_test_fixtures::TestDb::acquire(
                 lilium_test_fixtures::FixtureProfile::OutgoingCommand,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        mark_timeout(&mut session, 99999).await.unwrap();
-                        Ok(())
-                    })
-                },
             )
+            .await
+            .expect("init outgoing command db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                mark_timeout(session, 99999).await.unwrap();
+                Ok(())
+            })
             .await
             .expect("test_mark_timeout_nonexistent_command");
         }
@@ -923,19 +921,19 @@ mod tests {
 
         #[tokio::test]
         async fn test_retry_or_fail_nonexistent_command_returns_false() {
-            lilium_test_fixtures::with_db_session(
+            let test_db = lilium_test_fixtures::TestDb::acquire(
                 lilium_test_fixtures::FixtureProfile::OutgoingCommand,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let result = retry_or_fail(&mut session, 99999, "some error")
-                            .await
-                            .unwrap();
-                        assert!(!result);
-                        Ok(())
-                    })
-                },
             )
+            .await
+            .expect("init outgoing command db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                let result = retry_or_fail(session, 99999, "some error")
+                    .await
+                    .unwrap();
+                assert!(!result);
+                Ok(())
+            })
             .await
             .expect("test_retry_or_fail_nonexistent_command_returns_false");
         }
@@ -946,17 +944,17 @@ mod tests {
 
         #[tokio::test]
         async fn test_get_command_result_missing() {
-            lilium_test_fixtures::with_db_session(
+            let test_db = lilium_test_fixtures::TestDb::acquire(
                 lilium_test_fixtures::FixtureProfile::OutgoingCommand,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let result = get_command_result(&mut session, 99999).await.unwrap();
-                        assert!(result.is_none());
-                        Ok(())
-                    })
-                },
             )
+            .await
+            .expect("init outgoing command db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                let result = get_command_result(session, 99999).await.unwrap();
+                assert!(result.is_none());
+                Ok(())
+            })
             .await
             .expect("test_get_command_result_missing");
         }
@@ -967,19 +965,19 @@ mod tests {
 
         #[tokio::test]
         async fn test_prune_processed_before_returns_count() {
-            lilium_test_fixtures::with_db_session(
+            let test_db = lilium_test_fixtures::TestDb::acquire(
                 lilium_test_fixtures::FixtureProfile::OutgoingCommand,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let result = prune_processed_before(&mut session, Utc::now())
-                            .await
-                            .unwrap();
-                        assert_eq!(result, 0);
-                        Ok(())
-                    })
-                },
             )
+            .await
+            .expect("init outgoing command db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                let result = prune_processed_before(session, Utc::now())
+                    .await
+                    .unwrap();
+                assert_eq!(result, 0);
+                Ok(())
+            })
             .await
             .expect("test_prune_processed_before_returns_count");
         }
