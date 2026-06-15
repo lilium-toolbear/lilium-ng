@@ -10,9 +10,9 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::{info, warn};
 
 use lilium_common::LiliumError;
-use lilium_database::{Database, DbSessionContext};
+use lilium_database::Database;
 use lilium_models::ingestion::EventEnvelope;
-use lilium_services::event::{WebSocketEventInsert, WebSocketEventService};
+use lilium_services::event::{self, WebSocketEventInsert};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpillRecord {
@@ -342,10 +342,7 @@ impl EventWriter {
             .collect();
 
         let inserted = lilium_database::transaction!(self.database, |session| {
-            let session = DbSessionContext::new(session);
-            let mut service = WebSocketEventService::new(session);
-            service
-                .insert_events(&insert_rows)
+            event::insert_events(session, &insert_rows)
                 .await
                 .map_err(Into::into)
         })

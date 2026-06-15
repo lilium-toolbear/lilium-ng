@@ -13,8 +13,8 @@ use lilium_common::LiliumError;
 use lilium_database::{Database, DbSessionContext};
 use lilium_models::ingestion::WebSocketEvent;
 #[cfg(not(test))]
-use lilium_services::account_service::AccountService;
-use lilium_services::event::{EventProcessorOffsetService, WebSocketEventService};
+use lilium_services::account_service as account;
+use lilium_services::event;
 use lilium_services::media::MediaService;
 use lilium_services::message::MessageService;
 use lilium_services::room_member::RoomMemberService;
@@ -290,15 +290,14 @@ impl EventProcessor {
         Self::sync_users(session, &user_fetch_collector).await?;
         Self::sync_media(session, &media_message_ids).await?;
 
-        let mut offset_svc = EventProcessorOffsetService::new(DbSessionContext::new(session));
-        offset_svc
-            .update_offset(
-                &processor_id,
-                last_processed_id,
-                last_timestamp,
-                Some(Utc::now()),
-            )
-            .await?;
+        event::update_offset(
+            session,
+            &processor_id,
+            last_processed_id,
+            last_timestamp,
+            Some(Utc::now()),
+        )
+        .await?;
 
         Ok(())
     }
@@ -311,15 +310,14 @@ impl EventProcessor {
     ) -> Result<()> {
         let last_processed_id = i32::try_from(last_id)
             .map_err(|_| anyhow!("event id exceeds event_processor_offsets range"))?;
-        let mut offset_svc = EventProcessorOffsetService::new(DbSessionContext::new(session));
-        offset_svc
-            .update_offset(
-                &processor_id,
-                last_processed_id,
-                last_timestamp,
-                Some(Utc::now()),
-            )
-            .await?;
+        event::update_offset(
+            session,
+            &processor_id,
+            last_processed_id,
+            last_timestamp,
+            Some(Utc::now()),
+        )
+        .await?;
         Ok(())
     }
 
@@ -327,8 +325,7 @@ impl EventProcessor {
         session: &mut DbSessionContext<'_>,
         processor_id: String,
     ) -> Result<(i64, Option<DateTime<Utc>>)> {
-        let mut offset_svc = EventProcessorOffsetService::new(DbSessionContext::new(session));
-        let cursor = offset_svc.get_cursor(&processor_id).await?;
+        let cursor = event::get_cursor(session, &processor_id).await?;
         Ok(cursor
             .map(|c| (i64::from(c.last_processed_id), c.last_processed_timestamp))
             .unwrap_or((0, None)))
@@ -340,9 +337,7 @@ impl EventProcessor {
         last_id: i64,
         batch_size: i64,
     ) -> Result<Vec<WebSocketEvent>> {
-        let mut event_svc = WebSocketEventService::new(DbSessionContext::new(session));
-        event_svc
-            .poll_events(last_timestamp, last_id, batch_size)
+        event::poll_events(session, last_timestamp, last_id, batch_size)
             .await
             .map_err(Into::into)
     }
@@ -401,21 +396,18 @@ impl EventProcessor {
             let account_count = grouped.len();
 
             for (source_account_user_id, user_room_pairs) in grouped {
-                let account = {
-                    let mut account_service = AccountService::new(DbSessionContext::new(session));
-                    account_service.get_account(&source_account_user_id).await?
-                }
-                .ok_or_else(|| {
-                    LiliumError::service(
-                        "ACCOUNT_SYNC_ACCOUNT_NOT_FOUND",
-                        format!(
-                            "Account '{}' not found for user sync",
-                            source_account_user_id
-                        ),
-                    )
-                })?;
+                let account = { account::get_account(session, &source_account_user_id).await? }
+                    .ok_or_else(|| {
+                        LiliumError::service(
+                            "ACCOUNT_SYNC_ACCOUNT_NOT_FOUND",
+                            format!(
+                                "Account '{}' not found for user sync",
+                                source_account_user_id
+                            ),
+                        )
+                    })?;
 
-                let auth = AccountService::create_auth_client(&account)?;
+                let auth = account::create_auth_client(&account)?;
                 let mut user_service = UserService::new(DbSessionContext::new(session));
                 let (new_count, updated_count) = user_service
                     .batch_fetch_and_update_with_auth(&auth, &user_room_pairs, 1)
@@ -630,7 +622,7 @@ mod tests {
     use super::*;
     use lilium_models::dzmm::message::Message as DzmmMessage;
     use lilium_models::dzmm::room_member::RoomMember;
-    use lilium_services::event::EventProcessorOffsetService;
+    use lilium_services::event;
     use lilium_services::message::MessageService;
     use lilium_test_fixtures::{FixtureProfile, TestDb, with_db_session};
     use sqlx::query_as;
@@ -888,10 +880,7 @@ mod tests {
             .database()
             .transaction(|session| {
                 Box::pin(async move {
-                    let mut offset_service =
-                        EventProcessorOffsetService::new(DbSessionContext::new(session));
-                    offset_service
-                        .get_offset("test_processor")
+                    event::get_offset(session, "test_processor")
                         .await
                         .map_err(Into::into)
                 })
