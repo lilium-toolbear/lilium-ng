@@ -41,7 +41,7 @@ pub(crate) struct TestDatabaseLease {
     database: Mutex<Option<TestDatabase>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TestDatabaseConnection {
     inner: DbPool,
     database_url: String,
@@ -68,16 +68,21 @@ impl TestDatabaseConnection {
         &self.inner
     }
 
-    pub fn database_url(&self) -> &str {
-        &self.database_url
-    }
-
     pub fn max_connections(&self) -> u32 {
         self.max_connections
     }
 
     pub fn database_config(&self) -> lilium_database::DatabaseConfig {
         lilium_database::DatabaseConfig::from_url(self.database_url.clone(), self.max_connections)
+    }
+}
+
+impl std::fmt::Debug for TestDatabaseConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TestDatabaseConnection")
+            .field("max_connections", &self.max_connections)
+            .field("has_database_url", &true)
+            .finish()
     }
 }
 
