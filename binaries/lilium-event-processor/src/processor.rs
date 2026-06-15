@@ -1,8 +1,7 @@
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 #[cfg(not(test))]
 use std::collections::HashMap;
-use std::convert::TryFrom;
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tokio::time::{Duration, Instant, sleep};
@@ -280,16 +279,13 @@ impl EventProcessor {
             batch_cursor_id
         };
         let last_timestamp = batch_cursor_timestamp.or(start_cursor_timestamp);
-        let last_processed_id = i32::try_from(last_id)
-            .map_err(|_| anyhow!("event id exceeds event_processor_offsets range"))?;
-
         Self::sync_users(session, &user_fetch_collector).await?;
         Self::sync_media(session, &media_message_ids).await?;
 
         event::update_offset(
             session,
             &processor_id,
-            last_processed_id,
+            last_id,
             last_timestamp,
             Some(Utc::now()),
         )
@@ -304,12 +300,10 @@ impl EventProcessor {
         last_id: i64,
         last_timestamp: Option<DateTime<Utc>>,
     ) -> Result<()> {
-        let last_processed_id = i32::try_from(last_id)
-            .map_err(|_| anyhow!("event id exceeds event_processor_offsets range"))?;
         event::update_offset(
             session,
             &processor_id,
-            last_processed_id,
+            last_id,
             last_timestamp,
             Some(Utc::now()),
         )
@@ -323,7 +317,7 @@ impl EventProcessor {
     ) -> Result<(i64, Option<DateTime<Utc>>)> {
         let cursor = event::get_cursor(session, &processor_id).await?;
         Ok(cursor
-            .map(|c| (i64::from(c.last_processed_id), c.last_processed_timestamp))
+            .map(|c| (c.last_processed_id, c.last_processed_timestamp))
             .unwrap_or((0, None)))
     }
 

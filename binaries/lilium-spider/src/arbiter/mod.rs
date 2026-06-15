@@ -1,5 +1,6 @@
 use anyhow::Result;
 use lilium_database::Database;
+use lilium_services::account_service;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::UnixListener;
@@ -82,12 +83,11 @@ impl Arbiter {
 
     async fn load_enabled_accounts(&self) -> Result<Vec<String>> {
         lilium_database::transaction!(self.database, |session| {
-            sqlx::query_scalar::<_, String>(
-                "SELECT user_id FROM accounts WHERE is_enabled = true ORDER BY user_id",
-            )
-            .fetch_all(session.as_mut())
-            .await
-            .map_err(Into::into)
+            let accounts = account_service::list_accounts(session, true).await?;
+            Ok(accounts
+                .into_iter()
+                .map(|account| account.user_id)
+                .collect())
         })
         .await
     }
