@@ -16,9 +16,8 @@ use lilium_models::ingestion::WebSocketEvent;
 use lilium_services::account_service as account;
 use lilium_services::event;
 use lilium_services::media::MediaService;
-use lilium_services::message::MessageService;
-use lilium_services::room_member::RoomMemberService;
-use lilium_services::user::UserService;
+use lilium_services::message;
+use lilium_services::{room_member, user};
 
 pub struct EventProcessor {
     processor_id: String,
@@ -368,13 +367,11 @@ impl EventProcessor {
 
         #[cfg(test)]
         {
-            let mut user_service = UserService::new(DbSessionContext::new(session));
             let user_room_pairs: Vec<(String, String)> = user_fetch_collector
                 .iter()
                 .map(|(_, user_id, room_id)| (user_id.clone(), room_id.clone()))
                 .collect();
-            return user_service
-                .batch_fetch_and_update(&user_room_pairs)
+            return user::batch_fetch_and_update(session, &user_room_pairs)
                 .await
                 .map(|_| ());
         }
@@ -406,10 +403,9 @@ impl EventProcessor {
                     })?;
 
                 let auth = account::create_auth_client(&account)?;
-                let mut user_service = UserService::new(DbSessionContext::new(session));
-                let (new_count, updated_count) = user_service
-                    .batch_fetch_and_update_with_auth(&auth, &user_room_pairs, 1)
-                    .await?;
+                let (new_count, updated_count) =
+                    user::batch_fetch_and_update_with_auth(session, &auth, &user_room_pairs, 1)
+                        .await?;
                 total_new += new_count;
                 total_updated += updated_count;
             }
@@ -469,11 +465,7 @@ impl EventProcessor {
                 if let Some(msg) =
                     lilium_models::dzmm::message::Message::from_websocket(&event.data)
                 {
-                    let created = {
-                        let mut message_service =
-                            MessageService::new(DbSessionContext::new(session));
-                        message_service.create_message_if_missing(&msg).await?
-                    };
+                    let created = message::create_message_if_missing(session, &msg).await?;
 
                     if !created {
                         return Ok(None);
@@ -490,23 +482,23 @@ impl EventProcessor {
                     if msg.content_type == "system" {
                         if let Some(content_text) = msg.content_text.as_deref() {
                             if content_text.contains("加入了群聊") && !msg.sent_by.is_empty() {
-                                let mut room_member_service =
-                                    RoomMemberService::new(DbSessionContext::new(session));
-                                room_member_service
-                                    .upsert_member_simple(
-                                        &msg.room_id,
-                                        &msg.sent_by,
-                                        "member",
-                                        Some(msg.sent_at),
-                                    )
-                                    .await?;
+                                room_member::upsert_member_simple(
+                                    session,
+                                    &msg.room_id,
+                                    &msg.sent_by,
+                                    "member",
+                                    Some(msg.sent_at),
+                                )
+                                .await?;
                             } else if content_text.contains("离开了群聊") && !msg.sent_by.is_empty()
                             {
-                                let mut room_member_service =
-                                    RoomMemberService::new(DbSessionContext::new(session));
-                                let _ = room_member_service
-                                    .mark_member_left(&msg.room_id, &msg.sent_by, Some(msg.sent_at))
-                                    .await?;
+                                let _ = room_member::mark_member_left(
+                                    session,
+                                    &msg.room_id,
+                                    &msg.sent_by,
+                                    Some(msg.sent_at),
+                                )
+                                .await?;
                             }
                         }
                     }
@@ -537,25 +529,20 @@ impl EventProcessor {
             }
             "message:updated" => {
                 if let Some(message_id) = event.data.get("messageId").and_then(|v| v.as_str()) {
-                    let mut message_service = MessageService::new(DbSessionContext::new(session));
-                    message_service
-                        .update_message_from_payload(message_id, &event.data)
-                        .await?;
+                    message::update_message_from_payload(session, message_id, &event.data).await?;
                 }
                 Ok(None)
             }
             "message:deleted" => {
                 if let Some(message_id) = event.data.get("messageId").and_then(|v| v.as_str()) {
                     let deleted_by = event.data.get("deletedBy").and_then(|v| v.as_str());
-                    let mut message_service = MessageService::new(DbSessionContext::new(session));
-                    message_service.mark_deleted(message_id, deleted_by).await?;
+                    message::mark_deleted(session, message_id, deleted_by).await?;
                 }
                 Ok(None)
             }
             "message:recalled" => {
                 if let Some(message_id) = event.data.get("messageId").and_then(|v| v.as_str()) {
-                    let mut message_service = MessageService::new(DbSessionContext::new(session));
-                    message_service.mark_recalled(message_id).await?;
+                    message::mark_recalled(session, message_id).await?;
                 }
                 Ok(None)
             }
@@ -574,11 +561,14 @@ impl EventProcessor {
             "group:member-joined" => {
                 if let Some(user_id) = event.data.get("userId").and_then(|v| v.as_str()) {
                     if let Some(room_id) = event.data.get("chatroomId").and_then(|v| v.as_str()) {
-                        let mut room_member_service =
-                            RoomMemberService::new(DbSessionContext::new(session));
-                        room_member_service
-                            .upsert_member_simple(room_id, user_id, "member", Some(event.timestamp))
-                            .await?;
+                        room_member::upsert_member_simple(
+                            session,
+                            room_id,
+                            user_id,
+                            "member",
+                            Some(event.timestamp),
+                        )
+                        .await?;
                         user_fetch_collector.push((
                             event.user_id.clone(),
                             user_id.to_string(),
@@ -591,11 +581,13 @@ impl EventProcessor {
             "group:member-left" => {
                 if let Some(user_id) = event.data.get("userId").and_then(|v| v.as_str()) {
                     if let Some(room_id) = event.data.get("chatroomId").and_then(|v| v.as_str()) {
-                        let mut room_member_service =
-                            RoomMemberService::new(DbSessionContext::new(session));
-                        let _ = room_member_service
-                            .mark_member_left(room_id, user_id, Some(event.timestamp))
-                            .await?;
+                        let _ = room_member::mark_member_left(
+                            session,
+                            room_id,
+                            user_id,
+                            Some(event.timestamp),
+                        )
+                        .await?;
                     }
                 }
                 Ok(None)
@@ -621,7 +613,7 @@ mod tests {
     use lilium_models::dzmm::message::Message as DzmmMessage;
     use lilium_models::dzmm::room_member::RoomMember;
     use lilium_services::event;
-    use lilium_services::message::MessageService;
+    use lilium_services::message;
     use lilium_test_fixtures::{FixtureProfile, TestDb, with_db_session};
     use sqlx::query_as;
 
@@ -705,9 +697,6 @@ mod tests {
                     )]
                 );
 
-                let message_service = MessageService::new(DbSessionContext::new(&mut session));
-                drop(message_service);
-
                 let mut member_session = session;
                 let member = room_member_row(&mut member_session, "room_1", "user_joined")
                     .await?
@@ -729,16 +718,14 @@ mod tests {
         with_db_session(FixtureProfile::Shared, |session| {
             Box::pin(async move {
                 let mut session = session;
-                let mut room_member_service =
-                    RoomMemberService::new(DbSessionContext::new(&mut session));
-                room_member_service
-                    .upsert_member_simple(
-                        "room_1",
-                        "user_left",
-                        "member",
-                        Some(utc("2026-06-01T00:00:00Z")),
-                    )
-                    .await?;
+                room_member::upsert_member_simple(
+                    &mut session,
+                    "room_1",
+                    "user_left",
+                    "member",
+                    Some(utc("2026-06-01T00:00:00Z")),
+                )
+                .await?;
 
                 let event = websocket_event(
                     12,
@@ -802,8 +789,7 @@ mod tests {
                     reference_message_id: None,
                     reference_data: None,
                 };
-                let mut message_service = MessageService::new(DbSessionContext::new(&mut session));
-                message_service.create_message(&message).await?;
+                message::create_message(&mut session, &message).await?;
 
                 let event = websocket_event(
                     13,
@@ -822,9 +808,7 @@ mod tests {
                     .await
                     .expect("process event");
 
-                let mut message_service = MessageService::new(DbSessionContext::new(&mut session));
-                let updated = message_service
-                    .get_by_id_at("msg_deleted", sent_at, false)
+                let updated = message::get_by_id_at(&mut session, "msg_deleted", sent_at, false)
                     .await?
                     .expect("message exists");
 

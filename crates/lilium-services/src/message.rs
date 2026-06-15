@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use lilium_common::LiliumError;
-use lilium_database::DbSessionContext;
+use lilium_database::DbSession;
 
 use lilium_models::dzmm::message::Message;
 use tracing::instrument;
@@ -29,10 +29,6 @@ const SELECT_MESSAGE_COLS: &str = r#"message_id, room_id, sent_at, sent_by, cont
     metadata, raw_data, source, created_at, updated_at,
     is_deleted, deleted_at, deleted_by, is_recalled, is_edited,
     history, reference_message_id, reference_data"#;
-
-pub struct MessageService<'a> {
-    session: DbSessionContext<'a>,
-}
 
 #[derive(Debug, Clone)]
 enum BindVal {
@@ -243,6 +239,80 @@ fn apply_binds<'q>(
     q
 }
 
+async fn insert_message_if_missing(session: &mut DbSession, message: &Message) -> Result<bool> {
+    let result = sqlx::query(
+        r#"INSERT INTO messages (
+               message_id, room_id, sent_at, sent_by, content_type, content_text,
+               raw_data, source, created_at, is_deleted, is_recalled, is_edited, history
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+           ON CONFLICT DO NOTHING"#,
+    )
+    .bind(&message.message_id)
+    .bind(&message.room_id)
+    .bind(message.sent_at)
+    .bind(&message.sent_by)
+    .bind(&message.content_type)
+    .bind(&message.content_text)
+    .bind(&message.raw_data)
+    .bind(&message.source)
+    .bind(message.created_at)
+    .bind(message.is_deleted)
+    .bind(message.is_recalled)
+    .bind(message.is_edited)
+    .bind(&message.history)
+    .execute(session.as_mut())
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+async fn set_message_recalled(session: &mut DbSession, message_id: &str) -> Result<()> {
+    sqlx::query("UPDATE messages SET is_recalled = true, updated_at = NOW() WHERE message_id = $1")
+        .bind(message_id)
+        .execute(session.as_mut())
+        .await?;
+    Ok(())
+}
+
+async fn get_message_by_id_at(
+    session: &mut DbSession,
+    message_id: &str,
+    sent_at: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<Message>> {
+    sqlx::query_as::<_, Message>(
+        r#"SELECT message_id, room_id, sent_at, sent_by, content_type, content_text,
+           content_tsv::text, attachment_url, attachment_file, sticker_id, alt_text,
+           metadata, raw_data, source, created_at, updated_at,
+           is_deleted, deleted_at, deleted_by, is_recalled, is_edited,
+           history, reference_message_id, reference_data
+           FROM messages
+           WHERE message_id = $1 AND sent_at = $2"#,
+    )
+    .bind(message_id)
+    .bind(sent_at)
+    .fetch_optional(session.as_mut())
+    .await
+    .map_err(|e| e.into())
+}
+
+async fn update_message_content(session: &mut DbSession, message_id: &str, text: &str) -> Result<()> {
+    sqlx::query(
+        r#"UPDATE messages SET
+           content_text = $1,
+           is_edited = true,
+           updated_at = NOW(),
+           history = COALESCE(history, '[]'::jsonb) || jsonb_build_object(
+               'content', content_text,
+               'edited_at', NOW()
+           )
+           WHERE message_id = $2"#,
+    )
+    .bind(text)
+    .bind(message_id)
+    .execute(session.as_mut())
+    .await?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct MessageFilters {
     pub room_id: Option<String>,
@@ -394,15 +464,9 @@ fn encode_cursor_three(
     )
 }
 
-impl<'a> MessageService<'a> {
-    #[instrument(skip(session))]
-    pub fn new(session: DbSessionContext<'a>) -> Self {
-        Self { session }
-    }
-
-    #[instrument(skip(self, filters, pagination), fields(enriched))]
+    #[instrument(skip(session, filters, pagination), fields(enriched))]
     pub async fn get_messages(
-        &mut self,
+        session: &mut DbSession,
         filters: &MessageFilters,
         pagination: &PaginationParams,
         enriched: bool,
@@ -556,7 +620,7 @@ impl<'a> MessageService<'a> {
         }
 
         q = q.bind(per_page + 1);
-        let mut messages = q.fetch_all(self.session.as_mut()).await?;
+        let mut messages = q.fetch_all(session.as_mut()).await?;
 
         let has_more = messages.len() as i64 > per_page;
         if has_more {
@@ -585,9 +649,9 @@ impl<'a> MessageService<'a> {
         })
     }
 
-    #[instrument(skip(self), fields(message_id = %message_id, enriched))]
+    #[instrument(skip(session), fields(message_id = %message_id, enriched))]
     pub async fn get_by_id(
-        &mut self,
+        session: &mut DbSession,
         message_id: &str,
         enriched: bool,
     ) -> Result<Option<EnrichedMessage>> {
@@ -607,14 +671,14 @@ impl<'a> MessageService<'a> {
             select_clause, join_clause,
         ))
         .bind(message_id)
-        .fetch_optional(self.session.as_mut())
+        .fetch_optional(session.as_mut())
         .await
         .map_err(anyhow::Error::from)
     }
 
-    #[instrument(skip(self), fields(message_id = %message_id, sent_at = %sent_at, enriched))]
+    #[instrument(skip(session), fields(message_id = %message_id, sent_at = %sent_at, enriched))]
     pub async fn get_by_id_at(
-        &mut self,
+        session: &mut DbSession,
         message_id: &str,
         sent_at: DateTime<Utc>,
         enriched: bool,
@@ -636,14 +700,14 @@ impl<'a> MessageService<'a> {
         ))
         .bind(message_id)
         .bind(sent_at)
-        .fetch_optional(self.session.as_mut())
+        .fetch_optional(session.as_mut())
         .await
         .map_err(anyhow::Error::from)
     }
 
-    #[instrument(skip(self), fields(message_id = %message_id, before_count, after_count))]
+    #[instrument(skip(session), fields(message_id = %message_id, before_count, after_count))]
     pub async fn get_context(
-        &mut self,
+        session: &mut DbSession,
         message_id: &str,
         before_count: i64,
         after_count: i64,
@@ -653,7 +717,7 @@ impl<'a> MessageService<'a> {
             SELECT_MESSAGE_COLS
         ))
         .bind(message_id)
-        .fetch_optional(self.session.as_mut())
+        .fetch_optional(session.as_mut())
         .await?;
 
         let anchor = match anchor {
@@ -673,7 +737,7 @@ impl<'a> MessageService<'a> {
         .bind(anchor.sent_at)
         .bind(&anchor.message_id)
         .bind(before_limit)
-        .fetch_all(self.session.as_mut())
+        .fetch_all(session.as_mut())
         .await?;
 
         let after = sqlx::query_as::<_, EnrichedMessage>(&format!(
@@ -685,10 +749,10 @@ impl<'a> MessageService<'a> {
         .bind(anchor.sent_at)
         .bind(&anchor.message_id)
         .bind(after_limit)
-        .fetch_all(self.session.as_mut())
+        .fetch_all(session.as_mut())
         .await?;
 
-        let anchor_enriched = self.enrich_single(&anchor).await?;
+        let anchor_enriched = enrich_single(session, &anchor).await?;
         let before_count_actual = before.len() as i64;
         let after_count_actual = after.len() as i64;
 
@@ -706,13 +770,13 @@ impl<'a> MessageService<'a> {
         }))
     }
 
-    #[instrument(skip(self), fields(message_id = %message_id, count))]
+    #[instrument(skip(session), fields(message_id = %message_id, count))]
     pub async fn get_before(
-        &mut self,
+        session: &mut DbSession,
         message_id: &str,
         count: i64,
     ) -> Result<Vec<EnrichedMessage>> {
-        let target = self.get_by_id(message_id, false).await?;
+        let target = get_by_id(session, message_id, false).await?;
         let target = match target {
             Some(m) => m,
             None => return Ok(Vec::new()),
@@ -729,20 +793,20 @@ impl<'a> MessageService<'a> {
         .bind(target.sent_at)
         .bind(&target.message_id)
         .bind(limit)
-        .fetch_all(self.session.as_mut())
+        .fetch_all(session.as_mut())
         .await?;
 
         messages.reverse();
         Ok(messages)
     }
 
-    #[instrument(skip(self), fields(message_id = %message_id, count))]
+    #[instrument(skip(session), fields(message_id = %message_id, count))]
     pub async fn get_after(
-        &mut self,
+        session: &mut DbSession,
         message_id: &str,
         count: i64,
     ) -> Result<Vec<EnrichedMessage>> {
-        let target = self.get_by_id(message_id, false).await?;
+        let target = get_by_id(session, message_id, false).await?;
         let target = match target {
             Some(m) => m,
             None => return Ok(Vec::new()),
@@ -759,23 +823,23 @@ impl<'a> MessageService<'a> {
         .bind(target.sent_at)
         .bind(&target.message_id)
         .bind(limit)
-        .fetch_all(self.session.as_mut())
+        .fetch_all(session.as_mut())
         .await
         .map_err(anyhow::Error::from)
     }
 
-    async fn enrich_single(&mut self, message: &Message) -> Result<EnrichedMessage> {
+    async fn enrich_single(session: &mut DbSession, message: &Message) -> Result<EnrichedMessage> {
         let user_data = sqlx::query_as::<_, (Option<String>, Option<String>)>(
             "SELECT full_name, avatar_url FROM users WHERE user_id = $1",
         )
         .bind(&message.sent_by)
-        .fetch_optional(self.session.as_mut())
+        .fetch_optional(session.as_mut())
         .await?;
 
         let room_data =
             sqlx::query_as::<_, (Option<String>,)>("SELECT title FROM rooms WHERE room_id = $1")
                 .bind(&message.room_id)
-                .fetch_optional(self.session.as_mut())
+                .fetch_optional(session.as_mut())
                 .await?;
 
         let (user_display_name, user_avatar_url) = user_data.unwrap_or((None, None));
@@ -812,8 +876,8 @@ impl<'a> MessageService<'a> {
         })
     }
 
-    #[instrument(skip(self, messages), fields(message_count = messages.len()))]
-    pub async fn enrich_batch(&mut self, messages: &[Message]) -> Result<Vec<EnrichedMessage>> {
+    #[instrument(skip(session, messages), fields(message_count = messages.len()))]
+    pub async fn enrich_batch(session: &mut DbSession, messages: &[Message]) -> Result<Vec<EnrichedMessage>> {
         if messages.is_empty() {
             return Ok(Vec::new());
         }
@@ -838,7 +902,7 @@ impl<'a> MessageService<'a> {
                 "SELECT user_id, full_name, avatar_url FROM users WHERE user_id = ANY($1)",
             )
             .bind(&user_ids)
-            .fetch_all(self.session.as_mut())
+            .fetch_all(session.as_mut())
             .await?;
             rows.into_iter()
                 .map(|(id, name, avatar)| (id, (name, avatar)))
@@ -852,7 +916,7 @@ impl<'a> MessageService<'a> {
                 "SELECT room_id, title FROM rooms WHERE room_id = ANY($1)",
             )
             .bind(&room_ids)
-            .fetch_all(self.session.as_mut())
+            .fetch_all(session.as_mut())
             .await?;
             rows.into_iter().collect()
         } else {
@@ -900,9 +964,9 @@ impl<'a> MessageService<'a> {
         Ok(enriched)
     }
 
-    #[instrument(skip(self), fields(room_id = ?room_id, limit))]
+    #[instrument(skip(session), fields(room_id = ?room_id, limit))]
     pub async fn get_deleted_messages(
-        &mut self,
+        session: &mut DbSession,
         room_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<Message>> {
@@ -928,12 +992,12 @@ impl<'a> MessageService<'a> {
             q = q.bind(rid);
         }
         q = q.bind(limit);
-        let rows = q.fetch_all(self.session.as_mut()).await?;
+        let rows = q.fetch_all(session.as_mut()).await?;
         Ok(rows)
     }
 
-    #[instrument(skip(self), fields(room_id = %room_id))]
-    pub async fn get_room_stats(&mut self, room_id: &str) -> Result<MessageStats> {
+    #[instrument(skip(session), fields(room_id = %room_id))]
+    pub async fn get_room_stats(session: &mut DbSession, room_id: &str) -> Result<MessageStats> {
         let row = sqlx::query_as::<_, (i64, i64, i64, i64)>(
             "SELECT COUNT(*)::bigint,
                     COALESCE(SUM(CASE WHEN is_deleted THEN 1 ELSE 0 END), 0)::bigint,
@@ -942,14 +1006,14 @@ impl<'a> MessageService<'a> {
              FROM messages WHERE room_id = $1",
         )
         .bind(room_id)
-        .fetch_one(self.session.as_mut())
+        .fetch_one(session.as_mut())
         .await?;
 
         let type_rows = sqlx::query_as::<_, (String, i64)>(
             "SELECT content_type, COUNT(*)::bigint FROM messages WHERE room_id = $1 GROUP BY content_type",
         )
         .bind(room_id)
-        .fetch_all(self.session.as_mut())
+        .fetch_all(session.as_mut())
         .await?;
 
         Ok(MessageStats {
@@ -962,8 +1026,8 @@ impl<'a> MessageService<'a> {
         })
     }
 
-    #[instrument(skip(self), fields(user_id = %user_id))]
-    pub async fn get_user_stats(&mut self, user_id: &str) -> Result<MessageStats> {
+    #[instrument(skip(session), fields(user_id = %user_id))]
+    pub async fn get_user_stats(session: &mut DbSession, user_id: &str) -> Result<MessageStats> {
         let row = sqlx::query_as::<_, (i64, i64, i64, i64)>(
             "SELECT COUNT(*)::bigint,
                     COALESCE(SUM(CASE WHEN is_deleted THEN 1 ELSE 0 END), 0)::bigint,
@@ -972,21 +1036,21 @@ impl<'a> MessageService<'a> {
              FROM messages WHERE sent_by = $1",
         )
         .bind(user_id)
-        .fetch_one(self.session.as_mut())
+        .fetch_one(session.as_mut())
         .await?;
 
         let type_rows = sqlx::query_as::<_, (String, i64)>(
             "SELECT content_type, COUNT(*)::bigint FROM messages WHERE sent_by = $1 GROUP BY content_type",
         )
         .bind(user_id)
-        .fetch_all(self.session.as_mut())
+        .fetch_all(session.as_mut())
         .await?;
 
         let room_rows = sqlx::query_as::<_, (String, i64)>(
             "SELECT room_id, COUNT(*)::bigint FROM messages WHERE sent_by = $1 GROUP BY room_id ORDER BY COUNT(*) DESC LIMIT 10",
         )
         .bind(user_id)
-        .fetch_all(self.session.as_mut())
+        .fetch_all(session.as_mut())
         .await?;
 
         Ok(MessageStats {
@@ -999,19 +1063,19 @@ impl<'a> MessageService<'a> {
         })
     }
 
-    #[instrument(skip(self), fields(message_id = %message_id))]
-    pub async fn message_exists(&mut self, message_id: &str) -> Result<bool> {
+    #[instrument(skip(session), fields(message_id = %message_id))]
+    pub async fn message_exists(session: &mut DbSession, message_id: &str) -> Result<bool> {
         let exists = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM messages WHERE message_id = $1)",
         )
         .bind(message_id)
-        .fetch_one(self.session.as_mut())
+        .fetch_one(session.as_mut())
         .await?;
         Ok(exists)
     }
 
-    #[instrument(skip(self, message), fields(message_id = %message.message_id))]
-    pub async fn create_message(&mut self, message: &Message) -> Result<()> {
+    #[instrument(skip(session, message), fields(message_id = %message.message_id))]
+    pub async fn create_message(session: &mut DbSession, message: &Message) -> Result<()> {
         sqlx::query(
             r#"INSERT INTO messages (message_id, room_id, sent_at, sent_by, content_type, content_text,
                attachment_url, attachment_file, sticker_id, alt_text, metadata, raw_data, source,
@@ -1042,23 +1106,23 @@ impl<'a> MessageService<'a> {
         .bind(&message.history)
         .bind(&message.reference_message_id)
         .bind(&message.reference_data)
-        .execute(self.session.as_mut())
+        .execute(session.as_mut())
         .await?;
         Ok(())
     }
 
-    #[instrument(skip(self, message), fields(message_id = %message.message_id))]
-    pub async fn create_message_if_missing(&mut self, message: &Message) -> Result<bool> {
-        lilium_database::queries::messages::create_message_if_missing(
-            self.session.as_mut(),
+    #[instrument(skip(session, message), fields(message_id = %message.message_id))]
+    pub async fn create_message_if_missing(session: &mut DbSession, message: &Message) -> Result<bool> {
+        insert_message_if_missing(
+            session,
             message,
         )
         .await
     }
 
-    #[instrument(skip(self, messages), fields(message_count = messages.len()))]
+    #[instrument(skip(session, messages), fields(message_count = messages.len()))]
     pub async fn batch_create_if_missing(
-        &mut self,
+        session: &mut DbSession,
         messages: &[Message],
     ) -> Result<Vec<(String, DateTime<Utc>)>> {
         if messages.is_empty() {
@@ -1128,12 +1192,12 @@ impl<'a> MessageService<'a> {
                 .bind(&msg.history);
         }
 
-        let rows = q.fetch_all(self.session.as_mut()).await?;
+        let rows = q.fetch_all(session.as_mut()).await?;
         Ok(rows)
     }
 
-    #[instrument(skip(self, message), fields(message_id = %message.message_id))]
-    pub async fn update_message(&mut self, message: &Message) -> Result<()> {
+    #[instrument(skip(session, message), fields(message_id = %message.message_id))]
+    pub async fn update_message(session: &mut DbSession, message: &Message) -> Result<()> {
         sqlx::query(
             r#"UPDATE messages SET
                content_type = $3, content_text = $4, attachment_url = $5,
@@ -1152,20 +1216,20 @@ impl<'a> MessageService<'a> {
         .bind(&message.metadata)
         .bind(message.is_edited)
         .bind(&message.history)
-        .execute(self.session.as_mut())
+        .execute(session.as_mut())
         .await?;
         Ok(())
     }
 
-    #[instrument(skip(self, payload), fields(message_id = %message_id))]
+    #[instrument(skip(session, payload), fields(message_id = %message_id))]
     pub async fn update_message_from_payload(
-        &mut self,
+        session: &mut DbSession,
         message_id: &str,
         payload: &serde_json::Value,
     ) -> Result<()> {
         if let Some(content) = payload.get("message").and_then(|m| m.get("content")) {
             if content.get("type").and_then(|v| v.as_str()) == Some("recalled") {
-                lilium_database::queries::messages::mark_recalled(self.session.as_mut(), message_id)
+                set_message_recalled(session, message_id)
                     .await
             } else {
                 let sent_at = payload
@@ -1176,8 +1240,8 @@ impl<'a> MessageService<'a> {
                     .map(|dt| dt.with_timezone(&chrono::Utc));
 
                 if let Some(sent_at) = sent_at {
-                    let existing = lilium_database::queries::messages::get_by_id_at(
-                        self.session.as_mut(),
+                    let existing = get_message_by_id_at(
+                        session,
                         message_id,
                         sent_at,
                     )
@@ -1186,8 +1250,8 @@ impl<'a> MessageService<'a> {
                         return Ok(());
                     }
                     if let Some(text) = content.get("text").and_then(|v| v.as_str()) {
-                        lilium_database::queries::messages::update_content(
-                            self.session.as_mut(),
+                        update_message_content(
+                            session,
                             message_id,
                             text,
                         )
@@ -1204,8 +1268,8 @@ impl<'a> MessageService<'a> {
         }
     }
 
-    #[instrument(skip(self), fields(message_id = %message_id, has_deleted_by = deleted_by.is_some()))]
-    pub async fn mark_deleted(&mut self, message_id: &str, deleted_by: Option<&str>) -> Result<()> {
+    #[instrument(skip(session), fields(message_id = %message_id, has_deleted_by = deleted_by.is_some()))]
+    pub async fn mark_deleted(session: &mut DbSession, message_id: &str, deleted_by: Option<&str>) -> Result<()> {
         sqlx::query(
             r#"UPDATE messages
                SET is_deleted = true, deleted_at = NOW(), deleted_by = $2, updated_at = NOW()
@@ -1213,14 +1277,14 @@ impl<'a> MessageService<'a> {
         )
         .bind(message_id)
         .bind(deleted_by)
-        .execute(self.session.as_mut())
+        .execute(session.as_mut())
         .await?;
         Ok(())
     }
 
-    #[instrument(skip(self, message_ids), fields(message_count = message_ids.len(), has_deleted_by = deleted_by.is_some()))]
+    #[instrument(skip(session, message_ids), fields(message_count = message_ids.len(), has_deleted_by = deleted_by.is_some()))]
     pub async fn mark_deleted_batch(
-        &mut self,
+        session: &mut DbSession,
         message_ids: &[String],
         deleted_by: Option<&str>,
     ) -> Result<i64> {
@@ -1234,18 +1298,18 @@ impl<'a> MessageService<'a> {
         )
         .bind(message_ids)
         .bind(deleted_by)
-        .execute(self.session.as_mut())
+        .execute(session.as_mut())
         .await?;
         Ok(result.rows_affected() as i64)
     }
 
-    #[instrument(skip(self), fields(message_id = %message_id))]
-    pub async fn mark_recalled(&mut self, message_id: &str) -> Result<()> {
-        lilium_database::queries::messages::mark_recalled(self.session.as_mut(), message_id).await
+    #[instrument(skip(session), fields(message_id = %message_id))]
+    pub async fn mark_recalled(session: &mut DbSession, message_id: &str) -> Result<()> {
+        set_message_recalled(session, message_id).await
     }
 
-    #[instrument(skip(self, message_ids), fields(message_count = message_ids.len()))]
-    pub async fn mark_recalled_batch(&mut self, message_ids: &[String]) -> Result<i64> {
+    #[instrument(skip(session, message_ids), fields(message_count = message_ids.len()))]
+    pub async fn mark_recalled_batch(session: &mut DbSession, message_ids: &[String]) -> Result<i64> {
         if message_ids.is_empty() {
             return Ok(0);
         }
@@ -1253,13 +1317,13 @@ impl<'a> MessageService<'a> {
             "UPDATE messages SET is_recalled = true, updated_at = NOW() WHERE message_id = ANY($1)",
         )
         .bind(message_ids)
-        .execute(self.session.as_mut())
+        .execute(session.as_mut())
         .await?;
         Ok(result.rows_affected() as i64)
     }
 
-    #[instrument(skip(self, messages), fields(message_count = messages.len()))]
-    pub async fn batch_create(&mut self, messages: &[Message]) -> Result<i64> {
+    #[instrument(skip(session, messages), fields(message_count = messages.len()))]
+    pub async fn batch_create(session: &mut DbSession, messages: &[Message]) -> Result<i64> {
         if messages.is_empty() {
             return Ok(0);
         }
@@ -1310,40 +1374,40 @@ impl<'a> MessageService<'a> {
                 .bind(&msg.reference_data);
         }
 
-        let result = q.execute(self.session.as_mut()).await?;
+        let result = q.execute(session.as_mut()).await?;
         Ok(result.rows_affected() as i64)
     }
 
-    #[instrument(skip(self), fields(room_id = %room_id))]
+    #[instrument(skip(session), fields(room_id = %room_id))]
     pub async fn get_latest_message_time(
-        &mut self,
+        session: &mut DbSession,
         room_id: &str,
     ) -> Result<Option<DateTime<Utc>>> {
         sqlx::query_scalar(
             "SELECT sent_at FROM messages WHERE room_id = $1 ORDER BY sent_at DESC LIMIT 1",
         )
         .bind(room_id)
-        .fetch_optional(self.session.as_mut())
+        .fetch_optional(session.as_mut())
         .await
         .map_err(anyhow::Error::from)
     }
 
-    #[instrument(skip(self), fields(room_id = %room_id))]
+    #[instrument(skip(session), fields(room_id = %room_id))]
     pub async fn get_earliest_message_time(
-        &mut self,
+        session: &mut DbSession,
         room_id: &str,
     ) -> Result<Option<DateTime<Utc>>> {
         sqlx::query_scalar(
             "SELECT sent_at FROM messages WHERE room_id = $1 ORDER BY sent_at ASC LIMIT 1",
         )
         .bind(room_id)
-        .fetch_optional(self.session.as_mut())
+        .fetch_optional(session.as_mut())
         .await
         .map_err(anyhow::Error::from)
     }
 
-    #[instrument(skip(self, filters), fields(has_gps_only = filters.gps_only.unwrap_or(false)))]
-    pub async fn count_messages(&mut self, filters: &MessageFilters) -> Result<MessageCounts> {
+    #[instrument(skip(session, filters), fields(has_gps_only = filters.gps_only.unwrap_or(false)))]
+    pub async fn count_messages(session: &mut DbSession, filters: &MessageFilters) -> Result<MessageCounts> {
         let query_parts = build_query_parts(filters, false);
 
         if query_parts.params.is_empty()
@@ -1357,7 +1421,7 @@ impl<'a> MessageService<'a> {
                         COALESCE(SUM(edited_count), 0)::bigint
                  FROM rooms",
             )
-            .fetch_one(self.session.as_mut())
+            .fetch_one(session.as_mut())
             .await?;
 
             return Ok(MessageCounts {
@@ -1387,7 +1451,7 @@ impl<'a> MessageService<'a> {
             };
         }
 
-        let row = q.fetch_one(self.session.as_mut()).await?;
+        let row = q.fetch_one(session.as_mut()).await?;
 
         Ok(MessageCounts {
             total_messages: row.0,
@@ -1396,7 +1460,6 @@ impl<'a> MessageService<'a> {
             edited_messages: row.3,
         })
     }
-}
 
 impl sqlx::FromRow<'_, sqlx::postgres::PgRow> for EnrichedMessage {
     fn from_row(row: &sqlx::postgres::PgRow) -> sqlx::Result<Self> {
@@ -2134,18 +2197,20 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn service_struct_can_be_created() {
+        async fn message_exists_can_be_called_directly() {
             lilium_test_fixtures::with_db_session(
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut _svc = MessageService::new(session);
+                        let mut session = session;
+                        let exists = message_exists(&mut session, "__nonexistent__").await.expect("query");
+                        assert!(!exists);
                         Ok(())
                     })
                 },
             )
             .await
-            .expect("service_struct_can_be_created");
+            .expect("message_exists_can_be_called_directly");
         }
 
         #[tokio::test]
@@ -2154,7 +2219,7 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
+                        let mut session = session;
                         let filters = MessageFilters::default();
                         let pagination = PaginationParams {
                             limit: 100,
@@ -2164,8 +2229,7 @@ mod tests {
                             page: None,
                             sort_by: None,
                         };
-                        let result = svc
-                            .get_messages(&filters, &pagination, true)
+                        let result = get_messages(&mut session, &filters, &pagination, true)
                             .await
                             .expect("query");
                         assert!(result.data.len() <= 100);
@@ -2183,7 +2247,7 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
+                        let mut session = session;
                         let filters = MessageFilters::default();
                         let pagination = PaginationParams {
                             limit: 100,
@@ -2193,8 +2257,7 @@ mod tests {
                             page: None,
                             sort_by: None,
                         };
-                        let result = svc
-                            .get_messages(&filters, &pagination, true)
+                        let result = get_messages(&mut session, &filters, &pagination, true)
                             .await
                             .expect("query");
                         for i in 0..result.data.len().saturating_sub(1) {
@@ -2214,7 +2277,7 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
+                        let mut session = session;
                         let filters = MessageFilters::default();
                         let pagination = PaginationParams {
                             limit: 100,
@@ -2224,8 +2287,7 @@ mod tests {
                             page: None,
                             sort_by: None,
                         };
-                        let result = svc
-                            .get_messages(&filters, &pagination, true)
+                        let result = get_messages(&mut session, &filters, &pagination, true)
                             .await
                             .expect("query");
                         for i in 0..result.data.len().saturating_sub(1) {
@@ -2245,7 +2307,7 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
+                        let mut session = session;
                         let filters = MessageFilters {
                             room_id: Some("room1".into()),
                             ..Default::default()
@@ -2258,8 +2320,7 @@ mod tests {
                             page: None,
                             sort_by: None,
                         };
-                        let result = svc
-                            .get_messages(&filters, &pagination, true)
+                        let result = get_messages(&mut session, &filters, &pagination, true)
                             .await
                             .expect("query");
                         assert!(result.data.iter().all(|m| m.room_id == "room1"));
@@ -2277,7 +2338,7 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
+                        let mut session = session;
                         let filters = MessageFilters {
                             user_id: Some("user1".into()),
                             ..Default::default()
@@ -2290,8 +2351,7 @@ mod tests {
                             page: None,
                             sort_by: None,
                         };
-                        let result = svc
-                            .get_messages(&filters, &pagination, true)
+                        let result = get_messages(&mut session, &filters, &pagination, true)
                             .await
                             .expect("query");
                         assert!(result.data.iter().all(|m| m.sent_by == "user1"));
@@ -2309,7 +2369,7 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
+                        let mut session = session;
                         let filters = MessageFilters {
                             content_types: Some(vec!["text".into()]),
                             ..Default::default()
@@ -2322,8 +2382,7 @@ mod tests {
                             page: None,
                             sort_by: None,
                         };
-                        let result = svc
-                            .get_messages(&filters, &pagination, true)
+                        let result = get_messages(&mut session, &filters, &pagination, true)
                             .await
                             .expect("query");
                         assert!(result.data.iter().all(|m| m.content_type == "text"));
@@ -2341,7 +2400,7 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
+                        let mut session = session;
                         let filters = MessageFilters {
                             message_types: Some(vec!["deleted".into()]),
                             ..Default::default()
@@ -2354,8 +2413,7 @@ mod tests {
                             page: None,
                             sort_by: None,
                         };
-                        let result = svc
-                            .get_messages(&filters, &pagination, true)
+                        let result = get_messages(&mut session, &filters, &pagination, true)
                             .await
                             .expect("query");
                         assert!(result.data.iter().all(|m| m.is_deleted));
@@ -2373,7 +2431,7 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
+                        let mut session = session;
                         let filters = MessageFilters {
                             message_types: Some(vec!["recalled".into()]),
                             ..Default::default()
@@ -2386,8 +2444,7 @@ mod tests {
                             page: None,
                             sort_by: None,
                         };
-                        let result = svc
-                            .get_messages(&filters, &pagination, true)
+                        let result = get_messages(&mut session, &filters, &pagination, true)
                             .await
                             .expect("query");
                         assert!(result.data.iter().all(|m| m.is_recalled));
@@ -2405,7 +2462,7 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
+                        let mut session = session;
                         let start = Utc.with_ymd_and_hms(2024, 1, 1, 10, 0, 0).unwrap();
                         let end = Utc.with_ymd_and_hms(2024, 1, 1, 14, 0, 0).unwrap();
                         let filters = MessageFilters {
@@ -2421,8 +2478,7 @@ mod tests {
                             page: None,
                             sort_by: None,
                         };
-                        let result = svc
-                            .get_messages(&filters, &pagination, true)
+                        let result = get_messages(&mut session, &filters, &pagination, true)
                             .await
                             .expect("query");
                         for m in &result.data {
@@ -2443,7 +2499,7 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
+                        let mut session = session;
                         let filters = MessageFilters {
                             has_attachment: Some(true),
                             ..Default::default()
@@ -2456,8 +2512,7 @@ mod tests {
                             page: None,
                             sort_by: None,
                         };
-                        let result = svc
-                            .get_messages(&filters, &pagination, true)
+                        let result = get_messages(&mut session, &filters, &pagination, true)
                             .await
                             .expect("query");
                         assert!(result.data.iter().all(|m| m.attachment_file.is_some()));
@@ -2475,7 +2530,7 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
+                        let mut session = session;
                         let filters = MessageFilters {
                             has_reference: Some(true),
                             ..Default::default()
@@ -2488,8 +2543,7 @@ mod tests {
                             page: None,
                             sort_by: None,
                         };
-                        let result = svc
-                            .get_messages(&filters, &pagination, true)
+                        let result = get_messages(&mut session, &filters, &pagination, true)
                             .await
                             .expect("query");
                         assert!(result.data.iter().all(|m| m.reference_message_id.is_some()));
@@ -2507,7 +2561,7 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
+                        let mut session = session;
                         let filters = MessageFilters {
                             room_id: Some("room1".into()),
                             user_id: Some("user1".into()),
@@ -2522,8 +2576,7 @@ mod tests {
                             page: None,
                             sort_by: None,
                         };
-                        let result = svc
-                            .get_messages(&filters, &pagination, true)
+                        let result = get_messages(&mut session, &filters, &pagination, true)
                             .await
                             .expect("query");
                         for m in &result.data {
@@ -2545,7 +2598,7 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
+                        let mut session = session;
                         let filters = MessageFilters::default();
                         let pagination = PaginationParams {
                             limit: 3,
@@ -2555,8 +2608,7 @@ mod tests {
                             page: None,
                             sort_by: None,
                         };
-                        let result = svc
-                            .get_messages(&filters, &pagination, true)
+                        let result = get_messages(&mut session, &filters, &pagination, true)
                             .await
                             .expect("query");
                         assert!(result.data.len() <= 3);
@@ -2574,7 +2626,7 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
+                        let mut session = session;
                         let filters = MessageFilters::default();
                         let p1 = PaginationParams {
                             limit: 3,
@@ -2584,7 +2636,7 @@ mod tests {
                             page: None,
                             sort_by: None,
                         };
-                        let page1 = svc.get_messages(&filters, &p1, true).await.expect("page1");
+                        let page1 = get_messages(&mut session, &filters, &p1, true).await.expect("page1");
                         if let Some(ref cursor) = page1.next_cursor {
                             let p2 = PaginationParams {
                                 limit: 3,
@@ -2594,7 +2646,7 @@ mod tests {
                                 page: None,
                                 sort_by: None,
                             };
-                            let page2 = svc.get_messages(&filters, &p2, true).await.expect("page2");
+                            let page2 = get_messages(&mut session, &filters, &p2, true).await.expect("page2");
                             let ids1: std::collections::HashSet<_> =
                                 page1.data.iter().map(|m| m.message_id.clone()).collect();
                             let ids2: std::collections::HashSet<_> =
@@ -2615,7 +2667,7 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
+                        let mut session = session;
                         let filters = MessageFilters {
                             room_id: Some("__nonexistent_room__".into()),
                             ..Default::default()
@@ -2628,8 +2680,7 @@ mod tests {
                             page: None,
                             sort_by: None,
                         };
-                        let result = svc
-                            .get_messages(&filters, &pagination, true)
+                        let result = get_messages(&mut session, &filters, &pagination, true)
                             .await
                             .expect("query");
                         assert!(result.data.is_empty());
@@ -2648,8 +2699,8 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let result = svc.get_by_id("__nonexistent__", true).await.expect("query");
+                        let mut session = session;
+                        let result = get_by_id(&mut session, "__nonexistent__", true).await.expect("query");
                         assert!(result.is_none());
                         Ok(())
                     })
@@ -2665,8 +2716,8 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let exists = svc.message_exists("__nonexistent__").await.expect("query");
+                        let mut session = session;
+                        let exists = message_exists(&mut session, "__nonexistent__").await.expect("query");
                         assert!(!exists);
                         Ok(())
                     })
@@ -2682,8 +2733,8 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let messages = svc.get_before("__nonexistent__", 5).await.expect("query");
+                        let mut session = session;
+                        let messages = get_before(&mut session, "__nonexistent__", 5).await.expect("query");
                         assert!(messages.is_empty());
                         Ok(())
                     })
@@ -2699,8 +2750,8 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let messages = svc.get_after("__nonexistent__", 5).await.expect("query");
+                        let mut session = session;
+                        let messages = get_after(&mut session, "__nonexistent__", 5).await.expect("query");
                         assert!(messages.is_empty());
                         Ok(())
                     })
@@ -2716,9 +2767,8 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let result = svc
-                            .get_context("__nonexistent__", 2, 2)
+                        let mut session = session;
+                        let result = get_context(&mut session, "__nonexistent__", 2, 2)
                             .await
                             .expect("query");
                         assert!(result.is_none());
@@ -2736,9 +2786,8 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let result = svc
-                            .get_latest_message_time("__nonexistent__")
+                        let mut session = session;
+                        let result = get_latest_message_time(&mut session, "__nonexistent__")
                             .await
                             .expect("query");
                         assert!(result.is_none());
@@ -2756,9 +2805,8 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let result = svc
-                            .get_earliest_message_time("__nonexistent__")
+                        let mut session = session;
+                        let result = get_earliest_message_time(&mut session, "__nonexistent__")
                             .await
                             .expect("query");
                         assert!(result.is_none());
@@ -2776,8 +2824,8 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let count = svc.batch_create(&[]).await.expect("batch create");
+                        let mut session = session;
+                        let count = batch_create(&mut session, &[]).await.expect("batch create");
                         assert_eq!(count, 0);
                         Ok(())
                     })
@@ -2793,8 +2841,8 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let rows = svc.batch_create_if_missing(&[]).await.expect("batch");
+                        let mut session = session;
+                        let rows = batch_create_if_missing(&mut session, &[]).await.expect("batch");
                         assert!(rows.is_empty());
                         Ok(())
                     })
@@ -2810,8 +2858,8 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let result = svc.enrich_batch(&[]).await.expect("enrich");
+                        let mut session = session;
+                        let result = enrich_batch(&mut session, &[]).await.expect("enrich");
                         assert!(result.is_empty());
                         Ok(())
                     })
@@ -2827,9 +2875,8 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let count = svc
-                            .mark_deleted_batch(&[], None)
+                        let mut session = session;
+                        let count = mark_deleted_batch(&mut session, &[], None)
                             .await
                             .expect("mark deleted");
                         assert_eq!(count, 0);
@@ -2847,8 +2894,8 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let count = svc.mark_recalled_batch(&[]).await.expect("mark recalled");
+                        let mut session = session;
+                        let count = mark_recalled_batch(&mut session, &[]).await.expect("mark recalled");
                         assert_eq!(count, 0);
                         Ok(())
                     })
@@ -2864,8 +2911,10 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let messages = svc.get_deleted_messages(None, 10).await.expect("query");
+                        let mut session = session;
+                        let messages = super::get_deleted_messages(&mut session, None, 10)
+                            .await
+                            .expect("query");
                         for m in &messages {
                             assert!(m.is_deleted || m.is_recalled);
                         }
@@ -2883,9 +2932,8 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let messages = svc
-                            .get_deleted_messages(Some("room1"), 10)
+                        let mut session = session;
+                        let messages = super::get_deleted_messages(&mut session, Some("room1"), 10)
                             .await
                             .expect("query");
                         for m in &messages {
@@ -2905,8 +2953,8 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let stats = svc.get_room_stats("room1").await.expect("query");
+                        let mut session = session;
+                        let stats = get_room_stats(&mut session, "room1").await.expect("query");
                         assert!(stats.total >= 0);
                         Ok(())
                     })
@@ -2922,8 +2970,8 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let stats = svc.get_user_stats("user1").await.expect("query");
+                        let mut session = session;
+                        let stats = get_user_stats(&mut session, "user1").await.expect("query");
                         assert!(stats.total >= 0);
                         Ok(())
                     })
@@ -2939,12 +2987,12 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
+                        let mut session = session;
                         let filters = MessageFilters {
                             room_id: Some("room1".into()),
                             ..Default::default()
                         };
-                        let counts = svc.count_messages(&filters).await.expect("count");
+                        let counts = count_messages(&mut session, &filters).await.expect("count");
                         assert!(counts.total_messages >= 0);
                         Ok(())
                     })
@@ -2960,9 +3008,8 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
-                        let counts = svc
-                            .count_messages(&MessageFilters::default())
+                        let mut session = session;
+                        let counts = count_messages(&mut session, &MessageFilters::default())
                             .await
                             .expect("count");
                         assert!(counts.total_messages >= 0);
@@ -2980,10 +3027,10 @@ mod tests {
                 lilium_test_fixtures::FixtureProfile::Message,
                 |session| {
                     Box::pin(async move {
-                        let mut svc = MessageService::new(session);
+                        let mut session = session;
                         let msg = test_message();
-                        let first = svc.create_message_if_missing(&msg).await.expect("first");
-                        let second = svc.create_message_if_missing(&msg).await.expect("second");
+                        let first = create_message_if_missing(&mut session, &msg).await.expect("first");
+                        let second = create_message_if_missing(&mut session, &msg).await.expect("second");
                         assert!(first);
                         assert!(!second);
                         Ok(())
