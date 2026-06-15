@@ -297,7 +297,10 @@ mod tests {
         let pool = lilium_test_fixtures::connect_test_database().await;
 
         let config = Config {
-            database: crate::config::DatabaseConfig { pool_size: 1 },
+            database: crate::config::DatabaseConfig {
+                url: "postgres://localhost/lilium_test".to_string(),
+                max_connections: 1,
+            },
             worker: crate::config::WorkerConfig {
                 queue_size: 100,
                 batch_size: 10,
