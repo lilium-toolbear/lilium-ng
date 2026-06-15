@@ -654,7 +654,7 @@ CREATE TRIGGER outgoing_command_updated_trigger AFTER UPDATE ON public.outgoing_
 
 CREATE TABLE public.event_processor_offsets (
     processor_id character varying NOT NULL,
-    last_processed_id integer NOT NULL,
+    last_processed_id bigint NOT NULL,
     last_processed_at timestamp with time zone,
     updated_at timestamp with time zone NOT NULL,
     last_processed_timestamp timestamp with time zone
@@ -832,6 +832,5 @@ CREATE INDEX ix_websocket_events_user_id_timestamp_id ON ONLY public.websocket_e
 
 
 CREATE TRIGGER websocket_event_inserted_trigger AFTER INSERT ON public.websocket_events FOR EACH ROW EXECUTE FUNCTION public.notify_websocket_event_inserted();
-
 
 

@@ -298,14 +298,16 @@ async fn cleanup_test_database(database: &TestDatabase) -> Result<()> {
 }
 
 async fn cleanup_stale_test_databases(admin_pool: &PgPool) -> Result<()> {
+    let process_database_prefix = format!("lilium_test_{}_%", std::process::id());
     let stale_databases = sqlx::query_scalar::<_, String>(
         r#"
         SELECT datname
         FROM pg_database
-        WHERE datname LIKE 'lilium_test_%'
+        WHERE datname LIKE $1
         ORDER BY datname
         "#,
     )
+    .bind(process_database_prefix)
     .fetch_all(admin_pool)
     .await
     .context("list stale test databases")?;

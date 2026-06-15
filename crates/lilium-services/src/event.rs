@@ -298,8 +298,8 @@ pub async fn get_cursor(
 }
 
 #[instrument(skip(session), fields(processor_id = %processor_id))]
-pub async fn get_offset(session: &mut DbSession, processor_id: &str) -> Result<i32> {
-    let offset = sqlx::query_scalar::<_, Option<i32>>(
+pub async fn get_offset(session: &mut DbSession, processor_id: &str) -> Result<i64> {
+    let offset = sqlx::query_scalar::<_, Option<i64>>(
         "SELECT last_processed_id FROM event_processor_offsets WHERE processor_id = $1",
     )
     .bind(processor_id)
@@ -312,7 +312,7 @@ pub async fn get_offset(session: &mut DbSession, processor_id: &str) -> Result<i
 pub async fn update_offset(
     session: &mut DbSession,
     processor_id: &str,
-    last_processed_id: i32,
+    last_processed_id: i64,
     last_processed_timestamp: Option<DateTime<Utc>>,
     last_processed_at: Option<DateTime<Utc>>,
 ) -> Result<EventProcessorOffset> {
