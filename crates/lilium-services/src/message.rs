@@ -2196,30 +2196,30 @@ mod tests {
             }
         }
 
-        #[tokio::test]
-        async fn message_exists_can_be_called_directly() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let exists = message_exists(&mut session, "__nonexistent__").await.expect("query");
-                        assert!(!exists);
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("message_exists_can_be_called_directly");
+        macro_rules! message_db_test {
+            ($name:ident, $session:ident, $body:block) => {
+                #[tokio::test]
+                async fn $name() {
+                    let test_db = lilium_test_fixtures::TestDb::acquire(
+                        lilium_test_fixtures::FixtureProfile::Message,
+                    )
+                    .await
+                    .expect("init message db");
+
+                    lilium_database::transaction!(test_db.database(), |$session| $body)
+                        .await
+                        .expect(stringify!($name));
+                }
+            };
         }
 
-        #[tokio::test]
-        async fn get_messages_no_filters() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
+        message_db_test!(message_exists_can_be_called_directly, session, {
+                        let exists = message_exists(session, "__nonexistent__").await.expect("query");
+                        assert!(!exists);
+            Ok(())
+        });
+
+        message_db_test!(get_messages_no_filters, session, {
                         let filters = MessageFilters::default();
                         let pagination = PaginationParams {
                             limit: 100,
@@ -2229,25 +2229,14 @@ mod tests {
                             page: None,
                             sort_by: None,
                         };
-                        let result = get_messages(&mut session, &filters, &pagination, true)
+                        let result = get_messages(session, &filters, &pagination, true)
                             .await
                             .expect("query");
                         assert!(result.data.len() <= 100);
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("get_messages_no_filters");
-        }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn get_messages_ordered_newest_first() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
+        message_db_test!(get_messages_ordered_newest_first, session, {
                         let filters = MessageFilters::default();
                         let pagination = PaginationParams {
                             limit: 100,
@@ -2257,27 +2246,16 @@ mod tests {
                             page: None,
                             sort_by: None,
                         };
-                        let result = get_messages(&mut session, &filters, &pagination, true)
+                        let result = get_messages(session, &filters, &pagination, true)
                             .await
                             .expect("query");
                         for i in 0..result.data.len().saturating_sub(1) {
                             assert!(result.data[i].sent_at >= result.data[i + 1].sent_at);
                         }
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("get_messages_ordered_newest_first");
-        }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn get_messages_reverse_order() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
+        message_db_test!(get_messages_reverse_order, session, {
                         let filters = MessageFilters::default();
                         let pagination = PaginationParams {
                             limit: 100,
@@ -2287,27 +2265,16 @@ mod tests {
                             page: None,
                             sort_by: None,
                         };
-                        let result = get_messages(&mut session, &filters, &pagination, true)
+                        let result = get_messages(session, &filters, &pagination, true)
                             .await
                             .expect("query");
                         for i in 0..result.data.len().saturating_sub(1) {
                             assert!(result.data[i].sent_at <= result.data[i + 1].sent_at);
                         }
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("get_messages_reverse_order");
-        }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn filter_by_room() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
+        message_db_test!(filter_by_room, session, {
                         let filters = MessageFilters {
                             room_id: Some("room1".into()),
                             ..Default::default()
@@ -2320,25 +2287,14 @@ mod tests {
                             page: None,
                             sort_by: None,
                         };
-                        let result = get_messages(&mut session, &filters, &pagination, true)
+                        let result = get_messages(session, &filters, &pagination, true)
                             .await
                             .expect("query");
                         assert!(result.data.iter().all(|m| m.room_id == "room1"));
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("filter_by_room");
-        }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn filter_by_user() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
+        message_db_test!(filter_by_user, session, {
                         let filters = MessageFilters {
                             user_id: Some("user1".into()),
                             ..Default::default()
@@ -2351,25 +2307,14 @@ mod tests {
                             page: None,
                             sort_by: None,
                         };
-                        let result = get_messages(&mut session, &filters, &pagination, true)
+                        let result = get_messages(session, &filters, &pagination, true)
                             .await
                             .expect("query");
                         assert!(result.data.iter().all(|m| m.sent_by == "user1"));
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("filter_by_user");
-        }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn filter_by_content_types() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
+        message_db_test!(filter_by_content_types, session, {
                         let filters = MessageFilters {
                             content_types: Some(vec!["text".into()]),
                             ..Default::default()
@@ -2382,25 +2327,14 @@ mod tests {
                             page: None,
                             sort_by: None,
                         };
-                        let result = get_messages(&mut session, &filters, &pagination, true)
+                        let result = get_messages(session, &filters, &pagination, true)
                             .await
                             .expect("query");
                         assert!(result.data.iter().all(|m| m.content_type == "text"));
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("filter_by_content_types");
-        }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn filter_deleted_messages() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
+        message_db_test!(filter_deleted_messages, session, {
                         let filters = MessageFilters {
                             message_types: Some(vec!["deleted".into()]),
                             ..Default::default()
@@ -2413,25 +2347,14 @@ mod tests {
                             page: None,
                             sort_by: None,
                         };
-                        let result = get_messages(&mut session, &filters, &pagination, true)
+                        let result = get_messages(session, &filters, &pagination, true)
                             .await
                             .expect("query");
                         assert!(result.data.iter().all(|m| m.is_deleted));
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("filter_deleted_messages");
-        }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn filter_recalled_messages() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
+        message_db_test!(filter_recalled_messages, session, {
                         let filters = MessageFilters {
                             message_types: Some(vec!["recalled".into()]),
                             ..Default::default()
@@ -2444,25 +2367,14 @@ mod tests {
                             page: None,
                             sort_by: None,
                         };
-                        let result = get_messages(&mut session, &filters, &pagination, true)
+                        let result = get_messages(session, &filters, &pagination, true)
                             .await
                             .expect("query");
                         assert!(result.data.iter().all(|m| m.is_recalled));
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("filter_recalled_messages");
-        }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn filter_by_time_range() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
+        message_db_test!(filter_by_time_range, session, {
                         let start = Utc.with_ymd_and_hms(2024, 1, 1, 10, 0, 0).unwrap();
                         let end = Utc.with_ymd_and_hms(2024, 1, 1, 14, 0, 0).unwrap();
                         let filters = MessageFilters {
@@ -2478,28 +2390,17 @@ mod tests {
                             page: None,
                             sort_by: None,
                         };
-                        let result = get_messages(&mut session, &filters, &pagination, true)
+                        let result = get_messages(session, &filters, &pagination, true)
                             .await
                             .expect("query");
                         for m in &result.data {
                             assert!(m.sent_at >= start);
                             assert!(m.sent_at <= end);
                         }
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("filter_by_time_range");
-        }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn filter_has_attachment() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
+        message_db_test!(filter_has_attachment, session, {
                         let filters = MessageFilters {
                             has_attachment: Some(true),
                             ..Default::default()
@@ -2512,25 +2413,14 @@ mod tests {
                             page: None,
                             sort_by: None,
                         };
-                        let result = get_messages(&mut session, &filters, &pagination, true)
+                        let result = get_messages(session, &filters, &pagination, true)
                             .await
                             .expect("query");
                         assert!(result.data.iter().all(|m| m.attachment_file.is_some()));
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("filter_has_attachment");
-        }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn filter_has_reference() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
+        message_db_test!(filter_has_reference, session, {
                         let filters = MessageFilters {
                             has_reference: Some(true),
                             ..Default::default()
@@ -2543,25 +2433,14 @@ mod tests {
                             page: None,
                             sort_by: None,
                         };
-                        let result = get_messages(&mut session, &filters, &pagination, true)
+                        let result = get_messages(session, &filters, &pagination, true)
                             .await
                             .expect("query");
                         assert!(result.data.iter().all(|m| m.reference_message_id.is_some()));
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("filter_has_reference");
-        }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn filter_combined() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
+        message_db_test!(filter_combined, session, {
                         let filters = MessageFilters {
                             room_id: Some("room1".into()),
                             user_id: Some("user1".into()),
@@ -2576,7 +2455,7 @@ mod tests {
                             page: None,
                             sort_by: None,
                         };
-                        let result = get_messages(&mut session, &filters, &pagination, true)
+                        let result = get_messages(session, &filters, &pagination, true)
                             .await
                             .expect("query");
                         for m in &result.data {
@@ -2584,21 +2463,10 @@ mod tests {
                             assert_eq!(m.sent_by, "user1");
                             assert_eq!(m.content_type, "text");
                         }
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("filter_combined");
-        }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn pagination_first_page() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
+        message_db_test!(pagination_first_page, session, {
                         let filters = MessageFilters::default();
                         let pagination = PaginationParams {
                             limit: 3,
@@ -2608,25 +2476,14 @@ mod tests {
                             page: None,
                             sort_by: None,
                         };
-                        let result = get_messages(&mut session, &filters, &pagination, true)
+                        let result = get_messages(session, &filters, &pagination, true)
                             .await
                             .expect("query");
                         assert!(result.data.len() <= 3);
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("pagination_first_page");
-        }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn pagination_with_cursor_no_overlap() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
+        message_db_test!(pagination_with_cursor_no_overlap, session, {
                         let filters = MessageFilters::default();
                         let p1 = PaginationParams {
                             limit: 3,
@@ -2636,7 +2493,7 @@ mod tests {
                             page: None,
                             sort_by: None,
                         };
-                        let page1 = get_messages(&mut session, &filters, &p1, true).await.expect("page1");
+                        let page1 = get_messages(session, &filters, &p1, true).await.expect("page1");
                         if let Some(ref cursor) = page1.next_cursor {
                             let p2 = PaginationParams {
                                 limit: 3,
@@ -2646,28 +2503,17 @@ mod tests {
                                 page: None,
                                 sort_by: None,
                             };
-                            let page2 = get_messages(&mut session, &filters, &p2, true).await.expect("page2");
+                            let page2 = get_messages(session, &filters, &p2, true).await.expect("page2");
                             let ids1: std::collections::HashSet<_> =
                                 page1.data.iter().map(|m| m.message_id.clone()).collect();
                             let ids2: std::collections::HashSet<_> =
                                 page2.data.iter().map(|m| m.message_id.clone()).collect();
                             assert!(ids1.intersection(&ids2).next().is_none());
                         }
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("pagination_with_cursor_no_overlap");
-        }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn empty_database_returns_none() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
+        message_db_test!(empty_database_returns_none, session, {
                         let filters = MessageFilters {
                             room_id: Some("__nonexistent_room__".into()),
                             ..Default::default()
@@ -2680,365 +2526,151 @@ mod tests {
                             page: None,
                             sort_by: None,
                         };
-                        let result = get_messages(&mut session, &filters, &pagination, true)
+                        let result = get_messages(session, &filters, &pagination, true)
                             .await
                             .expect("query");
                         assert!(result.data.is_empty());
                         assert!(result.next_cursor.is_none());
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("empty_database_returns_none");
-        }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn get_by_id_nonexistent() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let result = get_by_id(&mut session, "__nonexistent__", true).await.expect("query");
+        message_db_test!(get_by_id_nonexistent, session, {
+                        let result = get_by_id(session, "__nonexistent__", true).await.expect("query");
                         assert!(result.is_none());
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("get_by_id_nonexistent");
-        }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn message_exists_false() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let exists = message_exists(&mut session, "__nonexistent__").await.expect("query");
+        message_db_test!(message_exists_false, session, {
+                        let exists = message_exists(session, "__nonexistent__").await.expect("query");
                         assert!(!exists);
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("message_exists_false");
-        }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn get_before_nonexistent_returns_empty() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let messages = get_before(&mut session, "__nonexistent__", 5).await.expect("query");
+        message_db_test!(get_before_nonexistent_returns_empty, session, {
+                        let messages = get_before(session, "__nonexistent__", 5).await.expect("query");
                         assert!(messages.is_empty());
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("get_before_nonexistent_returns_empty");
-        }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn get_after_nonexistent_returns_empty() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let messages = get_after(&mut session, "__nonexistent__", 5).await.expect("query");
+        message_db_test!(get_after_nonexistent_returns_empty, session, {
+                        let messages = get_after(session, "__nonexistent__", 5).await.expect("query");
                         assert!(messages.is_empty());
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("get_after_nonexistent_returns_empty");
-        }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn get_context_nonexistent_returns_none() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let result = get_context(&mut session, "__nonexistent__", 2, 2)
+        message_db_test!(get_context_nonexistent_returns_none, session, {
+                        let result = get_context(session, "__nonexistent__", 2, 2)
                             .await
                             .expect("query");
                         assert!(result.is_none());
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("get_context_nonexistent_returns_none");
-        }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn get_latest_message_time_empty_room() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let result = get_latest_message_time(&mut session, "__nonexistent__")
+        message_db_test!(get_latest_message_time_empty_room, session, {
+                        let result = get_latest_message_time(session, "__nonexistent__")
                             .await
                             .expect("query");
                         assert!(result.is_none());
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("get_latest_message_time_empty_room");
-        }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn get_earliest_message_time_empty_room() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let result = get_earliest_message_time(&mut session, "__nonexistent__")
+        message_db_test!(get_earliest_message_time_empty_room, session, {
+                        let result = get_earliest_message_time(session, "__nonexistent__")
                             .await
                             .expect("query");
                         assert!(result.is_none());
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("get_earliest_message_time_empty_room");
-        }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn batch_create_empty_list_returns_zero() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let count = batch_create(&mut session, &[]).await.expect("batch create");
+        message_db_test!(batch_create_empty_list_returns_zero, session, {
+                        let count = batch_create(session, &[]).await.expect("batch create");
                         assert_eq!(count, 0);
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("batch_create_empty_list_returns_zero");
-        }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn batch_create_if_missing_empty() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let rows = batch_create_if_missing(&mut session, &[]).await.expect("batch");
+        message_db_test!(batch_create_if_missing_empty, session, {
+                        let rows = batch_create_if_missing(session, &[]).await.expect("batch");
                         assert!(rows.is_empty());
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("batch_create_if_missing_empty");
-        }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn enrich_batch_empty() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let result = enrich_batch(&mut session, &[]).await.expect("enrich");
+        message_db_test!(enrich_batch_empty, session, {
+                        let result = enrich_batch(session, &[]).await.expect("enrich");
                         assert!(result.is_empty());
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("enrich_batch_empty");
-        }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn mark_deleted_batch_empty_returns_zero() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let count = mark_deleted_batch(&mut session, &[], None)
+        message_db_test!(mark_deleted_batch_empty_returns_zero, session, {
+                        let count = mark_deleted_batch(session, &[], None)
                             .await
                             .expect("mark deleted");
                         assert_eq!(count, 0);
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("mark_deleted_batch_empty_returns_zero");
-        }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn mark_recalled_batch_empty_returns_zero() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let count = mark_recalled_batch(&mut session, &[]).await.expect("mark recalled");
+        message_db_test!(mark_recalled_batch_empty_returns_zero, session, {
+                        let count = mark_recalled_batch(session, &[]).await.expect("mark recalled");
                         assert_eq!(count, 0);
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("mark_recalled_batch_empty_returns_zero");
-        }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn get_deleted_messages() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let messages = super::get_deleted_messages(&mut session, None, 10)
+        message_db_test!(get_deleted_messages, session, {
+                        let messages = super::get_deleted_messages(session, None, 10)
                             .await
                             .expect("query");
                         for m in &messages {
                             assert!(m.is_deleted || m.is_recalled);
                         }
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("get_deleted_messages");
-        }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn get_deleted_messages_with_room() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let messages = super::get_deleted_messages(&mut session, Some("room1"), 10)
+        message_db_test!(get_deleted_messages_with_room, session, {
+                        let messages = super::get_deleted_messages(session, Some("room1"), 10)
                             .await
                             .expect("query");
                         for m in &messages {
                             assert!(m.is_deleted || m.is_recalled);
                         }
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("get_deleted_messages_with_room");
-        }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn get_room_stats_returns_stats() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let stats = get_room_stats(&mut session, "room1").await.expect("query");
+        message_db_test!(get_room_stats_returns_stats, session, {
+                        let stats = get_room_stats(session, "room1").await.expect("query");
                         assert!(stats.total >= 0);
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("get_room_stats_returns_stats");
-        }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn get_user_stats_returns_stats() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let stats = get_user_stats(&mut session, "user1").await.expect("query");
+        message_db_test!(get_user_stats_returns_stats, session, {
+                        let stats = get_user_stats(session, "user1").await.expect("query");
                         assert!(stats.total >= 0);
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("get_user_stats_returns_stats");
-        }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn count_messages_with_filters() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
+        message_db_test!(count_messages_with_filters, session, {
                         let filters = MessageFilters {
                             room_id: Some("room1".into()),
                             ..Default::default()
                         };
-                        let counts = count_messages(&mut session, &filters).await.expect("count");
+                        let counts = count_messages(session, &filters).await.expect("count");
                         assert!(counts.total_messages >= 0);
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("count_messages_with_filters");
-        }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn count_messages_no_filters_uses_rooms_table() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let counts = count_messages(&mut session, &MessageFilters::default())
+        message_db_test!(count_messages_no_filters_uses_rooms_table, session, {
+                        let counts = count_messages(session, &MessageFilters::default())
                             .await
                             .expect("count");
                         assert!(counts.total_messages >= 0);
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("count_messages_no_filters_uses_rooms_table");
-        }
+            Ok(())
+        });
 
-        #[tokio::test]
-        async fn create_message_if_missing_duplicate() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::Message,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
+        message_db_test!(create_message_if_missing_duplicate, session, {
                         let msg = test_message();
-                        let first = create_message_if_missing(&mut session, &msg).await.expect("first");
-                        let second = create_message_if_missing(&mut session, &msg).await.expect("second");
+                        let first = create_message_if_missing(session, &msg).await.expect("first");
+                        let second = create_message_if_missing(session, &msg).await.expect("second");
                         assert!(first);
                         assert!(!second);
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .expect("create_message_if_missing_duplicate");
-        }
+            Ok(())
+        });
     }
 }
