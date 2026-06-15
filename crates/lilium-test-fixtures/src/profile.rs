@@ -1,8 +1,9 @@
 use anyhow::Result;
+use lilium_database::DbPool;
 use lilium_database::pool::SessionFuture;
 use lilium_database::{DbSession, DbSessionContext};
 
-use crate::database::{connect_test_database, TestDatabaseConnection};
+use crate::database::{TestDatabaseConnection, connect_test_database};
 use crate::reset::reset_database;
 use crate::seeds::{
     seed_message_profile, seed_shared_profile, seed_user_profile, seed_websocket_profile,
@@ -20,6 +21,41 @@ pub enum FixtureProfile {
     Account,
     Message,
     Notification,
+}
+
+pub struct TestDb {
+    database: lilium_database::Database,
+    _connection: TestDatabaseConnection,
+}
+
+impl TestDb {
+    pub async fn acquire(profile: FixtureProfile) -> Result<Self> {
+        let connection = connect_test_database().await;
+
+        connection
+            .with_session_context(|session| {
+                Box::pin(async move {
+                    let mut session = session;
+                    prepare_database(&mut session, profile).await
+                })
+            })
+            .await?;
+
+        let database = lilium_database::Database::create(connection.database_config()).await?;
+
+        Ok(Self {
+            database,
+            _connection: connection,
+        })
+    }
+
+    pub fn database(&self) -> &lilium_database::Database {
+        &self.database
+    }
+
+    pub fn raw_pool(&self) -> &DbPool {
+        self.database.raw_pool()
+    }
 }
 
 pub async fn prepare_database(session: &mut DbSession, profile: FixtureProfile) -> Result<()> {
@@ -54,6 +90,32 @@ where
         })
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL"]
+    async fn acquire_empty_profile_exposes_database_runtime() {
+        let test_db = TestDb::acquire(FixtureProfile::Empty)
+            .await
+            .expect("acquire test database guard");
+
+        let mut conn = test_db.database().raw_connection().await.unwrap();
+        let public_table_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_catalog.pg_tables WHERE schemaname = 'public'",
+        )
+        .fetch_one(conn.as_mut())
+        .await
+        .unwrap();
+
+        assert!(
+            public_table_count > 0,
+            "expected the live schema bootstrap to create public tables"
+        );
+    }
 }
 
 pub async fn with_db_session_and_pool<T, F>(profile: FixtureProfile, f: F) -> Result<T>
