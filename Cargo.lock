@@ -2991,6 +2991,7 @@ dependencies = [
 [[package]]
 name = "rust_engineio"
 version = "0.6.0"
+source = "git+https://github.com/kuma-dzmm/rust-socketio?rev=2a9c637acf43c622247753bf608304ed5ae5b657#2a9c637acf43c622247753bf608304ed5ae5b657"
 dependencies = [
  "adler32",
  "async-stream",
@@ -3013,6 +3014,7 @@ dependencies = [
 [[package]]
 name = "rust_socketio"
 version = "0.6.0"
+source = "git+https://github.com/kuma-dzmm/rust-socketio?rev=2a9c637acf43c622247753bf608304ed5ae5b657#2a9c637acf43c622247753bf608304ed5ae5b657"
 dependencies = [
  "adler32",
  "async-stream",
