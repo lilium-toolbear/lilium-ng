@@ -607,373 +607,351 @@ mod tests {
 
         #[tokio::test]
         async fn get_by_id_existing() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::User,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let user = get_by_id(&mut session, "user1").await.expect("query");
-                        if let Some(u) = user {
-                            assert_eq!(u.user_id, "user1");
-                        }
-                        Ok(())
-                    })
-                },
-            )
+            let test_db =
+                lilium_test_fixtures::TestDb::acquire(lilium_test_fixtures::FixtureProfile::User)
+                    .await
+                    .expect("init user db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                let user = get_by_id(session, "user1").await.expect("query");
+                if let Some(u) = user {
+                    assert_eq!(u.user_id, "user1");
+                }
+                Ok(())
+            })
             .await
             .expect("get_by_id existing");
         }
 
         #[tokio::test]
         async fn get_by_id_nonexistent() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::User,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let user = get_by_id(&mut session, "__nonexistent__")
-                            .await
-                            .expect("query");
-                        assert!(user.is_none());
-                        Ok(())
-                    })
-                },
-            )
+            let test_db =
+                lilium_test_fixtures::TestDb::acquire(lilium_test_fixtures::FixtureProfile::User)
+                    .await
+                    .expect("init user db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                let user = get_by_id(session, "__nonexistent__").await.expect("query");
+                assert!(user.is_none());
+                Ok(())
+            })
             .await
             .expect("get_by_id nonexistent");
         }
 
         #[tokio::test]
         async fn get_by_ids_multiple() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::User,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let users = get_by_ids(&mut session, &["user1".into(), "user2".into()])
-                            .await
-                            .expect("query");
-                        let ids: std::collections::HashSet<_> =
-                            users.iter().map(|u| u.user_id.clone()).collect();
-                        assert_eq!(ids.len(), users.len());
-                        Ok(())
-                    })
-                },
-            )
+            let test_db =
+                lilium_test_fixtures::TestDb::acquire(lilium_test_fixtures::FixtureProfile::User)
+                    .await
+                    .expect("init user db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                let users = get_by_ids(session, &["user1".into(), "user2".into()])
+                    .await
+                    .expect("query");
+                let ids: std::collections::HashSet<_> =
+                    users.iter().map(|u| u.user_id.clone()).collect();
+                assert_eq!(ids.len(), users.len());
+                Ok(())
+            })
             .await
             .expect("get_by_ids multiple");
         }
 
         #[tokio::test]
         async fn get_by_ids_empty() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::User,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let users = get_by_ids(&mut session, &[]).await.expect("query");
-                        assert!(users.is_empty());
-                        Ok(())
-                    })
-                },
-            )
+            let test_db =
+                lilium_test_fixtures::TestDb::acquire(lilium_test_fixtures::FixtureProfile::User)
+                    .await
+                    .expect("init user db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                let users = get_by_ids(session, &[]).await.expect("query");
+                assert!(users.is_empty());
+                Ok(())
+            })
             .await
             .expect("get_by_ids empty");
         }
 
         #[tokio::test]
         async fn get_by_ids_with_nonexistent() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::User,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let users =
-                            get_by_ids(&mut session, &["user1".into(), "__nonexistent__".into()])
-                                .await
-                                .expect("query");
-                        assert!(users.iter().all(|u| u.user_id != "__nonexistent__"));
-                        Ok(())
-                    })
-                },
-            )
+            let test_db =
+                lilium_test_fixtures::TestDb::acquire(lilium_test_fixtures::FixtureProfile::User)
+                    .await
+                    .expect("init user db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                let users = get_by_ids(session, &["user1".into(), "__nonexistent__".into()])
+                    .await
+                    .expect("query");
+                assert!(users.iter().all(|u| u.user_id != "__nonexistent__"));
+                Ok(())
+            })
             .await
             .expect("get_by_ids_with_nonexistent");
         }
 
         #[tokio::test]
         async fn search_users_no_filters() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::User,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let params = SearchUsersParams {
-                            query: None,
-                            limit: Some(10),
-                            offset: None,
-                        };
-                        let users = search_users(&mut session, &params).await.expect("search");
-                        assert!(users.len() <= 10);
-                        Ok(())
-                    })
-                },
-            )
+            let test_db =
+                lilium_test_fixtures::TestDb::acquire(lilium_test_fixtures::FixtureProfile::User)
+                    .await
+                    .expect("init user db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                let params = SearchUsersParams {
+                    query: None,
+                    limit: Some(10),
+                    offset: None,
+                };
+                let users = search_users(session, &params).await.expect("search");
+                assert!(users.len() <= 10);
+                Ok(())
+            })
             .await
             .expect("search no filters");
         }
 
         #[tokio::test]
         async fn search_users_by_name() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::User,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let params = SearchUsersParams {
-                            query: Some("One".into()),
-                            limit: Some(10),
-                            offset: None,
-                        };
-                        let users = search_users(&mut session, &params).await.expect("search");
-                        assert!(!users.is_empty());
-                        Ok(())
-                    })
-                },
-            )
+            let test_db =
+                lilium_test_fixtures::TestDb::acquire(lilium_test_fixtures::FixtureProfile::User)
+                    .await
+                    .expect("init user db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                let params = SearchUsersParams {
+                    query: Some("One".into()),
+                    limit: Some(10),
+                    offset: None,
+                };
+                let users = search_users(session, &params).await.expect("search");
+                assert!(!users.is_empty());
+                Ok(())
+            })
             .await
             .expect("search by name");
         }
 
         #[tokio::test]
         async fn search_users_with_empty_query() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::User,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let params = SearchUsersParams {
-                            query: Some("".into()),
-                            limit: Some(10),
-                            offset: None,
-                        };
-                        let users = search_users(&mut session, &params).await.expect("search");
-                        assert!(users.len() <= 10);
-                        Ok(())
-                    })
-                },
-            )
+            let test_db =
+                lilium_test_fixtures::TestDb::acquire(lilium_test_fixtures::FixtureProfile::User)
+                    .await
+                    .expect("init user db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                let params = SearchUsersParams {
+                    query: Some("".into()),
+                    limit: Some(10),
+                    offset: None,
+                };
+                let users = search_users(session, &params).await.expect("search");
+                assert!(users.len() <= 10);
+                Ok(())
+            })
             .await
             .expect("search empty query");
         }
 
         #[tokio::test]
         async fn search_users_pagination() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::User,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let page1 = SearchUsersParams {
-                            query: None,
-                            limit: Some(2),
-                            offset: Some(0),
-                        };
-                        let page2 = SearchUsersParams {
-                            query: None,
-                            limit: Some(2),
-                            offset: Some(2),
-                        };
-                        let users1 = search_users(&mut session, &page1).await.expect("page1");
-                        let users2 = search_users(&mut session, &page2).await.expect("page2");
-                        let ids1: std::collections::HashSet<_> =
-                            users1.iter().map(|u| u.user_id.clone()).collect();
-                        let ids2: std::collections::HashSet<_> =
-                            users2.iter().map(|u| u.user_id.clone()).collect();
-                        assert!(ids1.intersection(&ids2).next().is_none());
-                        Ok(())
-                    })
-                },
-            )
+            let test_db =
+                lilium_test_fixtures::TestDb::acquire(lilium_test_fixtures::FixtureProfile::User)
+                    .await
+                    .expect("init user db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                let page1 = SearchUsersParams {
+                    query: None,
+                    limit: Some(2),
+                    offset: Some(0),
+                };
+                let page2 = SearchUsersParams {
+                    query: None,
+                    limit: Some(2),
+                    offset: Some(2),
+                };
+                let users1 = search_users(session, &page1).await.expect("page1");
+                let users2 = search_users(session, &page2).await.expect("page2");
+                let ids1: std::collections::HashSet<_> =
+                    users1.iter().map(|u| u.user_id.clone()).collect();
+                let ids2: std::collections::HashSet<_> =
+                    users2.iter().map(|u| u.user_id.clone()).collect();
+                assert!(ids1.intersection(&ids2).next().is_none());
+                Ok(())
+            })
             .await
             .expect("search pagination");
         }
 
         #[tokio::test]
         async fn upsert_new_user() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::User,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let data = UpsertUserData {
-                            user_id: "new_test_user".into(),
-                            full_name: Some("New Test User".into()),
-                            bio: Some("Test bio".into()),
-                            ..Default::default()
-                        };
-                        let user = upsert_user(&mut session, &data).await.expect("upsert");
-                        assert_eq!(user.user_id, "new_test_user");
-                        Ok(())
-                    })
-                },
-            )
+            let test_db =
+                lilium_test_fixtures::TestDb::acquire(lilium_test_fixtures::FixtureProfile::User)
+                    .await
+                    .expect("init user db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                let data = UpsertUserData {
+                    user_id: "new_test_user".into(),
+                    full_name: Some("New Test User".into()),
+                    bio: Some("Test bio".into()),
+                    ..Default::default()
+                };
+                let user = upsert_user(session, &data).await.expect("upsert");
+                assert_eq!(user.user_id, "new_test_user");
+                Ok(())
+            })
             .await
             .expect("upsert new user");
         }
 
         #[tokio::test]
         async fn upsert_existing_user() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::User,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let data = UpsertUserData {
-                            user_id: "user1".into(),
-                            bio: Some("Updated bio".into()),
-                            ..Default::default()
-                        };
-                        let user = upsert_user(&mut session, &data).await.expect("upsert");
-                        assert_eq!(user.user_id, "user1");
-                        Ok(())
-                    })
-                },
-            )
+            let test_db =
+                lilium_test_fixtures::TestDb::acquire(lilium_test_fixtures::FixtureProfile::User)
+                    .await
+                    .expect("init user db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                let data = UpsertUserData {
+                    user_id: "user1".into(),
+                    bio: Some("Updated bio".into()),
+                    ..Default::default()
+                };
+                let user = upsert_user(session, &data).await.expect("upsert");
+                assert_eq!(user.user_id, "user1");
+                Ok(())
+            })
             .await
             .expect("upsert existing");
         }
 
         #[tokio::test]
         async fn increment_message_count() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::User,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        super::increment_message_count(&mut session, "user1")
-                            .await
-                            .expect("increment");
-                        Ok(())
-                    })
-                },
-            )
+            let test_db =
+                lilium_test_fixtures::TestDb::acquire(lilium_test_fixtures::FixtureProfile::User)
+                    .await
+                    .expect("init user db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                super::increment_message_count(session, "user1")
+                    .await
+                    .expect("increment");
+                Ok(())
+            })
             .await
             .expect("increment message");
         }
 
         #[tokio::test]
         async fn increment_deleted_count() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::User,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        super::increment_deleted_count(&mut session, "user1")
-                            .await
-                            .expect("increment");
-                        Ok(())
-                    })
-                },
-            )
+            let test_db =
+                lilium_test_fixtures::TestDb::acquire(lilium_test_fixtures::FixtureProfile::User)
+                    .await
+                    .expect("init user db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                super::increment_deleted_count(session, "user1")
+                    .await
+                    .expect("increment");
+                Ok(())
+            })
             .await
             .expect("increment deleted");
         }
 
         #[tokio::test]
         async fn increment_recalled_count() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::User,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        super::increment_recalled_count(&mut session, "user2")
-                            .await
-                            .expect("increment");
-                        Ok(())
-                    })
-                },
-            )
+            let test_db =
+                lilium_test_fixtures::TestDb::acquire(lilium_test_fixtures::FixtureProfile::User)
+                    .await
+                    .expect("init user db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                super::increment_recalled_count(session, "user2")
+                    .await
+                    .expect("increment");
+                Ok(())
+            })
             .await
             .expect("increment recalled");
         }
 
         #[tokio::test]
         async fn increment_nonexistent_user() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::User,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let result =
-                            super::increment_message_count(&mut session, "__nonexistent__").await;
-                        assert!(result.is_ok());
-                        Ok(())
-                    })
-                },
-            )
+            let test_db =
+                lilium_test_fixtures::TestDb::acquire(lilium_test_fixtures::FixtureProfile::User)
+                    .await
+                    .expect("init user db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                let result = super::increment_message_count(session, "__nonexistent__").await;
+                assert!(result.is_ok());
+                Ok(())
+            })
             .await
             .expect("increment nonexistent");
         }
 
         #[tokio::test]
         async fn fetch_user_profile_existing() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::User,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let profile = fetch_user_profile(&mut session, "user1")
-                            .await
-                            .expect("query");
-                        if let Some(p) = profile {
-                            assert_eq!(p.user_id, "user1");
-                        }
-                        Ok(())
-                    })
-                },
-            )
+            let test_db =
+                lilium_test_fixtures::TestDb::acquire(lilium_test_fixtures::FixtureProfile::User)
+                    .await
+                    .expect("init user db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                let profile = fetch_user_profile(session, "user1")
+                    .await
+                    .expect("query");
+                if let Some(p) = profile {
+                    assert_eq!(p.user_id, "user1");
+                }
+                Ok(())
+            })
             .await
             .expect("fetch user profile existing");
         }
 
         #[tokio::test]
         async fn fetch_user_profile_nonexistent() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::User,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let profile = fetch_user_profile(&mut session, "__nonexistent__")
-                            .await
-                            .expect("query");
-                        assert!(profile.is_none());
-                        Ok(())
-                    })
-                },
-            )
+            let test_db =
+                lilium_test_fixtures::TestDb::acquire(lilium_test_fixtures::FixtureProfile::User)
+                    .await
+                    .expect("init user db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                let profile = fetch_user_profile(session, "__nonexistent__")
+                    .await
+                    .expect("query");
+                assert!(profile.is_none());
+                Ok(())
+            })
             .await
             .expect("fetch user profile nonexistent");
         }
 
         #[tokio::test]
         async fn batch_fetch_and_update() {
-            lilium_test_fixtures::with_db_session(
-                lilium_test_fixtures::FixtureProfile::User,
-                |session| {
-                    Box::pin(async move {
-                        let mut session = session;
-                        let pairs = vec![("user1".into(), "room1".into())];
-                        let (new_count, updated_count) =
-                            super::batch_fetch_and_update(&mut session, &pairs)
-                                .await
-                                .expect("batch");
-                        assert!(new_count >= 0);
-                        assert!(updated_count >= 0);
-                        Ok(())
-                    })
-                },
-            )
+            let test_db =
+                lilium_test_fixtures::TestDb::acquire(lilium_test_fixtures::FixtureProfile::User)
+                    .await
+                    .expect("init user db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                let pairs = vec![("user1".into(), "room1".into())];
+                let (new_count, updated_count) =
+                    super::batch_fetch_and_update(session, &pairs)
+                        .await
+                        .expect("batch");
+                assert!(new_count >= 0);
+                assert!(updated_count >= 0);
+                Ok(())
+            })
             .await
             .expect("batch fetch and update");
         }
