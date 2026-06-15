@@ -1,16 +1,15 @@
 use anyhow::{Context, Result};
-use lilium_database::DbPool;
+use lilium_database::{Database, DatabaseConfig};
+use sqlx::PgPool;
 use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-use sqlx::PgPool;
-use std::borrow::Borrow;
-use std::ops::Deref;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::OnceCell;
+use url::Url;
 
 use crate::reset::reset_database;
 
@@ -40,36 +39,33 @@ pub(crate) struct TestDatabaseLease {
     database: Mutex<Option<TestDatabase>>,
 }
 
-#[derive(Debug, Clone)]
-pub struct TestDatabaseConnection {
-    inner: DbPool,
+#[derive(Clone)]
+pub(crate) struct TestDatabaseConnection {
+    database_url: String,
+    max_connections: u32,
     _lease: Arc<TestDatabaseLease>,
 }
 
 impl TestDatabaseConnection {
-    fn new(inner: DbPool, lease: Arc<TestDatabaseLease>) -> Self {
+    fn new(database_url: String, max_connections: u32, lease: Arc<TestDatabaseLease>) -> Self {
         Self {
-            inner,
+            database_url,
+            max_connections,
             _lease: lease,
         }
     }
 
-    pub fn inner(&self) -> &DbPool {
-        &self.inner
+    pub(crate) fn database_config(&self) -> lilium_database::DatabaseConfig {
+        lilium_database::DatabaseConfig::from_url(self.database_url.clone(), self.max_connections)
     }
 }
 
-impl Deref for TestDatabaseConnection {
-    type Target = DbPool;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl Borrow<DbPool> for TestDatabaseConnection {
-    fn borrow(&self) -> &DbPool {
-        &self.inner
+impl std::fmt::Debug for TestDatabaseConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TestDatabaseConnection")
+            .field("max_connections", &self.max_connections)
+            .field("has_database_url", &true)
+            .finish()
     }
 }
 
@@ -84,10 +80,6 @@ impl TestDatabaseLease {
 
 impl Drop for TestDatabaseLease {
     fn drop(&mut self) {
-        if std::thread::panicking() {
-            return;
-        }
-
         let mut database = self.database.lock().expect("lock leased test database");
         if let Some(database) = database.take() {
             self.pool.return_database(database);
@@ -139,43 +131,36 @@ impl TestDatabasePool {
     }
 
     async fn prepare_database(self: &Arc<Self>, database: &TestDatabase) -> Result<()> {
-        let options = build_test_database_options(&database.base_url, &database.name)?;
-        let pool = DbPool::connect_with_options(options, 1).await?;
+        let database_url = build_test_database_url(&database.base_url, &database.name)?;
+        let database = Database::create(DatabaseConfig::from_url(database_url, 1)).await?;
 
-        pool.with_session_context(|mut session| {
-            Box::pin(async move { reset_database(&mut session).await })
-        })
-        .await
+        lilium_database::transaction!(database, |session| { reset_database(session).await }).await
     }
 }
 
-pub async fn connect_test_database() -> TestDatabaseConnection {
+pub(crate) async fn connect_test_database() -> TestDatabaseConnection {
     connect_test_database_with_pool_size(4).await
 }
 
-pub async fn connect_test_database_with_pool_size(pool_size: u32) -> TestDatabaseConnection {
+pub(crate) async fn connect_test_database_with_pool_size(pool_size: u32) -> TestDatabaseConnection {
     load_test_env();
 
     let pool = ensure_test_database_pool(pool_size)
         .await
         .expect("initialize test database pool");
     let database = pool.acquire().await.expect("acquire test database");
-    let options = match build_test_database_options(&database.base_url, &database.name) {
-        Ok(options) => options,
+    let database_url = match build_test_database_url(&database.base_url, &database.name) {
+        Ok(database_url) => database_url,
         Err(error) => {
             pool.return_database(database);
-            panic!("build test database options: {error:#}");
+            panic!("build test database url: {error:#}");
         }
     };
-    let inner = match DbPool::connect_with_options(options, pool_size).await {
-        Ok(inner) => inner,
-        Err(error) => {
-            pool.return_database(database);
-            panic!("connect to test database: {error:#}");
-        }
-    };
-
-    TestDatabaseConnection::new(inner, Arc::new(TestDatabaseLease::new(pool, database)))
+    TestDatabaseConnection::new(
+        database_url,
+        pool_size,
+        Arc::new(TestDatabaseLease::new(pool, database)),
+    )
 }
 
 pub fn test_database_url() -> String {
@@ -237,9 +222,18 @@ fn build_admin_database_options(base_url: &str) -> Result<PgConnectOptions> {
     Ok(options.database("postgres"))
 }
 
-fn build_test_database_options(base_url: &str, db_name: &str) -> Result<PgConnectOptions> {
-    let options = PgConnectOptions::from_str(base_url).context("parse TEST_DATABASE_URL")?;
-    Ok(options.database(db_name))
+fn build_test_database_url(base_url: &str, db_name: &str) -> Result<String> {
+    let mut url = Url::parse(base_url).context("parse TEST_DATABASE_URL")?;
+    if url.scheme() == "postgresql" {
+        url.set_scheme("postgres").expect("set postgres scheme");
+    }
+    url.set_path(&format!("/{db_name}"));
+    Ok(url.to_string())
+}
+
+fn build_test_database_options(database_url: &str) -> Result<PgConnectOptions> {
+    let options = PgConnectOptions::from_str(database_url).context("parse TEST_DATABASE_URL")?;
+    Ok(options)
 }
 
 async fn create_test_database(base_url: &str, db_name: &str, pool_size: u32) -> Result<()> {
@@ -261,7 +255,8 @@ async fn create_test_database(base_url: &str, db_name: &str, pool_size: u32) -> 
         .await
         .with_context(|| format!("create test database {db_name}"))?;
 
-    let test_options = build_test_database_options(base_url, db_name)?;
+    let test_database_url = build_test_database_url(base_url, db_name)?;
+    let test_options = build_test_database_options(&test_database_url)?;
     let test_pool = PgPoolOptions::new()
         .max_connections(pool_size)
         .connect_with(test_options)
@@ -368,6 +363,7 @@ fn load_test_env() {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use url::Url;
 
     #[test]
     fn generated_database_names_are_unique_and_prefixed() {
@@ -375,5 +371,26 @@ mod tests {
 
         assert_eq!(names.len(), 16);
         assert!(names.iter().all(|name| name.starts_with("lilium_test_")));
+    }
+
+    #[test]
+    fn build_test_database_url_replaces_path_and_preserves_query_params() {
+        let database_url = build_test_database_url(
+            "postgresql://user:pass@localhost:5432/source_db?sslmode=require&application_name=lilium",
+            "lilium_test_123",
+        )
+        .unwrap();
+        let parsed = Url::parse(&database_url).unwrap();
+
+        assert_eq!(parsed.scheme(), "postgres");
+        assert_eq!(parsed.username(), "user");
+        assert_eq!(parsed.password(), Some("pass"));
+        assert_eq!(parsed.host_str(), Some("localhost"));
+        assert_eq!(parsed.port(), Some(5432));
+        assert_eq!(parsed.path(), "/lilium_test_123");
+        assert_eq!(
+            parsed.query(),
+            Some("sslmode=require&application_name=lilium")
+        );
     }
 }

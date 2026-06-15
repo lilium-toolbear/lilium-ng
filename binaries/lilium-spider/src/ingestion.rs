@@ -2,17 +2,17 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc::error::TryRecvError;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tracing::{info, warn};
 
 use lilium_common::LiliumError;
-use lilium_database::{DbPool, DbSessionContext};
+use lilium_database::Database;
 use lilium_models::ingestion::EventEnvelope;
-use lilium_services::event::{WebSocketEventInsert, WebSocketEventService};
+use lilium_services::event::{self, WebSocketEventInsert};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpillRecord {
@@ -240,7 +240,7 @@ impl EventIngestor {
 }
 
 pub struct EventWriter {
-    pool: DbPool,
+    database: Database,
     ingestor: Arc<EventIngestor>,
     receiver: Arc<Mutex<mpsc::Receiver<EventEnvelope>>>,
     batch_size: usize,
@@ -249,13 +249,13 @@ pub struct EventWriter {
 
 impl EventWriter {
     pub fn new(
-        pool: DbPool,
+        database: Database,
         ingestor: Arc<EventIngestor>,
         receiver: mpsc::Receiver<EventEnvelope>,
         batch_size: usize,
     ) -> Self {
         Self {
-            pool,
+            database,
             ingestor,
             receiver: Arc::new(Mutex::new(receiver)),
             batch_size,
@@ -341,20 +341,12 @@ impl EventWriter {
             })
             .collect();
 
-        let inserted = self
-            .pool
-            .with_session_context(|mut session| {
-                let insert_rows = insert_rows.clone();
-                Box::pin(async move {
-                    let mut service =
-                        WebSocketEventService::new(DbSessionContext::new(&mut session));
-                    service
-                        .insert_events(&insert_rows)
-                        .await
-                        .map_err(Into::into)
-                })
-            })
-            .await?;
+        let inserted = lilium_database::transaction!(self.database, |session| {
+            event::insert_events(session, &insert_rows)
+                .await
+                .map_err(Into::into)
+        })
+        .await?;
 
         self.inserted_count
             .fetch_add(inserted as u64, Ordering::Relaxed);
@@ -473,10 +465,12 @@ mod tests {
 
         let result = spill.read_replay_batch(10).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("SPILL_BUFFER_INVALID_SCHEMA"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("SPILL_BUFFER_INVALID_SCHEMA")
+        );
     }
 
     #[tokio::test]
@@ -497,20 +491,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_event_writer_drains_disk_before_memory() {
-        let pool = lilium_test_fixtures::connect_test_database().await;
-        pool.with_session_context(|session| {
-            Box::pin(async move {
-                let mut session = session;
-                lilium_test_fixtures::prepare_database(
-                    &mut session,
-                    lilium_test_fixtures::FixtureProfile::Event,
-                )
-                .await?;
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
+        let test_db =
+            lilium_test_fixtures::TestDb::acquire(lilium_test_fixtures::FixtureProfile::Event)
+                .await
+                .unwrap();
 
         let tmp = TempDir::new().unwrap();
         let spill = DiskSpillBuffer::new(tmp.path().join("ws_buffer_user_a.jsonl"));
@@ -521,7 +505,7 @@ mod tests {
         ingestor.spill().append(&make_event(1)).await.unwrap();
         ingestor.spill().append(&make_event(2)).await.unwrap();
 
-        let writer = EventWriter::new(pool.inner().clone(), ingestor.clone(), rx, 100);
+        let writer = EventWriter::new(test_db.database().clone(), ingestor.clone(), rx, 100);
         let count = writer.drain_once().await.unwrap();
         assert_eq!(count, 2); // Should drain disk first
     }

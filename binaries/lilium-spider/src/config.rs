@@ -10,7 +10,8 @@ pub struct Config {
 
 #[derive(Debug, Clone)]
 pub struct DatabaseConfig {
-    pub pool_size: u32,
+    pub url: String,
+    pub max_connections: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +52,10 @@ fn env_string(name: &str, default: String) -> String {
     std::env::var(name).unwrap_or(default)
 }
 
+fn env_required_string(name: &str) -> Result<String> {
+    std::env::var(name).with_context(|| format!("required env var '{name}' is missing"))
+}
+
 fn env_usize(name: &str, default: usize) -> Result<usize> {
     match std::env::var(name) {
         Ok(value) => value
@@ -86,7 +91,8 @@ impl Config {
     pub fn load() -> Result<Self> {
         Ok(Self {
             database: DatabaseConfig {
-                pool_size: env_u32("DATABASE_POOL_SIZE", default_pool_size())?,
+                url: env_required_string("DATABASE_URL")?,
+                max_connections: env_u32("DATABASE_POOL_SIZE", default_pool_size())?,
             },
             worker: WorkerConfig {
                 queue_size: env_usize("SPIDER_QUEUE_SIZE", default_queue_size())?,
@@ -100,5 +106,11 @@ impl Config {
                 )?,
             },
         })
+    }
+}
+
+impl From<DatabaseConfig> for lilium_database::DatabaseConfig {
+    fn from(value: DatabaseConfig) -> Self {
+        lilium_database::DatabaseConfig::from_url(value.url, value.max_connections)
     }
 }

@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
-use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 
 pub fn utc_now() -> DateTime<Utc> {
     Utc::now()
