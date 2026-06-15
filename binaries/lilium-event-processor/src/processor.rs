@@ -10,7 +10,7 @@ use tracing::{error, info, warn};
 
 #[cfg(not(test))]
 use lilium_common::LiliumError;
-use lilium_database::{Database, DbSessionContext};
+use lilium_database::{Database, DbSession, DbSessionContext};
 use lilium_models::ingestion::WebSocketEvent;
 #[cfg(not(test))]
 use lilium_services::account_service as account;
@@ -115,8 +115,7 @@ impl EventProcessor {
         let processor_id = self.processor_id.clone();
         let batch_size = self.batch_size as i64;
         lilium_database::transaction!(self.database, |session| {
-            let mut session = DbSessionContext::new(session);
-            Self::fetch_batch_inner(&mut session, processor_id, batch_size).await
+            Self::fetch_batch_inner(session, processor_id, batch_size).await
         })
         .await
     }
@@ -250,14 +249,13 @@ impl EventProcessor {
 
         let processor_id = self.processor_id.clone();
         lilium_database::transaction!(self.database, |session| {
-            let mut session = DbSessionContext::new(session);
-            Self::skip_batch_inner(&mut session, processor_id, last_id, last_timestamp).await
+            Self::skip_batch_inner(session, processor_id, last_id, last_timestamp).await
         })
         .await
     }
 
     async fn fetch_batch_inner(
-        session: &mut DbSessionContext<'_>,
+        session: &mut DbSession,
         processor_id: String,
         batch_size: i64,
     ) -> Result<(Vec<WebSocketEvent>, i64, Option<DateTime<Utc>>)> {
@@ -303,7 +301,7 @@ impl EventProcessor {
     }
 
     async fn skip_batch_inner(
-        session: &mut DbSessionContext<'_>,
+        session: &mut DbSession,
         processor_id: String,
         last_id: i64,
         last_timestamp: Option<DateTime<Utc>>,
@@ -322,7 +320,7 @@ impl EventProcessor {
     }
 
     async fn fetch_last_cursor(
-        session: &mut DbSessionContext<'_>,
+        session: &mut DbSession,
         processor_id: String,
     ) -> Result<(i64, Option<DateTime<Utc>>)> {
         let cursor = event::get_cursor(session, &processor_id).await?;
@@ -332,7 +330,7 @@ impl EventProcessor {
     }
 
     async fn poll_events(
-        session: &mut DbSessionContext<'_>,
+        session: &mut DbSession,
         last_timestamp: Option<DateTime<Utc>>,
         last_id: i64,
         batch_size: i64,
