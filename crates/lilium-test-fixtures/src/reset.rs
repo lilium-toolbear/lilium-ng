@@ -1,53 +1,64 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use lilium_database::DbSession;
+use sea_orm::{ConnectionTrait, Statement};
 
-pub async fn reset_database(session: &mut DbSession) -> Result<()> {
-    let table_names = public_table_names(session).await?;
+pub async fn reset_database<C: ConnectionTrait>(db: &C) -> Result<()> {
+    let table_names = public_table_names(db).await?;
     if !table_names.is_empty() {
         let truncate_sql = format!(
             "TRUNCATE TABLE {} RESTART IDENTITY CASCADE",
             table_names.join(", ")
         );
-        sqlx::query(&truncate_sql)
-            .execute(session.as_mut())
-            .await
-            .context("truncate public tables")?;
+        db.execute(Statement::from_string(
+            db.get_database_backend(),
+            truncate_sql,
+        ))
+        .await
+        .context("truncate public tables")?;
     }
 
-    ensure_time_partitions(session).await?;
+    ensure_time_partitions(db).await?;
 
-    sqlx::query("SELECT pg_advisory_unlock_all()")
-        .execute(session.as_mut())
-        .await
-        .context("unlock advisory locks")?;
+    db.execute(Statement::from_string(
+        db.get_database_backend(),
+        "SELECT pg_advisory_unlock_all()".to_owned(),
+    ))
+    .await
+    .context("unlock advisory locks")?;
 
     Ok(())
 }
 
-async fn public_table_names(session: &mut DbSession) -> Result<Vec<String>> {
-    let names = sqlx::query_scalar::<_, String>(
-        r#"
-        SELECT format('%I.%I', schemaname, tablename)
-        FROM pg_tables
-        WHERE schemaname = 'public'
-          AND tablename <> 'sqlx_migrations'
-          AND NOT EXISTS (
-              SELECT 1
-              FROM pg_inherits
-              WHERE inhrelid = format('%I.%I', schemaname, tablename)::regclass
-          )
-        ORDER BY tablename
-        "#,
-    )
-    .fetch_all(session.as_mut())
-    .await
-    .context("list public tables")?;
+async fn public_table_names<C: ConnectionTrait>(db: &C) -> Result<Vec<String>> {
+    let rows = db
+        .query_all(Statement::from_string(
+            db.get_database_backend(),
+            r#"
+            SELECT format('%I.%I', schemaname, tablename) AS table_name
+            FROM pg_tables
+            WHERE schemaname = 'public'
+              AND tablename <> 'sqlx_migrations'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM pg_inherits
+                  WHERE inhrelid = format('%I.%I', schemaname, tablename)::regclass
+              )
+            ORDER BY tablename
+            "#
+            .to_owned(),
+        ))
+        .await
+        .context("list public tables")?;
 
-    Ok(names)
+    rows.into_iter()
+        .map(|row| {
+            row.try_get("", "table_name")
+                .context("read public table name")
+        })
+        .collect()
 }
 
-async fn ensure_time_partitions(session: &mut DbSession) -> Result<()> {
+async fn ensure_time_partitions<C: ConnectionTrait>(db: &C) -> Result<()> {
     let now = Utc::now();
     let messages_anchors = [
         timestamp(2024, 1, 1, 0, 0, 0),
@@ -66,8 +77,8 @@ async fn ensure_time_partitions(session: &mut DbSession) -> Result<()> {
         now + Duration::days(8),
     ];
 
-    ensure_partitions_for_table(session, "messages", &messages_anchors).await?;
-    ensure_partitions_for_table(session, "websocket_events", &websocket_anchors).await?;
+    ensure_partitions_for_table(db, "messages", &messages_anchors).await?;
+    ensure_partitions_for_table(db, "websocket_events", &websocket_anchors).await?;
 
     Ok(())
 }
@@ -85,13 +96,14 @@ fn timestamp(
         .expect("valid test partition timestamp")
 }
 
-async fn ensure_partitions_for_table(
-    session: &mut DbSession,
+async fn ensure_partitions_for_table<C: ConnectionTrait>(
+    db: &C,
     table_name: &str,
     anchors: &[DateTime<Utc>],
 ) -> Result<()> {
     for anchor in anchors {
-        let _: Vec<String> = sqlx::query_scalar(
+        db.query_all(Statement::from_sql_and_values(
+            db.get_database_backend(),
             r#"
             SELECT child_name
             FROM ensure_time_partitions(
@@ -100,10 +112,8 @@ async fn ensure_partitions_for_table(
                 p_apply => true
             )
             "#,
-        )
-        .bind(table_name)
-        .bind(anchor)
-        .fetch_all(session.as_mut())
+            vec![table_name.into(), (*anchor).into()],
+        ))
         .await
         .with_context(|| format!("ensure {table_name} partitions"))?;
     }

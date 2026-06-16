@@ -31,3 +31,4 @@ rand.workspace = true
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
 lilium-test-fixtures.workspace = true
+mockall = "0.13"

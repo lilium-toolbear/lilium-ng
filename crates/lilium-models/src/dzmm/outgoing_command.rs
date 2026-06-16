@@ -1,9 +1,14 @@
 use chrono::{DateTime, Utc};
+use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
-pub struct OutgoingCommand {
+// Python parity source: dzmm_archive@6a92a9914602d633ff6fa3f5908fa68d00c36fcd models/ingestion/outgoing_command.py
+pub type OutgoingCommand = Model;
+
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+#[sea_orm(table_name = "outgoing_commands")]
+pub struct Model {
+    #[sea_orm(primary_key)]
     pub id: i32,
     pub created_at: DateTime<Utc>,
     pub account_user_id: String,
@@ -27,3 +32,8 @@ pub mod status {
 
     pub const TERMINAL_STATUSES: &[&str] = &[SUCCESS, FAILED, TIMEOUT];
 }
+
+#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+pub enum Relation {}
+
+impl ActiveModelBehavior for ActiveModel {}

@@ -1,16 +1,24 @@
 use chrono::{DateTime, Utc};
+use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
-pub struct Message {
+// Python parity source: dzmm_archive@6a92a9914602d633ff6fa3f5908fa68d00c36fcd models/dzmm/message.py
+// Parity decision: Python exposes `content_tsv`, but Rust intentionally keeps
+// PostgreSQL search vectors out of the table row model. The DB column still
+// exists and is only referenced from search predicates.
+pub type Message = Model;
+
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+#[sea_orm(table_name = "messages")]
+pub struct Model {
+    #[sea_orm(primary_key, auto_increment = false)]
     pub message_id: String,
     pub room_id: String,
+    #[sea_orm(primary_key, auto_increment = false)]
     pub sent_at: DateTime<Utc>,
     pub sent_by: String,
     pub content_type: String,
     pub content_text: Option<String>,
-    pub content_tsv: Option<String>,
     pub attachment_url: Option<String>,
     pub attachment_file: Option<String>,
     pub sticker_id: Option<String>,
@@ -29,6 +37,11 @@ pub struct Message {
     pub reference_message_id: Option<String>,
     pub reference_data: Option<serde_json::Value>,
 }
+
+#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+pub enum Relation {}
+
+impl ActiveModelBehavior for ActiveModel {}
 
 impl Message {
     pub fn from_websocket(data: &serde_json::Value) -> Option<Self> {
@@ -124,7 +137,6 @@ impl Message {
             sent_by,
             content_type,
             content_text,
-            content_tsv: None,
             attachment_url,
             attachment_file: None,
             sticker_id,
@@ -595,7 +607,6 @@ mod tests {
             sent_by: "u1".into(),
             content_type: "text".into(),
             content_text: Some("new".into()),
-            content_tsv: None,
             attachment_url: None,
             attachment_file: None,
             sticker_id: None,

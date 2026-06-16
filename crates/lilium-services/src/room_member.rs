@@ -2,45 +2,42 @@ use std::collections::HashMap;
 
 use crate::Result;
 use chrono::{DateTime, Utc};
-use lilium_database::DbSession;
-
-use lilium_models::dzmm::room_member::RoomMember;
+use lilium_models::dzmm::room_member as room_members;
+use sea_orm::sea_query::OnConflict;
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set,
+};
 use tracing::instrument;
 
-#[instrument(skip(session), fields(room_id = %room_id, user_id = %user_id))]
+type RoomMember = room_members::Model;
+
+#[instrument(skip(db), fields(room_id = %room_id, user_id = %user_id))]
 pub async fn get_member_info(
-    session: &mut DbSession,
+    db: &impl ConnectionTrait,
     room_id: &str,
     user_id: &str,
 ) -> Result<Option<RoomMember>> {
-    let member = sqlx::query_as::<_, RoomMember>(
-        r#"SELECT room_id, user_id, role, joined_at, left_at, raw_data, created_at, updated_at
-           FROM room_members
-           WHERE room_id = $1 AND user_id = $2"#,
-    )
-    .bind(room_id)
-    .bind(user_id)
-    .fetch_optional(session.as_mut())
-    .await?;
+    let member = room_members::Entity::find_by_id((room_id.to_owned(), user_id.to_owned()))
+        .one(db)
+        .await?;
     Ok(member)
 }
 
-#[instrument(skip(session), fields(room_id = %room_id, user_id = %user_id))]
-pub async fn is_member(session: &mut DbSession, room_id: &str, user_id: &str) -> Result<bool> {
-    let count: i64 = sqlx::query_scalar(
-        r#"SELECT COUNT(*) FROM room_members
-           WHERE room_id = $1 AND user_id = $2 AND left_at IS NULL"#,
-    )
-    .bind(room_id)
-    .bind(user_id)
-    .fetch_one(session.as_mut())
-    .await?;
-    Ok(count > 0)
+#[instrument(skip(db), fields(room_id = %room_id, user_id = %user_id))]
+pub async fn is_member(db: &impl ConnectionTrait, room_id: &str, user_id: &str) -> Result<bool> {
+    let member = room_members::Entity::find()
+        .filter(room_members::Column::RoomId.eq(room_id))
+        .filter(room_members::Column::UserId.eq(user_id))
+        .filter(room_members::Column::LeftAt.is_null())
+        .one(db)
+        .await?;
+    Ok(member.is_some())
 }
 
-#[instrument(skip(session, user_ids), fields(room_id = %room_id, user_count = user_ids.len(), has_account_user_id = _account_user_id.is_some()))]
+#[instrument(skip(db, user_ids), fields(room_id = %room_id, user_count = user_ids.len(), has_account_user_id = _account_user_id.is_some()))]
 pub async fn get_active_members_by_ids(
-    session: &mut DbSession,
+    db: &impl ConnectionTrait,
     room_id: &str,
     user_ids: &[String],
     _account_user_id: Option<&str>,
@@ -48,15 +45,14 @@ pub async fn get_active_members_by_ids(
     if user_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let members = sqlx::query_as::<_, RoomMember>(
-        r#"SELECT room_id, user_id, role, joined_at, left_at, raw_data, created_at, updated_at
-           FROM room_members
-           WHERE room_id = $1 AND user_id = ANY($2) AND left_at IS NULL"#,
-    )
-    .bind(room_id)
-    .bind(user_ids)
-    .fetch_all(session.as_mut())
-    .await?;
+    let members: Vec<RoomMember> = room_members::Entity::find()
+        .filter(room_members::Column::RoomId.eq(room_id))
+        .filter(room_members::Column::UserId.is_in(user_ids.iter().cloned()))
+        .filter(room_members::Column::LeftAt.is_null())
+        .all(db)
+        .await?
+        .into_iter()
+        .collect();
     let map = members
         .into_iter()
         .map(|m| (m.user_id.clone(), m))
@@ -64,95 +60,104 @@ pub async fn get_active_members_by_ids(
     Ok(map)
 }
 
-#[instrument(skip(session), fields(room_id = %room_id, user_id = %user_id, role = %role, has_joined_at = joined_at.is_some()))]
+#[instrument(skip(db), fields(room_id = %room_id, user_id = %user_id, role = %role, has_joined_at = joined_at.is_some()))]
 pub async fn upsert_member(
-    session: &mut DbSession,
+    db: &impl ConnectionTrait,
     room_id: &str,
     user_id: &str,
     role: &str,
     joined_at: Option<DateTime<Utc>>,
 ) -> Result<()> {
     let now = Utc::now();
-    sqlx::query(
-        r#"INSERT INTO room_members (room_id, user_id, role, joined_at, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $5)
-           ON CONFLICT (room_id, user_id) DO UPDATE SET
-               role = $3,
-               joined_at = $4,
-               left_at = NULL,
-               updated_at = EXCLUDED.updated_at"#,
+    room_members::Entity::insert(room_members::ActiveModel {
+        room_id: Set(room_id.to_owned()),
+        user_id: Set(user_id.to_owned()),
+        role: Set(Some(role.to_owned())),
+        joined_at: Set(joined_at),
+        raw_data: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+        left_at: Set(None),
+    })
+    .on_conflict(
+        OnConflict::columns([room_members::Column::RoomId, room_members::Column::UserId])
+            .update_columns([
+                room_members::Column::Role,
+                room_members::Column::JoinedAt,
+                room_members::Column::LeftAt,
+                room_members::Column::UpdatedAt,
+            ])
+            .to_owned(),
     )
-    .bind(room_id)
-    .bind(user_id)
-    .bind(role)
-    .bind(joined_at)
-    .bind(now)
-    .execute(session.as_mut())
+    .exec(db)
     .await?;
     Ok(())
 }
 
-#[instrument(skip(session), fields(room_id = %room_id, user_id = %user_id, role = %role, has_joined_at = joined_at.is_some()))]
+#[instrument(skip(db), fields(room_id = %room_id, user_id = %user_id, role = %role, has_joined_at = joined_at.is_some()))]
 pub async fn upsert_member_simple(
-    session: &mut DbSession,
+    db: &impl ConnectionTrait,
     room_id: &str,
     user_id: &str,
     role: &str,
     joined_at: Option<DateTime<Utc>>,
 ) -> Result<()> {
-    upsert_member(session, room_id, user_id, role, joined_at).await
+    upsert_member(db, room_id, user_id, role, joined_at).await
 }
 
-#[instrument(skip(session), fields(room_id = %room_id, user_id = %user_id, has_left_at = left_at.is_some()))]
+#[instrument(skip(db), fields(room_id = %room_id, user_id = %user_id, has_left_at = left_at.is_some()))]
 pub async fn mark_member_left(
-    session: &mut DbSession,
+    db: &impl ConnectionTrait,
     room_id: &str,
     user_id: &str,
     left_at: Option<DateTime<Utc>>,
 ) -> Result<bool> {
-    let result = sqlx::query(
-        r#"UPDATE room_members SET left_at = $3
-           WHERE room_id = $1 AND user_id = $2 AND left_at IS NULL"#,
-    )
-    .bind(room_id)
-    .bind(user_id)
-    .bind(left_at)
-    .execute(session.as_mut())
-    .await?;
-    Ok(result.rows_affected() > 0)
+    if let Some(member) = room_members::Entity::find_by_id((room_id.to_owned(), user_id.to_owned()))
+        .filter(room_members::Column::LeftAt.is_null())
+        .one(db)
+        .await?
+    {
+        let mut active: room_members::ActiveModel = member.into();
+        active.left_at = Set(left_at);
+        active.update(db).await?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
-#[instrument(skip(session), fields(room_id = %room_id))]
-pub async fn get_member_count(session: &mut DbSession, room_id: &str) -> Result<i64> {
-    let count: i64 = sqlx::query_scalar(
-        r#"SELECT COUNT(*) FROM room_members
-           WHERE room_id = $1 AND left_at IS NULL"#,
-    )
-    .bind(room_id)
-    .fetch_one(session.as_mut())
-    .await?;
+#[instrument(skip(db), fields(room_id = %room_id))]
+pub async fn get_member_count(db: &impl ConnectionTrait, room_id: &str) -> Result<i64> {
+    let count = room_members::Entity::find()
+        .select_only()
+        .column_as(room_members::Column::UserId.count(), "count")
+        .filter(room_members::Column::RoomId.eq(room_id))
+        .filter(room_members::Column::LeftAt.is_null())
+        .into_tuple::<(i64,)>()
+        .one(db)
+        .await?
+        .map(|(count,)| count)
+        .unwrap_or(0);
     Ok(count)
 }
 
-#[instrument(skip(session), fields(room_id = %room_id, limit, offset))]
+#[instrument(skip(db), fields(room_id = %room_id, limit, offset))]
 pub async fn get_room_members(
-    session: &mut DbSession,
+    db: &impl ConnectionTrait,
     room_id: &str,
     limit: i64,
     offset: i64,
 ) -> Result<Vec<RoomMember>> {
-    let members = sqlx::query_as::<_, RoomMember>(
-        r#"SELECT room_id, user_id, role, joined_at, left_at, raw_data, created_at, updated_at
-           FROM room_members
-           WHERE room_id = $1 AND left_at IS NULL
-           ORDER BY joined_at ASC NULLS LAST
-           LIMIT $2 OFFSET $3"#,
-    )
-    .bind(room_id)
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(session.as_mut())
-    .await?;
+    let members: Vec<RoomMember> = room_members::Entity::find()
+        .filter(room_members::Column::RoomId.eq(room_id))
+        .filter(room_members::Column::LeftAt.is_null())
+        .order_by_asc(room_members::Column::JoinedAt)
+        .limit(limit as u64)
+        .offset(offset as u64)
+        .all(db)
+        .await?
+        .into_iter()
+        .collect();
     Ok(members)
 }
 
@@ -233,7 +238,7 @@ mod tests {
             assert!(m.left_at.is_some());
         }
     }
-    mod room_member_service_integration {
+    mod room_member_integration {
         use super::*;
         use chrono::Utc;
 
@@ -244,25 +249,20 @@ mod tests {
             )
             .await
             .expect("init room member db");
-
-            lilium_database::transaction!(test_db.database(), |session| {
-                let now = Utc::now();
-                upsert_member(session, "test_r", "test_u", "member", Some(now))
-                    .await
-                    .expect("upsert");
-                let member = get_member_info(session, "test_r", "test_u")
-                    .await
-                    .expect("query");
-                assert!(member.is_some());
-                if let Some(m) = member {
-                    assert_eq!(m.room_id, "test_r");
-                    assert_eq!(m.user_id, "test_u");
-                    assert_eq!(m.role.as_deref(), Some("member"));
-                }
-                Ok(())
-            })
-            .await
-            .expect("member_info existing")
+            let db = test_db.database().orm();
+            let now = Utc::now();
+            upsert_member(db, "test_r", "test_u", "member", Some(now))
+                .await
+                .expect("upsert");
+            let member = get_member_info(db, "test_r", "test_u")
+                .await
+                .expect("query");
+            assert!(member.is_some());
+            if let Some(m) = member {
+                assert_eq!(m.room_id, "test_r");
+                assert_eq!(m.user_id, "test_u");
+                assert_eq!(m.role.as_deref(), Some("member"));
+            }
         }
 
         #[tokio::test]
@@ -272,16 +272,11 @@ mod tests {
             )
             .await
             .expect("init room member db");
-
-            lilium_database::transaction!(test_db.database(), |session| {
-                let member = get_member_info(session, "__no_room__", "__no_user__")
-                    .await
-                    .expect("query");
-                assert!(member.is_none());
-                Ok(())
-            })
-            .await
-            .expect("member_info nonexistent")
+            let db = test_db.database().orm();
+            let member = get_member_info(db, "__no_room__", "__no_user__")
+                .await
+                .expect("query");
+            assert!(member.is_none());
         }
 
         #[tokio::test]
@@ -291,20 +286,15 @@ mod tests {
             )
             .await
             .expect("init room member db");
-
-            lilium_database::transaction!(test_db.database(), |session| {
-                let now = Utc::now();
-                upsert_member(session, "test_r1", "test_u", "member", Some(now))
-                    .await
-                    .expect("upsert");
-                let member = get_member_info(session, "test_r2", "test_u")
-                    .await
-                    .expect("query");
-                assert!(member.is_none());
-                Ok(())
-            })
-            .await
-            .expect("member_info wrong room")
+            let db = test_db.database().orm();
+            let now = Utc::now();
+            upsert_member(db, "test_r1", "test_u", "member", Some(now))
+                .await
+                .expect("upsert");
+            let member = get_member_info(db, "test_r2", "test_u")
+                .await
+                .expect("query");
+            assert!(member.is_none());
         }
 
         #[tokio::test]
@@ -314,21 +304,16 @@ mod tests {
             )
             .await
             .expect("init room member db");
-
-            lilium_database::transaction!(test_db.database(), |session| {
-                let now = Utc::now();
-                upsert_member(session, "test_is_member", "test_u", "member", Some(now))
+            let db = test_db.database().orm();
+            let now = Utc::now();
+            upsert_member(db, "test_is_member", "test_u", "member", Some(now))
+                .await
+                .expect("upsert");
+            assert!(
+                is_member(db, "test_is_member", "test_u")
                     .await
-                    .expect("upsert");
-                assert!(
-                    is_member(session, "test_is_member", "test_u")
-                        .await
-                        .expect("query")
-                );
-                Ok(())
-            })
-            .await
-            .expect("is_member true")
+                    .expect("query")
+            );
         }
 
         #[tokio::test]
@@ -338,17 +323,12 @@ mod tests {
             )
             .await
             .expect("init room member db");
-
-            lilium_database::transaction!(test_db.database(), |session| {
-                assert!(
-                    !is_member(session, "__no_room__", "__no_user__")
-                        .await
-                        .expect("query")
-                );
-                Ok(())
-            })
-            .await
-            .expect("is_member false")
+            let db = test_db.database().orm();
+            assert!(
+                !is_member(db, "__no_room__", "__no_user__")
+                    .await
+                    .expect("query")
+            );
         }
 
         #[tokio::test]
@@ -358,26 +338,21 @@ mod tests {
             )
             .await
             .expect("init room member db");
-
-            lilium_database::transaction!(test_db.database(), |session| {
-                let now = Utc::now();
-                upsert_member(session, "test_active", "test_u1", "member", Some(now))
-                    .await
-                    .expect("upsert");
-                let members = get_active_members_by_ids(
-                    session,
-                    "test_active",
-                    &["test_u1".into(), "test_u1".into()],
-                    None,
-                )
+            let db = test_db.database().orm();
+            let now = Utc::now();
+            upsert_member(db, "test_active", "test_u1", "member", Some(now))
                 .await
-                .expect("query");
-                assert_eq!(members.len(), 1);
-                assert!(members.contains_key("test_u1"));
-                Ok(())
-            })
+                .expect("upsert");
+            let members = get_active_members_by_ids(
+                db,
+                "test_active",
+                &["test_u1".into(), "test_u1".into()],
+                None,
+            )
             .await
-            .expect("deduplicate members")
+            .expect("query");
+            assert_eq!(members.len(), 1);
+            assert!(members.contains_key("test_u1"));
         }
 
         #[tokio::test]
@@ -387,16 +362,11 @@ mod tests {
             )
             .await
             .expect("init room member db");
-
-            lilium_database::transaction!(test_db.database(), |session| {
-                let members = get_active_members_by_ids(session, "test_r", &[], None)
-                    .await
-                    .expect("query");
-                assert!(members.is_empty());
-                Ok(())
-            })
-            .await
-            .expect("members_by_ids empty")
+            let db = test_db.database().orm();
+            let members = get_active_members_by_ids(db, "test_r", &[], None)
+                .await
+                .expect("query");
+            assert!(members.is_empty());
         }
 
         #[tokio::test]
@@ -406,20 +376,15 @@ mod tests {
             )
             .await
             .expect("init room member db");
-
-            lilium_database::transaction!(test_db.database(), |session| {
-                let now = Utc::now();
-                upsert_member(session, "test_new_r", "test_new_u", "member", Some(now))
-                    .await
-                    .expect("upsert");
-                let member = get_member_info(session, "test_new_r", "test_new_u")
-                    .await
-                    .expect("query");
-                assert!(member.is_some());
-                Ok(())
-            })
-            .await
-            .expect("upsert new member")
+            let db = test_db.database().orm();
+            let now = Utc::now();
+            upsert_member(db, "test_new_r", "test_new_u", "member", Some(now))
+                .await
+                .expect("upsert");
+            let member = get_member_info(db, "test_new_r", "test_new_u")
+                .await
+                .expect("query");
+            assert!(member.is_some());
         }
 
         #[tokio::test]
@@ -429,23 +394,18 @@ mod tests {
             )
             .await
             .expect("init room member db");
-
-            lilium_database::transaction!(test_db.database(), |session| {
-                let now = Utc::now();
-                upsert_member(session, "test_upd_r", "test_upd_u", "member", Some(now))
-                    .await
-                    .expect("upsert member");
-                upsert_member(session, "test_upd_r", "test_upd_u", "admin", Some(now))
-                    .await
-                    .expect("upsert admin");
-                let member = get_member_info(session, "test_upd_r", "test_upd_u")
-                    .await
-                    .expect("query");
-                assert_eq!(member.unwrap().role.as_deref(), Some("admin"));
-                Ok(())
-            })
-            .await
-            .expect("upsert existing")
+            let db = test_db.database().orm();
+            let now = Utc::now();
+            upsert_member(db, "test_upd_r", "test_upd_u", "member", Some(now))
+                .await
+                .expect("upsert member");
+            upsert_member(db, "test_upd_r", "test_upd_u", "admin", Some(now))
+                .await
+                .expect("upsert admin");
+            let member = get_member_info(db, "test_upd_r", "test_upd_u")
+                .await
+                .expect("query");
+            assert_eq!(member.unwrap().role.as_deref(), Some("admin"));
         }
 
         #[tokio::test]
@@ -455,26 +415,15 @@ mod tests {
             )
             .await
             .expect("init room member db");
-
-            lilium_database::transaction!(test_db.database(), |session| {
-                let now = Utc::now();
-                upsert_member_simple(
-                    session,
-                    "test_simple_r",
-                    "test_simple_u",
-                    "creator",
-                    Some(now),
-                )
+            let db = test_db.database().orm();
+            let now = Utc::now();
+            upsert_member_simple(db, "test_simple_r", "test_simple_u", "creator", Some(now))
                 .await
                 .expect("upsert");
-                let member = get_member_info(session, "test_simple_r", "test_simple_u")
-                    .await
-                    .expect("query");
-                assert_eq!(member.unwrap().role.as_deref(), Some("creator"));
-                Ok(())
-            })
-            .await
-            .expect("upsert member simple")
+            let member = get_member_info(db, "test_simple_r", "test_simple_u")
+                .await
+                .expect("query");
+            assert_eq!(member.unwrap().role.as_deref(), Some("creator"));
         }
 
         #[tokio::test]
@@ -484,38 +433,27 @@ mod tests {
             )
             .await
             .expect("init room member db");
-
-            lilium_database::transaction!(test_db.database(), |session| {
-                let now = Utc::now();
-                upsert_member(
-                    session,
-                    "test_rejoin_r",
-                    "test_rejoin_u",
-                    "member",
-                    Some(now),
-                )
+            let db = test_db.database().orm();
+            let now = Utc::now();
+            upsert_member(db, "test_rejoin_r", "test_rejoin_u", "member", Some(now))
                 .await
                 .expect("upsert");
-                mark_member_left(session, "test_rejoin_r", "test_rejoin_u", Some(Utc::now()))
-                    .await
-                    .expect("mark left");
-                upsert_member_simple(
-                    session,
-                    "test_rejoin_r",
-                    "test_rejoin_u",
-                    "member",
-                    Some(Utc::now()),
-                )
+            mark_member_left(db, "test_rejoin_r", "test_rejoin_u", Some(Utc::now()))
                 .await
-                .expect("rejoin");
-                let member = get_member_info(session, "test_rejoin_r", "test_rejoin_u")
-                    .await
-                    .expect("query");
-                assert!(member.unwrap().left_at.is_none());
-                Ok(())
-            })
+                .expect("mark left");
+            upsert_member_simple(
+                db,
+                "test_rejoin_r",
+                "test_rejoin_u",
+                "member",
+                Some(Utc::now()),
+            )
             .await
-            .expect("reactivates left member")
+            .expect("rejoin");
+            let member = get_member_info(db, "test_rejoin_r", "test_rejoin_u")
+                .await
+                .expect("query");
+            assert!(member.unwrap().left_at.is_none());
         }
 
         #[tokio::test]
@@ -525,26 +463,20 @@ mod tests {
             )
             .await
             .expect("init room member db");
-
-            lilium_database::transaction!(test_db.database(), |session| {
-                let now = Utc::now();
-                upsert_member(session, "test_leave_r", "test_leave_u", "member", Some(now))
-                    .await
-                    .expect("upsert");
-                let left_at = Utc::now();
-                let marked =
-                    mark_member_left(session, "test_leave_r", "test_leave_u", Some(left_at))
-                        .await
-                        .expect("mark left");
-                assert!(marked);
-                let member = get_member_info(session, "test_leave_r", "test_leave_u")
-                    .await
-                    .expect("query");
-                assert!(member.unwrap().left_at.is_some());
-                Ok(())
-            })
-            .await
-            .expect("mark left at")
+            let db = test_db.database().orm();
+            let now = Utc::now();
+            upsert_member(db, "test_leave_r", "test_leave_u", "member", Some(now))
+                .await
+                .expect("upsert");
+            let left_at = Utc::now();
+            let marked = mark_member_left(db, "test_leave_r", "test_leave_u", Some(left_at))
+                .await
+                .expect("mark left");
+            assert!(marked);
+            let member = get_member_info(db, "test_leave_r", "test_leave_u")
+                .await
+                .expect("query");
+            assert!(member.unwrap().left_at.is_some());
         }
 
         #[tokio::test]
@@ -554,16 +486,11 @@ mod tests {
             )
             .await
             .expect("init room member db");
-
-            lilium_database::transaction!(test_db.database(), |session| {
-                let marked = mark_member_left(session, "__no_room__", "__no_user__", None)
-                    .await
-                    .expect("mark left");
-                assert!(!marked);
-                Ok(())
-            })
-            .await
-            .expect("mark left nonexistent")
+            let db = test_db.database().orm();
+            let marked = mark_member_left(db, "__no_room__", "__no_user__", None)
+                .await
+                .expect("mark left");
+            assert!(!marked);
         }
 
         #[tokio::test]
@@ -573,16 +500,9 @@ mod tests {
             )
             .await
             .expect("init room member db");
-
-            lilium_database::transaction!(test_db.database(), |session| {
-                let count = get_member_count(session, "__empty_room__")
-                    .await
-                    .expect("count");
-                assert_eq!(count, 0);
-                Ok(())
-            })
-            .await
-            .expect("member_count empty")
+            let db = test_db.database().orm();
+            let count = get_member_count(db, "__empty_room__").await.expect("count");
+            assert_eq!(count, 0);
         }
 
         #[tokio::test]
@@ -592,26 +512,19 @@ mod tests {
             )
             .await
             .expect("init room member db");
-
-            lilium_database::transaction!(test_db.database(), |session| {
-                let now = Utc::now();
-                upsert_member(session, "test_count_r", "test_u1", "member", Some(now))
-                    .await
-                    .expect("upsert u1");
-                upsert_member(session, "test_count_r", "test_u2", "member", Some(now))
-                    .await
-                    .expect("upsert u2");
-                upsert_member(session, "test_count_r", "test_u3", "member", Some(now))
-                    .await
-                    .expect("upsert u3");
-                let count = get_member_count(session, "test_count_r")
-                    .await
-                    .expect("count");
-                assert_eq!(count, 3);
-                Ok(())
-            })
-            .await
-            .expect("member_count")
+            let db = test_db.database().orm();
+            let now = Utc::now();
+            upsert_member(db, "test_count_r", "test_u1", "member", Some(now))
+                .await
+                .expect("upsert u1");
+            upsert_member(db, "test_count_r", "test_u2", "member", Some(now))
+                .await
+                .expect("upsert u2");
+            upsert_member(db, "test_count_r", "test_u3", "member", Some(now))
+                .await
+                .expect("upsert u3");
+            let count = get_member_count(db, "test_count_r").await.expect("count");
+            assert_eq!(count, 3);
         }
 
         #[tokio::test]
@@ -621,27 +534,22 @@ mod tests {
             )
             .await
             .expect("init room member db");
-
-            lilium_database::transaction!(test_db.database(), |session| {
-                let now = Utc::now();
-                upsert_member(session, "test_list_r", "test_u1", "member", Some(now))
-                    .await
-                    .expect("upsert");
-                upsert_member(session, "test_list_r", "test_u2", "admin", Some(now))
-                    .await
-                    .expect("upsert");
-                let members = get_room_members(session, "test_list_r", 100, 0)
-                    .await
-                    .expect("query");
-                assert_eq!(members.len(), 2);
-                let ids: std::collections::HashSet<_> =
-                    members.into_iter().map(|m| m.user_id).collect();
-                assert!(ids.contains("test_u1"));
-                assert!(ids.contains("test_u2"));
-                Ok(())
-            })
-            .await
-            .expect("room_members all")
+            let db = test_db.database().orm();
+            let now = Utc::now();
+            upsert_member(db, "test_list_r", "test_u1", "member", Some(now))
+                .await
+                .expect("upsert");
+            upsert_member(db, "test_list_r", "test_u2", "admin", Some(now))
+                .await
+                .expect("upsert");
+            let members = get_room_members(db, "test_list_r", 100, 0)
+                .await
+                .expect("query");
+            assert_eq!(members.len(), 2);
+            let ids: std::collections::HashSet<_> =
+                members.into_iter().map(|m| m.user_id).collect();
+            assert!(ids.contains("test_u1"));
+            assert!(ids.contains("test_u2"));
         }
 
         #[tokio::test]
@@ -651,16 +559,11 @@ mod tests {
             )
             .await
             .expect("init room member db");
-
-            lilium_database::transaction!(test_db.database(), |session| {
-                let members = get_room_members(session, "__empty_room__", 100, 0)
-                    .await
-                    .expect("query");
-                assert!(members.is_empty());
-                Ok(())
-            })
-            .await
-            .expect("room_members empty")
+            let db = test_db.database().orm();
+            let members = get_room_members(db, "__empty_room__", 100, 0)
+                .await
+                .expect("query");
+            assert!(members.is_empty());
         }
 
         #[tokio::test]
@@ -670,24 +573,19 @@ mod tests {
             )
             .await
             .expect("init room member db");
-
-            lilium_database::transaction!(test_db.database(), |session| {
-                let now = Utc::now();
-                upsert_member(session, "test_room_a", "test_u1", "member", Some(now))
-                    .await
-                    .expect("upsert");
-                upsert_member(session, "test_room_b", "test_u2", "member", Some(now))
-                    .await
-                    .expect("upsert");
-                let members = get_room_members(session, "test_room_a", 100, 0)
-                    .await
-                    .expect("query");
-                assert_eq!(members.len(), 1);
-                assert_eq!(members[0].user_id, "test_u1");
-                Ok(())
-            })
-            .await
-            .expect("room_members no cross-room")
+            let db = test_db.database().orm();
+            let now = Utc::now();
+            upsert_member(db, "test_room_a", "test_u1", "member", Some(now))
+                .await
+                .expect("upsert");
+            upsert_member(db, "test_room_b", "test_u2", "member", Some(now))
+                .await
+                .expect("upsert");
+            let members = get_room_members(db, "test_room_a", 100, 0)
+                .await
+                .expect("query");
+            assert_eq!(members.len(), 1);
+            assert_eq!(members[0].user_id, "test_u1");
         }
     }
 }

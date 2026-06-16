@@ -1,9 +1,17 @@
 use crate::Result;
 use chrono::{DateTime, Utc};
-use lilium_database::DbSession;
-
-use lilium_models::ingestion::{EventProcessorOffset, WebSocketEvent};
+use lilium_common::LiliumError;
+use lilium_models::ingestion::{
+    event_processor_offset as event_processor_offsets, websocket_event as websocket_events,
+};
+use sea_orm::sea_query::{Expr, OnConflict};
+use sea_orm::{
+    ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+};
 use tracing::instrument;
+
+type EventProcessorOffset = event_processor_offsets::Model;
+type WebSocketEvent = websocket_events::Model;
 
 #[derive(Debug, Clone)]
 pub struct WebSocketEventInsert {
@@ -13,334 +21,310 @@ pub struct WebSocketEventInsert {
     pub timestamp: DateTime<Utc>,
 }
 
-#[instrument(skip(session, data), fields(user_id = %user_id, event = %event, timestamp = %timestamp))]
+#[instrument(skip(db, data), fields(user_id = %user_id, event = %event, timestamp = %timestamp))]
 pub async fn insert_event(
-    session: &mut DbSession,
+    db: &impl ConnectionTrait,
     user_id: &str,
     event: &str,
     data: serde_json::Value,
     timestamp: DateTime<Utc>,
 ) -> Result<WebSocketEvent> {
-    let record = sqlx::query_as::<_, WebSocketEvent>(
-        r#"INSERT INTO websocket_events (user_id, event, data, timestamp)
-           VALUES ($1, $2, $3, $4)
-           RETURNING id, user_id, event, data, timestamp"#,
-    )
-    .bind(user_id)
-    .bind(event)
-    .bind(data)
-    .bind(timestamp)
-    .fetch_one(session.as_mut())
+    let record = websocket_events::Entity::insert(websocket_events::ActiveModel {
+        id: Default::default(),
+        timestamp: Set(timestamp),
+        user_id: Set(user_id.to_owned()),
+        event: Set(event.to_owned()),
+        data: Set(data),
+    })
+    .exec_with_returning(db)
     .await?;
     Ok(record)
 }
 
-#[instrument(skip(session, events), fields(event_count = events.len()))]
+#[instrument(skip(db, events), fields(event_count = events.len()))]
 pub async fn insert_events(
-    session: &mut DbSession,
+    db: &impl ConnectionTrait,
     events: &[WebSocketEventInsert],
 ) -> Result<i64> {
     if events.is_empty() {
         return Ok(0);
     }
-    let mut query =
-        String::from("INSERT INTO websocket_events (user_id, event, data, timestamp) VALUES ");
-    for (i, _) in events.iter().enumerate() {
-        if i > 0 {
-            query.push(',');
-        }
-        let offset = i * 4;
-        query.push_str(&format!(
-            " (${}, ${}, ${}, ${})",
-            offset + 1,
-            offset + 2,
-            offset + 3,
-            offset + 4,
-        ));
-    }
 
-    let mut q = sqlx::query(&query);
-    for e in events {
-        q = q
-            .bind(&e.user_id)
-            .bind(&e.event)
-            .bind(&e.data)
-            .bind(e.timestamp);
-    }
-    let result = q.execute(session.as_mut()).await?;
-    Ok(result.rows_affected() as i64)
+    let inserted = websocket_events::Entity::insert_many(events.iter().cloned().map(|e| {
+        websocket_events::ActiveModel {
+            id: Default::default(),
+            timestamp: Set(e.timestamp),
+            user_id: Set(e.user_id),
+            event: Set(e.event),
+            data: Set(e.data),
+        }
+    }))
+    .exec_with_returning_many(db)
+    .await?;
+
+    Ok(inserted.len() as i64)
 }
 
-#[instrument(skip(session), fields(limit, user_id = ?user_id, event_type = ?event_type))]
+#[instrument(skip(db), fields(limit, user_id = ?user_id, event_type = ?event_type))]
 pub async fn get_pending_events(
-    session: &mut DbSession,
+    db: &impl ConnectionTrait,
     limit: i64,
     user_id: Option<&str>,
     event_type: Option<&str>,
 ) -> Result<Vec<WebSocketEvent>> {
-    let mut query =
-        String::from("SELECT id, user_id, event, data, timestamp FROM websocket_events WHERE 1=1");
-    let mut param_idx = 1;
-    if user_id.is_some() {
-        query.push_str(&format!(" AND user_id = ${}", param_idx));
-        param_idx += 1;
-    }
-    if event_type.is_some() {
-        query.push_str(&format!(" AND event = ${}", param_idx));
-        param_idx += 1;
-    }
-    query.push_str(&format!(
-        " ORDER BY timestamp ASC, id ASC LIMIT ${}",
-        param_idx
-    ));
+    let mut query = websocket_events::Entity::find();
 
-    let mut q = sqlx::query_as::<_, WebSocketEvent>(&query);
     if let Some(uid) = user_id {
-        q = q.bind(uid);
+        query = query.filter(websocket_events::Column::UserId.eq(uid));
     }
     if let Some(et) = event_type {
-        q = q.bind(et);
+        query = query.filter(websocket_events::Column::Event.eq(et));
     }
-    q = q.bind(limit);
-    let events = q.fetch_all(session.as_mut()).await?;
-    Ok(events)
+
+    Ok(query
+        .order_by_asc(websocket_events::Column::Timestamp)
+        .order_by_asc(websocket_events::Column::Id)
+        .limit(limit as u64)
+        .all(db)
+        .await?
+        .into_iter()
+        .collect())
 }
 
-#[instrument(skip(session), fields(last_processed_id, last_processed_timestamp = ?last_processed_timestamp, limit, user_id = ?user_id, event_type = ?event_type))]
+#[instrument(skip(db), fields(last_processed_id, last_processed_timestamp = ?last_processed_timestamp, limit, user_id = ?user_id, event_type = ?event_type))]
 pub async fn get_events_after_offset(
-    session: &mut DbSession,
+    db: &impl ConnectionTrait,
     last_processed_id: i64,
     last_processed_timestamp: Option<DateTime<Utc>>,
     limit: i64,
     user_id: Option<&str>,
     event_type: Option<&str>,
 ) -> Result<Vec<WebSocketEvent>> {
-    let mut conditions = Vec::new();
-    let mut param_idx = 1;
+    let mut query = websocket_events::Entity::find();
 
-    if last_processed_timestamp.is_some() {
-        conditions.push(format!(
-            "(timestamp > ${} OR (timestamp = ${} AND id > ${}))",
-            param_idx,
-            param_idx,
-            param_idx + 1,
-        ));
-        param_idx += 2;
-    } else {
-        conditions.push(format!("id > ${}", param_idx));
-        param_idx += 1;
-    }
-
-    if user_id.is_some() {
-        conditions.push(format!("user_id = ${}", param_idx));
-        param_idx += 1;
-    }
-    if event_type.is_some() {
-        conditions.push(format!("event = ${}", param_idx));
-        param_idx += 1;
-    }
-
-    let where_clause = if conditions.is_empty() {
-        String::new()
-    } else {
-        format!(" WHERE {}", conditions.join(" AND "))
-    };
-
-    let order_clause = if last_processed_timestamp.is_some() {
-        " ORDER BY timestamp ASC, id ASC"
-    } else {
-        " ORDER BY id ASC"
-    };
-
-    let query = format!(
-        "SELECT id, user_id, event, data, timestamp FROM websocket_events{}{} LIMIT ${}",
-        where_clause, order_clause, param_idx,
-    );
-
-    let mut q = sqlx::query_as::<_, WebSocketEvent>(&query);
-    if let Some(ts) = last_processed_timestamp {
-        q = q.bind(ts).bind(last_processed_id);
-    } else {
-        q = q.bind(last_processed_id);
-    }
     if let Some(uid) = user_id {
-        q = q.bind(uid);
+        query = query.filter(websocket_events::Column::UserId.eq(uid));
     }
     if let Some(et) = event_type {
-        q = q.bind(et);
+        query = query.filter(websocket_events::Column::Event.eq(et));
     }
-    q = q.bind(limit);
-    let events = q.fetch_all(session.as_mut()).await?;
-    Ok(events)
+
+    query = if let Some(ts) = last_processed_timestamp {
+        query
+            .filter(
+                Condition::any()
+                    .add(Expr::col(websocket_events::Column::Timestamp).gt(ts))
+                    .add(
+                        Condition::all()
+                            .add(Expr::col(websocket_events::Column::Timestamp).eq(ts))
+                            .add(Expr::col(websocket_events::Column::Id).gt(last_processed_id)),
+                    ),
+            )
+            .order_by_asc(websocket_events::Column::Timestamp)
+            .order_by_asc(websocket_events::Column::Id)
+    } else {
+        query
+            .filter(websocket_events::Column::Id.gt(last_processed_id))
+            .order_by_asc(websocket_events::Column::Id)
+    };
+
+    Ok(query
+        .limit(limit as u64)
+        .all(db)
+        .await?
+        .into_iter()
+        .collect())
 }
 
-#[instrument(skip(session), fields(event_id))]
-pub async fn delete_event(session: &mut DbSession, event_id: i64) -> Result<()> {
-    sqlx::query("DELETE FROM websocket_events WHERE id = $1")
-        .bind(event_id)
-        .execute(session.as_mut())
+#[instrument(skip(db), fields(event_id))]
+pub async fn delete_event(db: &impl ConnectionTrait, event_id: i64) -> Result<()> {
+    websocket_events::Entity::delete_many()
+        .filter(websocket_events::Column::Id.eq(event_id))
+        .exec(db)
         .await?;
     Ok(())
 }
 
-#[instrument(skip(session))]
-pub async fn get_queue_depth(session: &mut DbSession) -> Result<i64> {
-    let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM websocket_events")
-        .fetch_one(session.as_mut())
-        .await?;
+#[instrument(skip(db))]
+pub async fn get_queue_depth(db: &impl ConnectionTrait) -> Result<i64> {
+    let count = websocket_events::Entity::find()
+        .select_only()
+        .column_as(websocket_events::Column::Id.count(), "count")
+        .into_tuple::<(i64,)>()
+        .one(db)
+        .await?
+        .map(|(count,)| count)
+        .unwrap_or(0);
     Ok(count)
 }
 
-#[instrument(skip(session))]
-pub async fn get_oldest_event_age(session: &mut DbSession) -> Result<Option<std::time::Duration>> {
-    let oldest = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
-        "SELECT timestamp FROM websocket_events ORDER BY timestamp ASC, id ASC LIMIT 1",
-    )
-    .fetch_one(session.as_mut())
-    .await?;
+#[instrument(skip(db))]
+pub async fn get_oldest_event_age(
+    db: &impl ConnectionTrait,
+) -> Result<Option<std::time::Duration>> {
+    let oldest = websocket_events::Entity::find()
+        .select_only()
+        .column(websocket_events::Column::Timestamp)
+        .order_by_asc(websocket_events::Column::Timestamp)
+        .order_by_asc(websocket_events::Column::Id)
+        .into_tuple::<(DateTime<Utc>,)>()
+        .one(db)
+        .await?
+        .map(|(timestamp,)| timestamp);
     Ok(oldest.and_then(|ts| Utc::now().signed_duration_since(ts).to_std().ok()))
 }
 
-#[instrument(skip(session))]
-pub async fn get_max_event_id(session: &mut DbSession) -> Result<Option<i64>> {
-    let max_id = sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(id) FROM websocket_events")
-        .fetch_one(session.as_mut())
-        .await?;
+#[instrument(skip(db))]
+pub async fn get_max_event_id(db: &impl ConnectionTrait) -> Result<Option<i64>> {
+    let max_id = websocket_events::Entity::find()
+        .select_only()
+        .column_as(websocket_events::Column::Id.max(), "max_id")
+        .into_tuple::<(Option<i64>,)>()
+        .one(db)
+        .await?
+        .and_then(|(max_id,)| max_id);
     Ok(max_id)
 }
 
-#[instrument(skip(session))]
+#[instrument(skip(db))]
 pub async fn get_latest_event_cursor(
-    session: &mut DbSession,
+    db: &impl ConnectionTrait,
 ) -> Result<(Option<DateTime<Utc>>, i64)> {
-    let row = sqlx::query_as::<_, (Option<DateTime<Utc>>, i64)>(
-        "SELECT timestamp, id FROM websocket_events ORDER BY timestamp DESC, id DESC LIMIT 1",
-    )
-    .fetch_optional(session.as_mut())
-    .await?;
-    Ok(row.unwrap_or((None, 0)))
+    let row = websocket_events::Entity::find()
+        .select_only()
+        .column(websocket_events::Column::Timestamp)
+        .column(websocket_events::Column::Id)
+        .order_by_desc(websocket_events::Column::Timestamp)
+        .order_by_desc(websocket_events::Column::Id)
+        .into_tuple::<(DateTime<Utc>, i64)>()
+        .one(db)
+        .await?;
+    Ok(row
+        .map(|(timestamp, id)| (Some(timestamp), id))
+        .unwrap_or((None, 0)))
 }
 
-#[instrument(skip(session), fields(user_id = ?user_id, event_type = ?event_type))]
+#[instrument(skip(db), fields(user_id = ?user_id, event_type = ?event_type))]
 pub async fn get_latest_event(
-    session: &mut DbSession,
+    db: &impl ConnectionTrait,
     user_id: Option<&str>,
     event_type: Option<&str>,
 ) -> Result<Option<WebSocketEvent>> {
-    let mut query =
-        String::from("SELECT id, user_id, event, data, timestamp FROM websocket_events WHERE 1=1");
-    let mut param_idx = 1;
-    if user_id.is_some() {
-        query.push_str(&format!(" AND user_id = ${}", param_idx));
-        param_idx += 1;
-    }
-    if event_type.is_some() {
-        query.push_str(&format!(" AND event = ${}", param_idx));
-        param_idx += 1;
-    }
-    query.push_str(&format!(
-        " ORDER BY timestamp DESC, id DESC LIMIT ${}",
-        param_idx
-    ));
+    let mut query = websocket_events::Entity::find();
 
-    let mut q = sqlx::query_as::<_, WebSocketEvent>(&query);
     if let Some(uid) = user_id {
-        q = q.bind(uid);
+        query = query.filter(websocket_events::Column::UserId.eq(uid));
     }
     if let Some(et) = event_type {
-        q = q.bind(et);
+        query = query.filter(websocket_events::Column::Event.eq(et));
     }
-    q = q.bind(1i64);
-    let event = q.fetch_optional(session.as_mut()).await?;
-    Ok(event)
+
+    Ok(query
+        .order_by_desc(websocket_events::Column::Timestamp)
+        .order_by_desc(websocket_events::Column::Id)
+        .limit(1)
+        .all(db)
+        .await?
+        .into_iter()
+        .next())
 }
 
-#[instrument(skip(session), fields(event_id))]
+#[instrument(skip(db), fields(event_id))]
 pub async fn get_latest_timestamp_for_id(
-    session: &mut DbSession,
+    db: &impl ConnectionTrait,
     event_id: i64,
 ) -> Result<Option<DateTime<Utc>>> {
-    let ts = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
-        "SELECT MAX(timestamp) FROM websocket_events WHERE id = $1",
-    )
-    .bind(event_id)
-    .fetch_one(session.as_mut())
-    .await?;
+    let ts = websocket_events::Entity::find()
+        .select_only()
+        .column(websocket_events::Column::Timestamp)
+        .filter(websocket_events::Column::Id.eq(event_id))
+        .order_by_desc(websocket_events::Column::Timestamp)
+        .into_tuple::<(DateTime<Utc>,)>()
+        .one(db)
+        .await?
+        .map(|(timestamp,)| timestamp);
     Ok(ts)
 }
 
-#[instrument(skip(session), fields(last_timestamp = ?last_timestamp, last_id, limit))]
+#[instrument(skip(db), fields(last_timestamp = ?last_timestamp, last_id, limit))]
 pub async fn poll_events(
-    session: &mut DbSession,
+    db: &impl ConnectionTrait,
     last_timestamp: Option<DateTime<Utc>>,
     last_id: i64,
     limit: i64,
 ) -> Result<Vec<WebSocketEvent>> {
     if last_timestamp.is_some() {
-        get_events_after_offset(session, last_id, last_timestamp, limit, None, None).await
+        get_events_after_offset(db, last_id, last_timestamp, limit, None, None).await
     } else {
-        get_events_after_offset(session, last_id, None, limit, None, None).await
+        get_events_after_offset(db, last_id, None, limit, None, None).await
     }
 }
 
-#[instrument(skip(session), fields(processor_id = %processor_id))]
+#[instrument(skip(db), fields(processor_id = %processor_id))]
 pub async fn get_cursor(
-    session: &mut DbSession,
+    db: &impl ConnectionTrait,
     processor_id: &str,
 ) -> Result<Option<EventProcessorOffset>> {
-    let offset = sqlx::query_as::<_, EventProcessorOffset>(
-        "SELECT * FROM event_processor_offsets WHERE processor_id = $1",
-    )
-    .bind(processor_id)
-    .fetch_optional(session.as_mut())
-    .await?;
+    let offset = event_processor_offsets::Entity::find_by_id(processor_id.to_owned())
+        .one(db)
+        .await?;
     Ok(offset)
 }
 
-#[instrument(skip(session), fields(processor_id = %processor_id))]
-pub async fn get_offset(session: &mut DbSession, processor_id: &str) -> Result<i64> {
-    let offset = sqlx::query_scalar::<_, Option<i64>>(
-        "SELECT last_processed_id FROM event_processor_offsets WHERE processor_id = $1",
-    )
-    .bind(processor_id)
-    .fetch_optional(session.as_mut())
-    .await?;
-    Ok(offset.flatten().unwrap_or(0))
+#[instrument(skip(db), fields(processor_id = %processor_id))]
+pub async fn get_offset(db: &impl ConnectionTrait, processor_id: &str) -> Result<i64> {
+    let offset = event_processor_offsets::Entity::find_by_id(processor_id.to_owned())
+        .one(db)
+        .await?
+        .map(|model| model.last_processed_id)
+        .unwrap_or(0);
+    Ok(offset)
 }
 
-#[instrument(skip(session), fields(processor_id = %processor_id, last_processed_id, has_last_processed_timestamp = last_processed_timestamp.is_some(), has_last_processed_at = last_processed_at.is_some()))]
+#[instrument(skip(db), fields(processor_id = %processor_id, last_processed_id, has_last_processed_timestamp = last_processed_timestamp.is_some(), has_last_processed_at = last_processed_at.is_some()))]
 pub async fn update_offset(
-    session: &mut DbSession,
+    db: &impl ConnectionTrait,
     processor_id: &str,
     last_processed_id: i64,
     last_processed_timestamp: Option<DateTime<Utc>>,
     last_processed_at: Option<DateTime<Utc>>,
 ) -> Result<EventProcessorOffset> {
-    let record = sqlx::query_as::<_, EventProcessorOffset>(
-        r#"INSERT INTO event_processor_offsets
-               (processor_id, last_processed_id, last_processed_timestamp, last_processed_at, updated_at)
-           VALUES ($1, $2, $3, $4, NOW())
-           ON CONFLICT (processor_id) DO UPDATE SET
-               last_processed_id = $2,
-               last_processed_timestamp = $3,
-               last_processed_at = $4,
-               updated_at = NOW()
-           RETURNING *"#,
+    let now = Utc::now();
+    event_processor_offsets::Entity::insert(event_processor_offsets::ActiveModel {
+        processor_id: Set(processor_id.to_owned()),
+        last_processed_id: Set(last_processed_id),
+        last_processed_timestamp: Set(last_processed_timestamp),
+        last_processed_at: Set(last_processed_at),
+        updated_at: Set(now),
+    })
+    .on_conflict(
+        OnConflict::column(event_processor_offsets::Column::ProcessorId)
+            .update_columns([
+                event_processor_offsets::Column::LastProcessedId,
+                event_processor_offsets::Column::LastProcessedTimestamp,
+                event_processor_offsets::Column::LastProcessedAt,
+                event_processor_offsets::Column::UpdatedAt,
+            ])
+            .to_owned(),
     )
-    .bind(processor_id)
-    .bind(last_processed_id)
-    .bind(last_processed_timestamp)
-    .bind(last_processed_at)
-    .fetch_one(session.as_mut())
+    .exec(db)
     .await?;
+    let record = event_processor_offsets::Entity::find_by_id(processor_id.to_owned())
+        .one(db)
+        .await?
+        .ok_or_else(|| {
+            LiliumError::service(
+                "EVENT_PROCESSOR_OFFSET_UPSERT_RETURNED_NO_ROW",
+                "upsert offset must return one row",
+            )
+        })?;
     Ok(record)
 }
 
-#[instrument(skip(session), fields(processor_id = %processor_id))]
-pub async fn delete_offset(session: &mut DbSession, processor_id: &str) -> Result<()> {
-    sqlx::query("DELETE FROM event_processor_offsets WHERE processor_id = $1")
-        .bind(processor_id)
-        .execute(session.as_mut())
+#[instrument(skip(db), fields(processor_id = %processor_id))]
+pub async fn delete_offset(db: &impl ConnectionTrait, processor_id: &str) -> Result<()> {
+    event_processor_offsets::Entity::delete_by_id(processor_id.to_owned())
+        .exec(db)
         .await?;
     Ok(())
 }
@@ -365,22 +349,18 @@ mod tests {
             lilium_test_fixtures::TestDb::acquire(lilium_test_fixtures::FixtureProfile::Event)
                 .await
                 .expect("init event db");
+        let db = test_db.database().orm();
 
-        lilium_database::transaction!(test_db.database(), |session| {
-            let now = Utc::now();
-            let user_id = unique_event_id();
-            insert_event(session, &user_id, "test", json!({"hello": "world"}), now)
-                .await
-                .expect("insert event");
-            let events = get_pending_events(session, 10, Some(&user_id), Some("test"))
-                .await
-                .expect("pending events");
-            assert!(!events.is_empty());
-            assert!(events.iter().any(|e| e.user_id == user_id));
-            Ok(())
-        })
-        .await
-        .expect("event roundtrip");
+        let now = Utc::now();
+        let user_id = unique_event_id();
+        insert_event(db, &user_id, "test", json!({"hello": "world"}), now)
+            .await
+            .expect("insert event");
+        let events = get_pending_events(db, 10, Some(&user_id), Some("test"))
+            .await
+            .expect("pending events");
+        assert!(!events.is_empty());
+        assert!(events.iter().any(|e| e.user_id == user_id));
     }
 
     #[tokio::test]
@@ -389,39 +369,27 @@ mod tests {
             lilium_test_fixtures::TestDb::acquire(lilium_test_fixtures::FixtureProfile::Event)
                 .await
                 .expect("init event db");
+        let db = test_db.database().orm();
 
-        lilium_database::transaction!(test_db.database(), |session| {
-            let processor_id = unique_event_id();
+        let processor_id = unique_event_id();
 
-            let offset = get_offset(session, &processor_id)
-                .await
-                .expect("initial offset");
-            assert_eq!(offset, 0);
+        let offset = get_offset(db, &processor_id).await.expect("initial offset");
+        assert_eq!(offset, 0);
 
-            let updated = update_offset(
-                session,
-                &processor_id,
-                42,
-                Some(Utc::now()),
-                Some(Utc::now()),
-            )
+        let updated = update_offset(db, &processor_id, 42, Some(Utc::now()), Some(Utc::now()))
             .await
             .expect("update offset");
-            assert_eq!(updated.processor_id, processor_id);
-            assert_eq!(updated.last_processed_id, 42);
+        assert_eq!(updated.processor_id, processor_id);
+        assert_eq!(updated.last_processed_id, 42);
 
-            let cursor = get_cursor(session, &processor_id)
-                .await
-                .expect("get cursor")
-                .expect("cursor exists");
-            assert_eq!(cursor.last_processed_id, 42);
+        let cursor = get_cursor(db, &processor_id)
+            .await
+            .expect("get cursor")
+            .expect("cursor exists");
+        assert_eq!(cursor.last_processed_id, 42);
 
-            delete_offset(session, &processor_id)
-                .await
-                .expect("delete offset");
-            Ok(())
-        })
-        .await
-        .expect("offset roundtrip");
+        delete_offset(db, &processor_id)
+            .await
+            .expect("delete offset");
     }
 }

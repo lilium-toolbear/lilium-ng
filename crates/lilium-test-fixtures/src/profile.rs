@@ -1,6 +1,6 @@
 use anyhow::Result;
 use lilium_database::Database;
-use lilium_database::DbSession;
+use sea_orm::ConnectionTrait;
 
 use crate::database::{TestDatabaseConnection, connect_test_database};
 use crate::reset::reset_database;
@@ -32,10 +32,8 @@ impl TestDb {
         let connection = connect_test_database().await;
 
         let database = Database::create(connection.database_config()).await?;
-        lilium_database::transaction!(database, |session| {
-            prepare_database(session, profile).await
-        })
-        .await?;
+        lilium_database::transaction!(database, |conn| { prepare_database(conn, profile).await })
+            .await?;
 
         Ok(Self {
             database,
@@ -48,8 +46,8 @@ impl TestDb {
     }
 }
 
-pub async fn prepare_database(session: &mut DbSession, profile: FixtureProfile) -> Result<()> {
-    reset_database(session).await?;
+pub async fn prepare_database<C: ConnectionTrait>(db: &C, profile: FixtureProfile) -> Result<()> {
+    reset_database(db).await?;
 
     match profile {
         FixtureProfile::Empty
@@ -58,10 +56,10 @@ pub async fn prepare_database(session: &mut DbSession, profile: FixtureProfile) 
         | FixtureProfile::Event
         | FixtureProfile::Account
         | FixtureProfile::Notification => {}
-        FixtureProfile::Shared => seed_shared_profile(session).await?,
-        FixtureProfile::User => seed_user_profile(session).await?,
-        FixtureProfile::Message => seed_message_profile(session).await?,
-        FixtureProfile::WebsocketConnection => seed_websocket_profile(session).await?,
+        FixtureProfile::Shared => seed_shared_profile(db).await?,
+        FixtureProfile::User => seed_user_profile(db).await?,
+        FixtureProfile::Message => seed_message_profile(db).await?,
+        FixtureProfile::WebsocketConnection => seed_websocket_profile(db).await?,
     }
 
     Ok(())

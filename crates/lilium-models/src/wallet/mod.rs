@@ -3,6 +3,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
+// Python parity source: dzmm_archive@6a92a9914602d633ff6fa3f5908fa68d00c36fcd models/wallet/wallet.py
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Wallet {
     pub user_id: String,
@@ -15,6 +16,7 @@ pub struct Wallet {
     pub created_at: DateTime<Utc>,
 }
 
+// Python parity source: dzmm_archive@6a92a9914602d633ff6fa3f5908fa68d00c36fcd models/wallet/wallet_transaction.py
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct WalletTransaction {
     pub id: i64,

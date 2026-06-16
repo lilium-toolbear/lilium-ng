@@ -1,22 +1,20 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-#[cfg(not(test))]
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tokio::time::{Duration, Instant, sleep};
 use tracing::{error, info, warn};
 
-#[cfg(not(test))]
 use lilium_common::LiliumError;
-use lilium_database::{Database, DbSession};
+use lilium_database::Database;
 use lilium_models::ingestion::WebSocketEvent;
-#[cfg(not(test))]
-use lilium_services::account_service as account;
+use lilium_services::account;
 use lilium_services::event;
 use lilium_services::media::MediaService;
 use lilium_services::message;
 use lilium_services::{room_member, user};
+use sea_orm::ConnectionTrait;
 
 #[derive(Debug, Default)]
 struct BatchSideEffects {
@@ -161,14 +159,14 @@ impl EventProcessor {
     async fn process_batch_individually(
         &self,
         events: &[WebSocketEvent],
-        cursor_id: i64,
+        _cursor_id: i64,
         cursor_timestamp: Option<DateTime<Utc>>,
     ) -> Result<BatchSideEffects> {
         let mut side_effects = BatchSideEffects::default();
 
         for event in events {
             let event_slice = std::slice::from_ref(event);
-            let event_cursor_id = event.id.unwrap_or(cursor_id);
+            let event_cursor_id = event.id;
             let event_cursor_timestamp = Some(event.timestamp).or(cursor_timestamp);
 
             match self
@@ -188,10 +186,6 @@ impl EventProcessor {
                         event_id = event_cursor_id,
                         error = %error,
                         "Skipping poison event during per-event fallback"
-                    );
-                    #[cfg(test)]
-                    eprintln!(
-                        "process_batch_individually: event {event_cursor_id} failed, entering skip_batch"
                     );
                     if let Err(skip_error) = self
                         .skip_batch(event_slice, event_cursor_id, event_cursor_timestamp)
@@ -213,12 +207,12 @@ impl EventProcessor {
     async fn process_single_event_fallback(
         &self,
         event: &WebSocketEvent,
-        cursor_id: i64,
+        _cursor_id: i64,
         cursor_timestamp: Option<DateTime<Utc>>,
     ) -> Result<BatchSideEffects> {
         let processor_id = self.processor_id.clone();
         let event = event.clone();
-        let event_id = event.id.unwrap_or(cursor_id);
+        let event_id = event.id;
         let (user_fetch_collector, media_message_ids) =
             lilium_database::transaction!(self.database, |session| {
                 let event = event.clone();
@@ -326,7 +320,7 @@ impl EventProcessor {
     }
 
     async fn fetch_batch_inner(
-        session: &mut DbSession,
+        session: &impl ConnectionTrait,
         processor_id: String,
         batch_size: i64,
     ) -> Result<(Vec<WebSocketEvent>, i64, Option<DateTime<Utc>>)> {
@@ -337,7 +331,7 @@ impl EventProcessor {
     }
 
     async fn process_batch_inner(
-        session: &mut DbSession,
+        session: &impl ConnectionTrait,
         events: Vec<WebSocketEvent>,
         processor_id: String,
         start_cursor_id: i64,
@@ -371,7 +365,7 @@ impl EventProcessor {
     }
 
     async fn skip_batch_inner(
-        session: &mut DbSession,
+        session: &impl ConnectionTrait,
         processor_id: String,
         last_id: i64,
         last_timestamp: Option<DateTime<Utc>>,
@@ -388,7 +382,7 @@ impl EventProcessor {
     }
 
     async fn fetch_last_cursor(
-        session: &mut DbSession,
+        session: &impl ConnectionTrait,
         processor_id: String,
     ) -> Result<(i64, Option<DateTime<Utc>>)> {
         let cursor = event::get_cursor(session, &processor_id).await?;
@@ -398,7 +392,7 @@ impl EventProcessor {
     }
 
     async fn poll_events(
-        session: &mut DbSession,
+        session: &impl ConnectionTrait,
         last_timestamp: Option<DateTime<Utc>>,
         last_id: i64,
         batch_size: i64,
@@ -409,7 +403,7 @@ impl EventProcessor {
     }
 
     async fn collect_updates_from_events(
-        session: &mut DbSession,
+        session: &impl ConnectionTrait,
         events: &[WebSocketEvent],
     ) -> Result<(Vec<(String, String, String)>, Vec<String>)> {
         let mut user_fetch_collector = Vec::new();
@@ -427,75 +421,54 @@ impl EventProcessor {
     }
 
     async fn sync_users(
-        session: &mut DbSession,
+        session: &impl ConnectionTrait,
         user_fetch_collector: &[(String, String, String)],
     ) -> Result<Vec<user::AvatarDownload>> {
         if user_fetch_collector.is_empty() {
             return Ok(Vec::new());
         }
 
-        #[cfg(test)]
-        {
-            if user_fetch_collector
-                .iter()
-                .any(|(_, user_id, _)| user_id == "__test:user-sync-fail")
-            {
-                anyhow::bail!("test-only user sync failure");
-            }
-
-            let user_room_pairs: Vec<(String, String)> = user_fetch_collector
-                .iter()
-                .map(|(_, user_id, room_id)| (user_id.clone(), room_id.clone()))
-                .collect();
-            user::batch_fetch_and_update(session, &user_room_pairs).await?;
-            return Ok(Vec::new());
+        let mut grouped: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for (source_account_user_id, user_id, room_id) in user_fetch_collector {
+            grouped
+                .entry(source_account_user_id.clone())
+                .or_default()
+                .push((user_id.clone(), room_id.clone()));
         }
 
-        #[cfg(not(test))]
-        {
-            let mut grouped: HashMap<String, Vec<(String, String)>> = HashMap::new();
-            for (source_account_user_id, user_id, room_id) in user_fetch_collector {
-                grouped
-                    .entry(source_account_user_id.clone())
-                    .or_default()
-                    .push((user_id.clone(), room_id.clone()));
-            }
+        let mut total_new = 0;
+        let mut total_updated = 0;
+        let account_count = grouped.len();
+        let mut avatar_downloads = Vec::new();
 
-            let mut total_new = 0;
-            let mut total_updated = 0;
-            let account_count = grouped.len();
-            let mut avatar_downloads = Vec::new();
+        for (source_account_user_id, user_room_pairs) in grouped {
+            let account = { account::get_account(session, &source_account_user_id).await? }
+                .ok_or_else(|| {
+                    LiliumError::service(
+                        "ACCOUNT_SYNC_ACCOUNT_NOT_FOUND",
+                        format!(
+                            "Account '{}' not found for user sync",
+                            source_account_user_id
+                        ),
+                    )
+                })?;
 
-            for (source_account_user_id, user_room_pairs) in grouped {
-                let account = { account::get_account(session, &source_account_user_id).await? }
-                    .ok_or_else(|| {
-                        LiliumError::service(
-                            "ACCOUNT_SYNC_ACCOUNT_NOT_FOUND",
-                            format!(
-                                "Account '{}' not found for user sync",
-                                source_account_user_id
-                            ),
-                        )
-                    })?;
-
-                let auth = account::create_auth_client(&account)?;
-                let result =
-                    user::batch_fetch_and_update_with_auth(session, &auth, &user_room_pairs, 1)
-                        .await?;
-                total_new += result.new_count;
-                total_updated += result.updated_count;
-                avatar_downloads.extend(result.avatar_downloads);
-            }
-
-            info!(
-                new = total_new,
-                updated = total_updated,
-                accounts = account_count,
-                "Batch fetched users via auth clients"
-            );
-
-            Ok(avatar_downloads)
+            let auth = account::create_auth_client(&account)?;
+            let result =
+                user::batch_fetch_and_update_with_auth(session, &auth, &user_room_pairs, 1).await?;
+            total_new += result.new_count;
+            total_updated += result.updated_count;
+            avatar_downloads.extend(result.avatar_downloads);
         }
+
+        info!(
+            new = total_new,
+            updated = total_updated,
+            accounts = account_count,
+            "Batch fetched users via auth clients"
+        );
+
+        Ok(avatar_downloads)
     }
 
     fn spawn_media_download(&self, media_message_ids: Vec<String>) {
@@ -621,9 +594,7 @@ impl EventProcessor {
         let mut last_timestamp: Option<DateTime<Utc>> = None;
 
         for event in events {
-            if let Some(event_id) = event.id {
-                last_id = event_id;
-            }
+            last_id = event.id;
             last_timestamp = Some(event.timestamp);
         }
 
@@ -631,15 +602,10 @@ impl EventProcessor {
     }
 
     async fn process_event(
-        session: &mut DbSession,
+        session: &impl ConnectionTrait,
         event: &WebSocketEvent,
         user_fetch_collector: &mut Vec<(String, String, String)>,
     ) -> Result<Option<String>> {
-        #[cfg(test)]
-        if event.event == "__test:fail" {
-            anyhow::bail!("test-only event processor failure");
-        }
-
         match event.event.as_str() {
             "message:new" => {
                 if let Some(msg) =
@@ -659,27 +625,27 @@ impl EventProcessor {
                         ));
                     }
 
-                    if msg.content_type == "system" {
-                        if let Some(content_text) = msg.content_text.as_deref() {
-                            if content_text.contains("加入了群聊") && !msg.sent_by.is_empty() {
-                                room_member::upsert_member_simple(
-                                    session,
-                                    &msg.room_id,
-                                    &msg.sent_by,
-                                    "member",
-                                    Some(msg.sent_at),
-                                )
-                                .await?;
-                            } else if content_text.contains("离开了群聊") && !msg.sent_by.is_empty()
-                            {
-                                let _ = room_member::mark_member_left(
-                                    session,
-                                    &msg.room_id,
-                                    &msg.sent_by,
-                                    Some(msg.sent_at),
-                                )
-                                .await?;
-                            }
+                    if msg.content_type == "system"
+                        && let Some(content_text) = msg.content_text.as_deref()
+                    {
+                        if content_text.contains("加入了群聊") && !msg.sent_by.is_empty() {
+                            room_member::upsert_member_simple(
+                                session,
+                                &msg.room_id,
+                                &msg.sent_by,
+                                "member",
+                                Some(msg.sent_at),
+                            )
+                            .await?;
+                        } else if content_text.contains("离开了群聊") && !msg.sent_by.is_empty()
+                        {
+                            let _ = room_member::mark_member_left(
+                                session,
+                                &msg.room_id,
+                                &msg.sent_by,
+                                Some(msg.sent_at),
+                            )
+                            .await?;
                         }
                     }
 
@@ -694,15 +660,12 @@ impl EventProcessor {
                         return Ok(None);
                     }
 
-                    if let Some(msg_data) = event.data.get("message") {
-                        if let Some(content) = msg_data.get("content") {
-                            if let Some(content_type) = content.get("type").and_then(|v| v.as_str())
-                            {
-                                if matches!(content_type, "image" | "video" | "voice" | "sticker") {
-                                    return Ok(Some(msg.message_id.clone()));
-                                }
-                            }
-                        }
+                    if let Some(msg_data) = event.data.get("message")
+                        && let Some(content) = msg_data.get("content")
+                        && let Some(content_type) = content.get("type").and_then(|v| v.as_str())
+                        && matches!(content_type, "image" | "video" | "voice" | "sticker")
+                    {
+                        return Ok(Some(msg.message_id.clone()));
                     }
                 }
                 Ok(None)
@@ -727,48 +690,48 @@ impl EventProcessor {
                 Ok(None)
             }
             "presence:user-online" => {
-                if let Some(user_id) = event.data.get("userId").and_then(|v| v.as_str()) {
-                    if let Some(room_id) = event.data.get("chatroomId").and_then(|v| v.as_str()) {
-                        user_fetch_collector.push((
-                            event.user_id.clone(),
-                            user_id.to_string(),
-                            room_id.to_string(),
-                        ));
-                    }
+                if let Some(user_id) = event.data.get("userId").and_then(|v| v.as_str())
+                    && let Some(room_id) = event.data.get("chatroomId").and_then(|v| v.as_str())
+                {
+                    user_fetch_collector.push((
+                        event.user_id.clone(),
+                        user_id.to_string(),
+                        room_id.to_string(),
+                    ));
                 }
                 Ok(None)
             }
             "group:member-joined" => {
-                if let Some(user_id) = event.data.get("userId").and_then(|v| v.as_str()) {
-                    if let Some(room_id) = event.data.get("chatroomId").and_then(|v| v.as_str()) {
-                        room_member::upsert_member_simple(
-                            session,
-                            room_id,
-                            user_id,
-                            "member",
-                            Some(event.timestamp),
-                        )
-                        .await?;
-                        user_fetch_collector.push((
-                            event.user_id.clone(),
-                            user_id.to_string(),
-                            room_id.to_string(),
-                        ));
-                    }
+                if let Some(user_id) = event.data.get("userId").and_then(|v| v.as_str())
+                    && let Some(room_id) = event.data.get("chatroomId").and_then(|v| v.as_str())
+                {
+                    room_member::upsert_member_simple(
+                        session,
+                        room_id,
+                        user_id,
+                        "member",
+                        Some(event.timestamp),
+                    )
+                    .await?;
+                    user_fetch_collector.push((
+                        event.user_id.clone(),
+                        user_id.to_string(),
+                        room_id.to_string(),
+                    ));
                 }
                 Ok(None)
             }
             "group:member-left" => {
-                if let Some(user_id) = event.data.get("userId").and_then(|v| v.as_str()) {
-                    if let Some(room_id) = event.data.get("chatroomId").and_then(|v| v.as_str()) {
-                        let _ = room_member::mark_member_left(
-                            session,
-                            room_id,
-                            user_id,
-                            Some(event.timestamp),
-                        )
-                        .await?;
-                    }
+                if let Some(user_id) = event.data.get("userId").and_then(|v| v.as_str())
+                    && let Some(room_id) = event.data.get("chatroomId").and_then(|v| v.as_str())
+                {
+                    let _ = room_member::mark_member_left(
+                        session,
+                        room_id,
+                        user_id,
+                        Some(event.timestamp),
+                    )
+                    .await?;
                 }
                 Ok(None)
             }
@@ -795,7 +758,6 @@ mod tests {
     use lilium_services::event;
     use lilium_services::message;
     use lilium_test_fixtures::{FixtureProfile, TestDb};
-    use sqlx::query_as;
 
     fn utc(ts: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(ts)
@@ -811,7 +773,7 @@ mod tests {
         data: serde_json::Value,
     ) -> WebSocketEvent {
         WebSocketEvent {
-            id: Some(id),
+            id,
             event: event.to_string(),
             data,
             user_id: user_id.to_string(),
@@ -820,20 +782,13 @@ mod tests {
     }
 
     async fn room_member_row(
-        session: &mut DbSession,
+        session: &impl ConnectionTrait,
         room_id: &str,
         user_id: &str,
     ) -> Result<Option<RoomMember>> {
-        let row = query_as::<_, RoomMember>(
-            r#"SELECT room_id, user_id, role, joined_at, left_at, raw_data, created_at, updated_at
-               FROM room_members
-               WHERE room_id = $1 AND user_id = $2"#,
-        )
-        .bind(room_id)
-        .bind(user_id)
-        .fetch_optional(session.as_mut())
-        .await?;
-        Ok(row)
+        lilium_services::room_member::get_member_info(session, room_id, user_id)
+            .await
+            .map_err(Into::into)
     }
 
     #[tokio::test]
@@ -990,7 +945,6 @@ mod tests {
                 sent_by: "user_deleted".to_string(),
                 content_type: "text".to_string(),
                 content_text: Some("hello".to_string()),
-                content_tsv: None,
                 attachment_url: None,
                 attachment_file: None,
                 sticker_id: None,
@@ -1058,10 +1012,13 @@ mod tests {
         let events = vec![
             websocket_event(
                 21,
-                "__test:fail",
+                "presence:user-online",
                 "account_1",
                 "2026-06-03T00:00:00Z",
-                serde_json::json!({}),
+                serde_json::json!({
+                    "chatroomId": "room_1",
+                    "userId": "user_sync_missing_account"
+                }),
             ),
             websocket_event(
                 22,
@@ -1115,7 +1072,7 @@ mod tests {
                 "message": {
                     "message_id": "msg_user_sync_fail",
                     "chatroom_id": "room_1",
-                    "sent_by": "__test:user-sync-fail",
+                    "sent_by": "user_sync_missing_account",
                     "sent_at": "2026-06-03T00:00:00Z",
                     "content": {
                         "type": "text",
@@ -1137,7 +1094,7 @@ mod tests {
                     let message = message::get_by_id(session, "msg_user_sync_fail", false)
                         .await?
                         .expect("message should be committed before user sync skip");
-                    assert_eq!(message.sent_by, "__test:user-sync-fail");
+                    assert_eq!(message.sent_by, "user_sync_missing_account");
 
                     let offset = event::get_offset(session, "test_processor").await?;
                     assert_eq!(offset, 31);

@@ -1,8 +1,10 @@
+#![allow(dead_code)]
+
 use anyhow::{Context, Result};
 use lilium_api_client::http::{CookieRefreshCallback, DzmmApi};
 use lilium_api_client::websocket::WsClient;
 use lilium_database::Database;
-use lilium_services::account_service;
+use lilium_services::account;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
@@ -113,7 +115,7 @@ impl Worker {
         let account_id = account_id.to_string();
         let lookup_account_id = account_id.clone();
         let account = lilium_database::transaction!(database, |session| {
-            let account = account_service::get_account(session, &lookup_account_id).await?;
+            let account = account::get_account(session, &lookup_account_id).await?;
             Ok(account)
         })
         .await?
@@ -127,7 +129,7 @@ impl Worker {
             Box::pin(async move {
                 let update_account_id = account_id.clone();
                 let result = lilium_database::transaction!(database, |session| {
-                    account_service::update_cookies(session, &update_account_id, &cookies).await?;
+                    account::update_cookies(session, &update_account_id, &cookies).await?;
                     Ok(())
                 })
                 .await;

@@ -1,41 +1,19 @@
-use anyhow::{Context, Result};
-use sqlx::{PgPool, Postgres, pool::PoolConnection};
-use std::future::Future;
-use std::pin::Pin;
-use tracing::instrument;
-
-pub type SessionFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+use sqlx::PgPool;
 
 #[derive(Debug, Clone)]
+/// Internal wrapper around the SQLx Postgres pool used by [`crate::Database`].
+///
+/// This type exists so the database crate can keep raw SQLx pool access behind
+/// an explicit infrastructure boundary. Service code should use
+/// [`crate::Database::orm`] and SeaORM instead of depending on this pool.
 pub struct DbPool {
     inner: PgPool,
 }
 
-#[derive(Debug)]
-pub struct DbSession {
-    inner: PoolConnection<Postgres>,
-}
-
-impl DbSession {
-    fn new(inner: PoolConnection<Postgres>) -> Self {
-        Self { inner }
-    }
-}
-
-impl std::ops::Deref for DbSession {
-    type Target = PoolConnection<Postgres>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl std::ops::DerefMut for DbSession {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
-    }
-}
-
+/// Normalize Postgres URLs for SQLx/SeaORM connection constructors.
+///
+/// The Python side and deployment configuration may use `postgresql://`; SQLx
+/// accepts `postgres://` consistently, so the database layer normalizes it once.
 pub(crate) fn normalize_database_url(url: &str) -> String {
     let url = url.trim();
     if let Some(rest) = url.strip_prefix("postgresql://") {
@@ -46,67 +24,16 @@ pub(crate) fn normalize_database_url(url: &str) -> String {
 }
 
 impl DbPool {
+    /// Wrap an existing SQLx Postgres pool for internal database runtime use.
     pub(crate) fn from_pg_pool(inner: PgPool) -> Self {
         Self { inner }
     }
 
+    /// Return the underlying SQLx pool for infrastructure-only helpers.
+    ///
+    /// Do not expose this to services for ordinary table CRUD. Prefer
+    /// `ConnectionTrait` and SeaORM query builders.
     pub fn inner(&self) -> &PgPool {
         &self.inner
-    }
-
-    #[instrument(skip(self))]
-    pub async fn begin_session(&self) -> Result<DbSession> {
-        let mut conn = self
-            .inner
-            .acquire()
-            .await
-            .with_context(|| "failed to begin database transaction")?;
-        sqlx::query("BEGIN")
-            .execute(conn.as_mut())
-            .await
-            .with_context(|| "failed to begin database transaction")?;
-        Ok(DbSession::new(conn))
-    }
-
-    async fn commit_session(session: &mut DbSession) -> Result<()> {
-        sqlx::query("COMMIT")
-            .execute(session.inner.as_mut())
-            .await
-            .with_context(|| "failed to commit session")?;
-        Ok(())
-    }
-
-    async fn rollback_session(session: &mut DbSession) -> Result<()> {
-        sqlx::query("ROLLBACK")
-            .execute(session.inner.as_mut())
-            .await
-            .with_context(|| "failed to rollback session")?;
-        Ok(())
-    }
-
-    async fn run_session<T, F>(&self, f: F) -> Result<T>
-    where
-        F: for<'a> FnOnce(&'a mut DbSession) -> SessionFuture<'a, T>,
-    {
-        let mut session = self.begin_session().await?;
-        let result = f(&mut session).await;
-        match result {
-            Ok(value) => {
-                Self::commit_session(&mut session).await?;
-                Ok(value)
-            }
-            Err(error) => {
-                Self::rollback_session(&mut session).await.ok();
-                Err(error)
-            }
-        }
-    }
-
-    #[instrument(skip(self, f))]
-    pub async fn with_session<T, F>(&self, f: F) -> Result<T>
-    where
-        F: for<'a> FnOnce(&'a mut DbSession) -> SessionFuture<'a, T>,
-    {
-        self.run_session(f).await
     }
 }

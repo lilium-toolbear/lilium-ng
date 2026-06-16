@@ -1,12 +1,17 @@
 use crate::Result;
 use chrono::Utc;
 use lilium_api_client::http::DzmmApi;
-use lilium_database::DbSession;
-
 use lilium_common::LiliumError;
-use lilium_models::dzmm::account::DzmmAccount;
+use lilium_models::dzmm::{account as dzmm_account, websocket_connection as websocket_connections};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter,
+    QueryOrder, Set,
+};
 use tracing::instrument;
 
+type DzmmAccount = dzmm_account::Model;
+
+#[allow(clippy::result_large_err)]
 #[instrument(
     skip(account),
     fields(
@@ -33,9 +38,10 @@ pub fn create_auth_client(account: &DzmmAccount) -> Result<DzmmApi> {
     .map_err(|e| LiliumError::service("ACCOUNT_AUTH_CLIENT_BUILD_FAILED", e.to_string()))
 }
 
+#[allow(clippy::too_many_arguments)]
 #[instrument(
     skip(
-        session,
+        db,
         user_profile,
         email,
         password,
@@ -54,8 +60,8 @@ pub fn create_auth_client(account: &DzmmAccount) -> Result<DzmmApi> {
         has_cookies = cookies.is_some()
     )
 )]
-pub async fn create_account(
-    session: &mut DbSession,
+pub async fn create_account<C>(
+    db: &C,
     user_id: &str,
     user_profile: serde_json::Value,
     email: Option<&str>,
@@ -64,8 +70,11 @@ pub async fn create_account(
     signin_code_image: Option<&[u8]>,
     signin_code_image_mime: Option<&str>,
     cookies: Option<&str>,
-) -> Result<DzmmAccount> {
-    let existing = get_account(session, user_id).await?;
+) -> Result<DzmmAccount>
+where
+    C: ConnectionTrait,
+{
+    let existing = get_account(db, user_id).await?;
     if existing.is_some() {
         return Err(LiliumError::domain_service_with_code(
             "ACCOUNT_INVALID_REQUEST",
@@ -95,64 +104,64 @@ pub async fn create_account(
     }
 
     let now = Utc::now();
-    let account = sqlx::query_as::<_, DzmmAccount>(
-        r#"INSERT INTO dzmm_account (user_id, user_profile, email, password, signin_code, signin_code_image, signin_code_image_mime, cookies, is_enabled, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $10)
-             RETURNING *"#,
-    )
-    .bind(user_id)
-    .bind(user_profile)
-    .bind(email)
-    .bind(password)
-    .bind(signin_code)
-    .bind(signin_code_image)
-    .bind(signin_code_image_mime)
-    .bind(cookies)
-    .bind(now)
-    .bind(now)
-    .fetch_one(session.as_mut())
+    let account = dzmm_account::ActiveModel {
+        user_id: Set(user_id.to_owned()),
+        user_profile: Set(user_profile),
+        email: Set(email.map(str::to_owned)),
+        password: Set(password.map(str::to_owned)),
+        signin_code: Set(signin_code.map(str::to_owned)),
+        signin_code_image: Set(signin_code_image.map(|value| value.to_vec())),
+        signin_code_image_mime: Set(signin_code_image_mime.map(str::to_owned)),
+        cookies: Set(cookies.map(str::to_owned)),
+        is_enabled: Set(true),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(db)
     .await?;
 
     Ok(account)
 }
 
-#[instrument(skip(session), fields(user_id = %user_id))]
-pub async fn get_account(session: &mut DbSession, user_id: &str) -> Result<Option<DzmmAccount>> {
-    let account = sqlx::query_as::<_, DzmmAccount>("SELECT * FROM dzmm_account WHERE user_id = $1")
-        .bind(user_id)
-        .fetch_optional(session.as_mut())
+#[instrument(skip(db), fields(user_id = %user_id))]
+pub async fn get_account<C>(db: &C, user_id: &str) -> Result<Option<DzmmAccount>>
+where
+    C: ConnectionTrait,
+{
+    let account = dzmm_account::Entity::find_by_id(user_id.to_owned())
+        .one(db)
         .await?;
 
     Ok(account)
 }
 
-#[instrument(skip(session), fields(enabled_only))]
-pub async fn list_accounts(
-    session: &mut DbSession,
-    enabled_only: bool,
-) -> Result<Vec<DzmmAccount>> {
+#[instrument(skip(db), fields(enabled_only))]
+pub async fn list_accounts<C>(db: &C, enabled_only: bool) -> Result<Vec<DzmmAccount>>
+where
+    C: ConnectionTrait,
+{
     let accounts = if enabled_only {
-        sqlx::query_as::<_, DzmmAccount>(
-            "SELECT * FROM dzmm_account WHERE is_enabled = true ORDER BY created_at DESC",
-        )
-        .fetch_all(session.as_mut())
-        .await?
+        dzmm_account::Entity::find()
+            .filter(dzmm_account::Column::IsEnabled.eq(true))
+            .order_by_desc(dzmm_account::Column::CreatedAt)
+            .all(db)
+            .await?
     } else {
-        sqlx::query_as::<_, DzmmAccount>("SELECT * FROM dzmm_account ORDER BY created_at DESC")
-            .fetch_all(session.as_mut())
+        dzmm_account::Entity::find()
+            .order_by_desc(dzmm_account::Column::CreatedAt)
+            .all(db)
             .await?
     };
 
-    Ok(accounts)
+    Ok(accounts.into_iter().collect())
 }
 
-#[instrument(skip(session, new_password), fields(user_id = %user_id))]
-pub async fn update_password(
-    session: &mut DbSession,
-    user_id: &str,
-    new_password: &str,
-) -> Result<DzmmAccount> {
-    let account = get_account(session, user_id).await?;
+#[instrument(skip(db, new_password), fields(user_id = %user_id))]
+pub async fn update_password<C>(db: &C, user_id: &str, new_password: &str) -> Result<DzmmAccount>
+where
+    C: ConnectionTrait,
+{
+    let account = get_account(db, user_id).await?;
     let account = match account {
         Some(a) => a,
         None => {
@@ -174,21 +183,24 @@ pub async fn update_password(
     }
 
     let now = Utc::now();
-    let updated = sqlx::query_as::<_, DzmmAccount>(
-        "UPDATE dzmm_account SET password = $1, updated_at = $2 WHERE user_id = $3 RETURNING *",
-    )
-    .bind(new_password)
-    .bind(now)
-    .bind(user_id)
-    .fetch_one(session.as_mut())
+    let updated = dzmm_account::ActiveModel {
+        user_id: Set(user_id.to_owned()),
+        password: Set(Some(new_password.to_owned())),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .update(db)
     .await?;
 
     Ok(updated)
 }
 
-#[instrument(skip(session, cookies), fields(user_id = %user_id))]
-pub async fn update_cookies(session: &mut DbSession, user_id: &str, cookies: &str) -> Result<()> {
-    let account = get_account(session, user_id).await?;
+#[instrument(skip(db, cookies), fields(user_id = %user_id))]
+pub async fn update_cookies<C>(db: &C, user_id: &str, cookies: &str) -> Result<()>
+where
+    C: ConnectionTrait,
+{
+    let account = get_account(db, user_id).await?;
     if account.is_none() {
         return Err(LiliumError::domain_service_with_code(
             "ACCOUNT_INVALID_REQUEST",
@@ -197,23 +209,28 @@ pub async fn update_cookies(session: &mut DbSession, user_id: &str, cookies: &st
     }
 
     let now = Utc::now();
-    sqlx::query("UPDATE dzmm_account SET cookies = $1, updated_at = $2 WHERE user_id = $3")
-        .bind(cookies)
-        .bind(now)
-        .bind(user_id)
-        .execute(session.as_mut())
-        .await?;
+    dzmm_account::ActiveModel {
+        user_id: Set(user_id.to_owned()),
+        cookies: Set(Some(cookies.to_owned())),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .update(db)
+    .await?;
 
     Ok(())
 }
 
-#[instrument(skip(session, user_profile), fields(user_id = %user_id))]
-pub async fn update_user_profile(
-    session: &mut DbSession,
+#[instrument(skip(db, user_profile), fields(user_id = %user_id))]
+pub async fn update_user_profile<C>(
+    db: &C,
     user_id: &str,
     user_profile: serde_json::Value,
-) -> Result<DzmmAccount> {
-    let account = get_account(session, user_id).await?;
+) -> Result<DzmmAccount>
+where
+    C: ConnectionTrait,
+{
+    let account = get_account(db, user_id).await?;
     if account.is_none() {
         return Err(LiliumError::domain_service_with_code(
             "ACCOUNT_INVALID_REQUEST",
@@ -222,21 +239,24 @@ pub async fn update_user_profile(
     }
 
     let now = Utc::now();
-    let updated = sqlx::query_as::<_, DzmmAccount>(
-        "UPDATE dzmm_account SET user_profile = $1, updated_at = $2 WHERE user_id = $3 RETURNING *",
-    )
-    .bind(user_profile)
-    .bind(now)
-    .bind(user_id)
-    .fetch_one(session.as_mut())
+    let updated = dzmm_account::ActiveModel {
+        user_id: Set(user_id.to_owned()),
+        user_profile: Set(user_profile),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .update(db)
     .await?;
 
     Ok(updated)
 }
 
-#[instrument(skip(session), fields(user_id = %user_id))]
-pub async fn activate_account(session: &mut DbSession, user_id: &str) -> Result<DzmmAccount> {
-    let account = get_account(session, user_id).await?;
+#[instrument(skip(db), fields(user_id = %user_id))]
+pub async fn activate_account<C>(db: &C, user_id: &str) -> Result<DzmmAccount>
+where
+    C: ConnectionTrait,
+{
+    let account = get_account(db, user_id).await?;
     if account.is_none() {
         return Err(LiliumError::domain_service_with_code(
             "ACCOUNT_INVALID_REQUEST",
@@ -245,20 +265,24 @@ pub async fn activate_account(session: &mut DbSession, user_id: &str) -> Result<
     }
 
     let now = Utc::now();
-    let updated = sqlx::query_as::<_, DzmmAccount>(
-        "UPDATE dzmm_account SET is_enabled = true, updated_at = $1 WHERE user_id = $2 RETURNING *",
-    )
-    .bind(now)
-    .bind(user_id)
-    .fetch_one(session.as_mut())
+    let updated = dzmm_account::ActiveModel {
+        user_id: Set(user_id.to_owned()),
+        is_enabled: Set(true),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .update(db)
     .await?;
 
     Ok(updated)
 }
 
-#[instrument(skip(session), fields(user_id = %user_id))]
-pub async fn deactivate_account(session: &mut DbSession, user_id: &str) -> Result<DzmmAccount> {
-    let account = get_account(session, user_id).await?;
+#[instrument(skip(db), fields(user_id = %user_id))]
+pub async fn deactivate_account<C>(db: &C, user_id: &str) -> Result<DzmmAccount>
+where
+    C: ConnectionTrait,
+{
+    let account = get_account(db, user_id).await?;
     if account.is_none() {
         return Err(LiliumError::domain_service_with_code(
             "ACCOUNT_INVALID_REQUEST",
@@ -267,20 +291,24 @@ pub async fn deactivate_account(session: &mut DbSession, user_id: &str) -> Resul
     }
 
     let now = Utc::now();
-    let updated = sqlx::query_as::<_, DzmmAccount>(
-        "UPDATE dzmm_account SET is_enabled = false, updated_at = $1 WHERE user_id = $2 RETURNING *",
-    )
-    .bind(now)
-    .bind(user_id)
-    .fetch_one(session.as_mut())
+    let updated = dzmm_account::ActiveModel {
+        user_id: Set(user_id.to_owned()),
+        is_enabled: Set(false),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .update(db)
     .await?;
 
     Ok(updated)
 }
 
-#[instrument(skip(session), fields(user_id = %user_id))]
-pub async fn delete_account(session: &mut DbSession, user_id: &str) -> Result<()> {
-    let account = get_account(session, user_id).await?;
+#[instrument(skip(db), fields(user_id = %user_id))]
+pub async fn delete_account<C>(db: &C, user_id: &str) -> Result<()>
+where
+    C: ConnectionTrait,
+{
+    let account = get_account(db, user_id).await?;
     if account.is_none() {
         return Err(LiliumError::domain_service_with_code(
             "ACCOUNT_INVALID_REQUEST",
@@ -288,12 +316,11 @@ pub async fn delete_account(session: &mut DbSession, user_id: &str) -> Result<()
         ));
     }
 
-    let has_active = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM websocket_connections WHERE account_user_id = $1)",
-    )
-    .bind(user_id)
-    .fetch_one(session.as_mut())
-    .await?;
+    let has_active = websocket_connections::Entity::find()
+        .filter(websocket_connections::Column::AccountUserId.eq(user_id))
+        .count(db)
+        .await?
+        > 0;
 
     if has_active {
         return Err(LiliumError::service(
@@ -306,21 +333,23 @@ pub async fn delete_account(session: &mut DbSession, user_id: &str) -> Result<()
         ));
     }
 
-    sqlx::query("DELETE FROM dzmm_account WHERE user_id = $1")
-        .bind(user_id)
-        .execute(session.as_mut())
+    dzmm_account::Entity::delete_by_id(user_id.to_owned())
+        .exec(db)
         .await?;
 
     Ok(())
 }
 
-#[instrument(skip(session))]
-pub async fn get_next_available_account(session: &mut DbSession) -> Result<Option<DzmmAccount>> {
-    let account = sqlx::query_as::<_, DzmmAccount>(
-        "SELECT * FROM dzmm_account WHERE is_enabled = true ORDER BY created_at ASC LIMIT 1",
-    )
-    .fetch_optional(session.as_mut())
-    .await?;
+#[instrument(skip(db))]
+pub async fn get_next_available_account<C>(db: &C) -> Result<Option<DzmmAccount>>
+where
+    C: ConnectionTrait,
+{
+    let account = dzmm_account::Entity::find()
+        .filter(dzmm_account::Column::IsEnabled.eq(true))
+        .order_by_asc(dzmm_account::Column::CreatedAt)
+        .one(db)
+        .await?;
 
     Ok(account)
 }
@@ -329,6 +358,7 @@ pub async fn get_next_available_account(session: &mut DbSession) -> Result<Optio
 mod tests {
     use super::*;
     use chrono::Utc;
+    use lilium_models::dzmm::user as users;
     use serde_json::json;
 
     #[tokio::test]
@@ -338,18 +368,28 @@ mod tests {
                 .await
                 .expect("init account db");
 
-        lilium_database::transaction!(test_db.database(), |session| {
+        lilium_database::transaction!(test_db.database(), |tx| {
             let user_id = format!(
                 "account_{}_{}",
                 Utc::now().timestamp_micros(),
                 std::process::id()
             );
-            lilium_test_fixtures::seed_test_users(session, &[&user_id])
-                .await
-                .expect("seed account user");
+            let now = Utc::now();
+            users::Entity::insert(users::ActiveModel {
+                user_id: Set(user_id.clone()),
+                message_count: Set(0),
+                deleted_count: Set(0),
+                recalled_count: Set(0),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            })
+            .exec(tx)
+            .await
+            .expect("seed account user");
             let profile = json!({"nickname": "test_account"});
             let created = create_account(
-                session,
+                tx,
                 &user_id,
                 profile.clone(),
                 Some("test@example.com"),
@@ -362,15 +402,13 @@ mod tests {
             .await
             .expect("create account");
             assert_eq!(created.user_id, user_id);
-            let fetched = get_account(session, &user_id)
+            let fetched = get_account(tx, &user_id)
                 .await
                 .expect("fetch account")
                 .expect("account exists");
             assert_eq!(fetched.user_id, user_id);
             assert_eq!(fetched.user_profile, profile);
-            delete_account(session, &user_id)
-                .await
-                .expect("delete account");
+            delete_account(tx, &user_id).await.expect("delete account");
             Ok(())
         })
         .await

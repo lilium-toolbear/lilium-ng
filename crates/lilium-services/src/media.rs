@@ -2,13 +2,15 @@ use crate::user::AvatarDownload;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use exif::{In, Reader as ExifReader, Tag, Value};
-use lilium_database::DbSession;
+use lilium_models::dzmm::{image_gps, message as messages, user as users};
 use lofty::file::AudioFile;
 use reqwest::{
     Client, Method, Url,
     header::{CONTENT_TYPE, LOCATION},
     redirect::Policy,
 };
+use sea_orm::sea_query::{Alias, Expr, extension::postgres::PgExpr};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set};
 use std::fs::File;
 use std::io::BufReader;
 use std::io::ErrorKind;
@@ -53,7 +55,7 @@ pub struct MediaFileUpdate {
     pub metadata_patch: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub struct ImageGpsData {
     pub latitude: f64,
     pub longitude: f64,
@@ -65,6 +67,12 @@ pub struct ImageGpsData {
 pub struct AvatarFileUpdate {
     pub user_id: String,
     pub avatar_file: String,
+}
+
+impl Default for MediaService {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MediaService {
@@ -186,97 +194,84 @@ impl MediaService {
     }
 }
 
-#[instrument(skip(session, message_ids), fields(message_count = message_ids.len()))]
-pub async fn collect_message_media_downloads(
-    session: &mut DbSession,
+#[instrument(skip(db, message_ids), fields(message_count = message_ids.len()))]
+pub async fn collect_message_media_downloads<C>(
+    db: &C,
     message_ids: &[String],
-) -> Result<Vec<MediaDownload>> {
+) -> Result<Vec<MediaDownload>>
+where
+    C: ConnectionTrait,
+{
     if message_ids.is_empty() {
         return Ok(Vec::new());
     }
 
-    let media_rows = sqlx::query_as::<
-        _,
-        (
-            String,
-            DateTime<Utc>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        ),
-    >(
-        r#"SELECT message_id, sent_at, content_type, attachment_url, attachment_file, sticker_id
-           FROM messages WHERE message_id = ANY($1)"#,
-    )
-    .bind(message_ids)
-    .fetch_all(session.as_mut())
-    .await?;
-
-    let downloads = media_rows
+    let downloads = messages::Entity::find()
+        .filter(messages::Column::MessageId.is_in(message_ids.iter().cloned()))
+        .all(db)
+        .await?
         .into_iter()
-        .filter_map(
-            |(message_id, sent_at, content_type, attachment_url, attachment_file, sticker_id)| {
-                if attachment_file.is_some() {
-                    return None;
-                }
-                let attachment_url = attachment_url?;
-                let content_type = content_type.unwrap_or_else(|| "other".to_string());
-                let ext = content_type_ext(&content_type).to_string();
-                Some(MediaDownload {
-                    message_id,
-                    sent_at,
-                    content_type,
-                    attachment_url,
-                    ext,
-                    sticker_id,
-                })
-            },
-        )
+        .filter_map(|message| {
+            if message.attachment_file.is_some() {
+                return None;
+            }
+            let attachment_url = message.attachment_url?;
+            let content_type = message.content_type;
+            let ext = content_type_ext(&content_type).to_string();
+            Some(MediaDownload {
+                message_id: message.message_id,
+                sent_at: message.sent_at,
+                content_type,
+                attachment_url,
+                ext,
+                sticker_id: message.sticker_id,
+            })
+        })
         .collect();
 
     Ok(downloads)
 }
 
-#[instrument(skip(session, updates), fields(update_count = updates.len()))]
-pub async fn persist_message_media_files(
-    session: &mut DbSession,
-    updates: &[MediaFileUpdate],
-) -> Result<i64> {
+#[instrument(skip(db, updates), fields(update_count = updates.len()))]
+pub async fn persist_message_media_files<C>(db: &C, updates: &[MediaFileUpdate]) -> Result<i64>
+where
+    C: ConnectionTrait,
+{
     let mut updated_count = 0;
     for update in updates {
-        let result = sqlx::query("UPDATE messages SET attachment_file = $1 WHERE message_id = $2")
-            .bind(&update.attachment_file)
-            .bind(&update.message_id)
-            .execute(session.as_mut())
+        let result = messages::Entity::update_many()
+            .set(messages::ActiveModel {
+                attachment_file: Set(Some(update.attachment_file.clone())),
+                ..Default::default()
+            })
+            .filter(messages::Column::MessageId.eq(update.message_id.clone()))
+            .exec(db)
             .await?;
-        updated_count += result.rows_affected() as i64;
+        updated_count += result.rows_affected as i64;
 
         if let Some(metadata_patch) = &update.metadata_patch {
-            sqlx::query(
-                r#"UPDATE messages
-                   SET metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb
-                   WHERE message_id = $1"#,
-            )
-            .bind(&update.message_id)
-            .bind(metadata_patch)
-            .execute(session.as_mut())
-            .await?;
+            messages::Entity::update_many()
+                .col_expr(
+                    messages::Column::Metadata,
+                    Expr::cust("COALESCE(metadata, '{}'::jsonb)")
+                        .concat(Expr::value(metadata_patch.clone()).cast_as(Alias::new("jsonb"))),
+                )
+                .filter(messages::Column::MessageId.eq(update.message_id.clone()))
+                .exec(db)
+                .await?;
         }
 
         if let Some(gps) = &update.gps {
-            sqlx::query(
-                r#"INSERT INTO image_gps
-                   (message_id, latitude, longitude, altitude, "timestamp", created_at)
-                   VALUES ($1, $2, $3, $4, $5, NOW())
-                   ON CONFLICT (message_id) DO NOTHING"#,
-            )
-            .bind(&update.message_id)
-            .bind(gps.latitude)
-            .bind(gps.longitude)
-            .bind(gps.altitude)
-            .bind(gps.timestamp)
-            .execute(session.as_mut())
+            image_gps::Entity::insert(image_gps::ActiveModel {
+                message_id: Set(update.message_id.clone()),
+                latitude: Set(gps.latitude),
+                longitude: Set(gps.longitude),
+                altitude: Set(gps.altitude),
+                timestamp: Set(gps.timestamp),
+                created_at: Set(Utc::now()),
+            })
+            .on_conflict_do_nothing()
+            .exec(db)
             .await?;
         }
         info!(
@@ -288,23 +283,23 @@ pub async fn persist_message_media_files(
     Ok(updated_count)
 }
 
-#[instrument(skip(session, updates), fields(update_count = updates.len()))]
-pub async fn persist_user_avatar_files(
-    session: &mut DbSession,
-    updates: &[AvatarFileUpdate],
-) -> Result<i64> {
+#[instrument(skip(db, updates), fields(update_count = updates.len()))]
+pub async fn persist_user_avatar_files<C>(db: &C, updates: &[AvatarFileUpdate]) -> Result<i64>
+where
+    C: ConnectionTrait,
+{
     let mut updated_count = 0;
     for update in updates {
-        let result = sqlx::query(
-            r#"UPDATE users
-               SET avatar_file = $2, updated_at = NOW()
-               WHERE user_id = $1"#,
-        )
-        .bind(&update.user_id)
-        .bind(&update.avatar_file)
-        .execute(session.as_mut())
-        .await?;
-        updated_count += result.rows_affected() as i64;
+        let result = users::Entity::update_many()
+            .set(users::ActiveModel {
+                avatar_file: Set(Some(update.avatar_file.clone())),
+                updated_at: Set(Utc::now()),
+                ..Default::default()
+            })
+            .filter(users::Column::UserId.eq(update.user_id.clone()))
+            .exec(db)
+            .await?;
+        updated_count += result.rows_affected as i64;
         info!(
             user_id = %update.user_id,
             path = %update.avatar_file,
@@ -499,7 +494,7 @@ pub fn transform_avatar_url(url: &str) -> Option<String> {
 #[instrument(skip(url), fields(input_len = url.len()))]
 pub fn extract_avatar_id(url: &str) -> Option<String> {
     let parsed = Url::parse(&normalize_url(url)).ok()?;
-    let filename = parsed.path_segments()?.last()?.to_string();
+    let filename = parsed.path_segments()?.next_back()?.to_string();
     Some(
         filename
             .rsplit_once('.')
@@ -759,7 +754,7 @@ fn build_http_client() -> Client {
 
 fn extension_from_url(url: &str) -> Option<String> {
     let parsed = Url::parse(url).ok()?;
-    let filename = parsed.path_segments()?.last()?;
+    let filename = parsed.path_segments()?.next_back()?;
     let ext = filename.rsplit_once('.').map(|(_, ext)| ext)?;
     if ext.is_empty() {
         None
@@ -1004,7 +999,6 @@ mod tests {
                 sent_by: "user-1".into(),
                 content_type: "sticker".into(),
                 content_text: None,
-                content_tsv: None,
                 attachment_url: Some("https://example.com/sticker.webp".into()),
                 attachment_file: None,
                 sticker_id: Some("sticker-1".into()),
@@ -1036,9 +1030,10 @@ mod tests {
                 .await
                 .expect("insert sticker message");
 
-            let downloads = collect_message_media_downloads(session, &[message.message_id.clone()])
-                .await
-                .expect("collect media downloads");
+            let downloads =
+                collect_message_media_downloads(session, std::slice::from_ref(&message.message_id))
+                    .await
+                    .expect("collect media downloads");
 
             assert_eq!(downloads.len(), 1);
             assert_eq!(downloads[0].content_type, "sticker");
@@ -1070,7 +1065,6 @@ mod tests {
                     sent_by: "user-1".into(),
                     content_type: content_type.into(),
                     content_text: None,
-                    content_tsv: None,
                     attachment_url: Some(format!("https://example.com/{message_id}")),
                     attachment_file: None,
                     sticker_id: None,
@@ -1121,21 +1115,24 @@ mod tests {
             .await
             .expect("persist media side effects");
 
-            let gps = sqlx::query_as::<_, (f64, f64, Option<f64>, Option<DateTime<Utc>>)>(
-                r#"SELECT latitude, longitude, altitude, "timestamp"
-                   FROM image_gps WHERE message_id = $1"#,
-            )
-            .bind("image-with-gps")
-            .fetch_one(session.as_mut())
-            .await?;
-            assert_eq!(gps, (35.0, 139.0, Some(42.0), Some(sent_at)));
+            let gps = image_gps::Entity::find_by_id("image-with-gps".to_owned())
+                .one(session)
+                .await?
+                .expect("gps row");
+            assert_eq!(gps.latitude, 35.0);
+            assert_eq!(gps.longitude, 139.0);
+            assert_eq!(gps.altitude, Some(42.0));
+            assert_eq!(gps.timestamp, Some(sent_at));
 
-            let metadata: Option<serde_json::Value> =
-                sqlx::query_scalar("SELECT metadata FROM messages WHERE message_id = $1")
-                    .bind("voice-with-duration")
-                    .fetch_one(session.as_mut())
-                    .await?;
-            assert_eq!(metadata, Some(serde_json::json!({"audio_duration": 12.5})));
+            let metadata_message = messages::Entity::find()
+                .filter(messages::Column::MessageId.eq("voice-with-duration"))
+                .one(session)
+                .await?
+                .expect("metadata row");
+            assert_eq!(
+                metadata_message.metadata,
+                Some(serde_json::json!({"audio_duration": 12.5}))
+            );
 
             Ok(())
         })

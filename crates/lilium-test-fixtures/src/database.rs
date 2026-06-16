@@ -169,14 +169,14 @@ pub fn test_database_url() -> String {
 }
 
 async fn ensure_test_database_pool(pool_size: u32) -> Result<Arc<TestDatabasePool>> {
-    if let Some(existing_pool_size) = TEST_DATABASE_POOL_SIZE.get() {
-        if *existing_pool_size != pool_size {
-            return Err(anyhow::anyhow!(
-                "test database pool size mismatch: existing={}, requested={}",
-                existing_pool_size,
-                pool_size
-            ));
-        }
+    if let Some(existing_pool_size) = TEST_DATABASE_POOL_SIZE.get()
+        && *existing_pool_size != pool_size
+    {
+        return Err(anyhow::anyhow!(
+            "test database pool size mismatch: existing={}, requested={}",
+            existing_pool_size,
+            pool_size
+        ));
     }
 
     TEST_DATABASE_POOL
