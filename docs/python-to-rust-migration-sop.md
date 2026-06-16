@@ -32,6 +32,21 @@ the real source code and runtime fixtures that define those surfaces.
    loaders, and tests that define the behavior. Do not infer behavior from file
    names, stale Markdown, or previous migration counts.
 
+   After completing a Python equivalence scan, record the exact Python source
+   file path and Git commit hash in a Rust code comment next to the migrated
+   model, function, or module. Use the current Python repository commit from
+   `git -C ../dzmm_archive rev-parse HEAD`. The
+   comment must identify the source that was read, for example:
+
+   ```rust
+   // Python parity source: dzmm_archive@<commit> models/dzmm/message.py
+   ```
+
+   When one Rust module covers multiple Python files, list each Python file in
+   separate comments. When Rust intentionally diverges from Python, add a short
+   comment naming the Python field or behavior and the reason for the
+   divergence.
+
 3. Record the behavior contract before changing Rust.
 
    Identify the exact externally visible contract:
@@ -91,6 +106,8 @@ the real source code and runtime fixtures that define those surfaces.
 Every completed migration slice must be backed by:
 
 - Python source files read for the behavior.
+- Python source file paths and commit hashes recorded in Rust comments for the
+  migrated slice.
 - Rust files changed for the implementation.
 - Tests or commands run.
 - The compatibility surface that was verified.

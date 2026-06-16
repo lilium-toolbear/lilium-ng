@@ -1,336 +1,493 @@
 use std::collections::HashMap;
 
-use anyhow::Result;
 use chrono::{DateTime, Utc};
 use lilium_common::LiliumError;
-use lilium_database::DbSession;
-
 use lilium_models::dzmm::message::Message;
+use lilium_models::dzmm::{image_gps, message as messages, room as rooms, user as users};
+use sea_orm::sea_query::{Expr, JoinType, NullOrdering, OnConflict, Order};
+use sea_orm::{
+    ColumnTrait, Condition, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder,
+    QuerySelect, Select, Set,
+};
 use tracing::instrument;
 
-const SELECT_ENRICHED: &str = r#"m.message_id, m.room_id, m.sent_at, m.sent_by, m.content_type, m.content_text,
-    m.content_tsv::text, m.attachment_url, m.attachment_file, m.sticker_id, m.alt_text,
-    m.metadata, m.raw_data, m.source, m.created_at, m.updated_at,
-    m.is_deleted, m.deleted_at, m.deleted_by, m.is_recalled, m.is_edited,
-    m.history, m.reference_message_id, m.reference_data,
-    u.full_name AS user_display_name, u.avatar_url AS user_avatar_url,
-    r.title AS room_title"#;
-
-const SELECT_BASE: &str = r#"m.message_id, m.room_id, m.sent_at, m.sent_by, m.content_type, m.content_text,
-    m.content_tsv::text, m.attachment_url, m.attachment_file, m.sticker_id, m.alt_text,
-    m.metadata, m.raw_data, m.source, m.created_at, m.updated_at,
-    m.is_deleted, m.deleted_at, m.deleted_by, m.is_recalled, m.is_edited,
-    m.history, m.reference_message_id, m.reference_data,
-    NULL::varchar AS user_display_name, NULL::varchar AS user_avatar_url,
-    NULL::varchar AS room_title"#;
-
-const SELECT_MESSAGE_COLS: &str = r#"message_id, room_id, sent_at, sent_by, content_type, content_text,
-    content_tsv::text, attachment_url, attachment_file, sticker_id, alt_text,
-    metadata, raw_data, source, created_at, updated_at,
-    is_deleted, deleted_at, deleted_by, is_recalled, is_edited,
-    history, reference_message_id, reference_data"#;
+type MessageRow = messages::Model;
 
 #[derive(Debug, Clone)]
-enum BindVal {
-    Text(String),
-    Timestamp(DateTime<Utc>),
-    Bool(bool),
-    TextArray(Vec<String>),
+struct QueryParts {
+    condition: Condition,
+    has_condition: bool,
+    join_users: bool,
+    join_rooms: bool,
+    join_gps: bool,
 }
 
-#[derive(Debug, Clone, Default)]
-struct QueryParts {
-    conditions: String,
-    joins: String,
-    params: Vec<BindVal>,
+impl Default for QueryParts {
+    fn default() -> Self {
+        Self {
+            condition: Condition::all(),
+            has_condition: false,
+            join_users: false,
+            join_rooms: false,
+            join_gps: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, FromQueryResult)]
+struct MessageStatsRow {
+    total: i64,
+    deleted: i64,
+    recalled: i64,
+    edited: i64,
+}
+
+#[derive(Debug, Clone, FromQueryResult)]
+struct CountPairRow {
+    key: String,
+    count: i64,
+}
+
+fn db_error(error: impl std::fmt::Display) -> LiliumError {
+    LiliumError::database(error.to_string())
+}
+
+fn message_active_model(message: &Message) -> messages::ActiveModel {
+    messages::ActiveModel {
+        message_id: Set(message.message_id.clone()),
+        room_id: Set(message.room_id.clone()),
+        sent_at: Set(message.sent_at),
+        sent_by: Set(message.sent_by.clone()),
+        content_type: Set(message.content_type.clone()),
+        content_text: Set(message.content_text.clone()),
+        attachment_url: Set(message.attachment_url.clone()),
+        attachment_file: Set(message.attachment_file.clone()),
+        sticker_id: Set(message.sticker_id.clone()),
+        alt_text: Set(message.alt_text.clone()),
+        metadata: Set(message.metadata.clone()),
+        raw_data: Set(message.raw_data.clone()),
+        source: Set(message.source.clone()),
+        created_at: Set(message.created_at),
+        updated_at: Set(message.updated_at),
+        is_deleted: Set(message.is_deleted),
+        deleted_at: Set(message.deleted_at),
+        deleted_by: Set(message.deleted_by.clone()),
+        is_recalled: Set(message.is_recalled),
+        is_edited: Set(message.is_edited),
+        history: Set(message.history.clone()),
+        reference_message_id: Set(message.reference_message_id.clone()),
+        reference_data: Set(message.reference_data.clone()),
+    }
+}
+
+fn enriched_message_query(enriched: bool) -> Select<messages::Entity> {
+    let query = messages::Entity::find()
+        .select_only()
+        .column_as(messages::Column::MessageId, "message_id")
+        .column_as(messages::Column::RoomId, "room_id")
+        .column_as(messages::Column::SentAt, "sent_at")
+        .column_as(messages::Column::SentBy, "sent_by")
+        .column_as(messages::Column::ContentType, "content_type")
+        .column_as(messages::Column::ContentText, "content_text")
+        .column_as(messages::Column::AttachmentUrl, "attachment_url")
+        .column_as(messages::Column::AttachmentFile, "attachment_file")
+        .column_as(messages::Column::StickerId, "sticker_id")
+        .column_as(messages::Column::AltText, "alt_text")
+        .column_as(messages::Column::Metadata, "metadata")
+        .column_as(messages::Column::RawData, "raw_data")
+        .column_as(messages::Column::Source, "source")
+        .column_as(messages::Column::CreatedAt, "created_at")
+        .column_as(messages::Column::UpdatedAt, "updated_at")
+        .column_as(messages::Column::IsDeleted, "is_deleted")
+        .column_as(messages::Column::DeletedAt, "deleted_at")
+        .column_as(messages::Column::DeletedBy, "deleted_by")
+        .column_as(messages::Column::IsRecalled, "is_recalled")
+        .column_as(messages::Column::IsEdited, "is_edited")
+        .column_as(messages::Column::History, "history")
+        .column_as(messages::Column::ReferenceMessageId, "reference_message_id")
+        .column_as(messages::Column::ReferenceData, "reference_data")
+        .join(
+            JoinType::LeftJoin,
+            messages::Entity::belongs_to(users::Entity)
+                .from(messages::Column::SentBy)
+                .to(users::Column::UserId)
+                .into(),
+        )
+        .join(
+            JoinType::LeftJoin,
+            messages::Entity::belongs_to(rooms::Entity)
+                .from(messages::Column::RoomId)
+                .to(rooms::Column::RoomId)
+                .into(),
+        );
+
+    if enriched {
+        query
+            .column_as(users::Column::FullName, "user_display_name")
+            .column_as(users::Column::AvatarUrl, "user_avatar_url")
+            .column_as(rooms::Column::Title, "room_title")
+    } else {
+        query
+            .column_as(Expr::cust("NULL::varchar"), "user_display_name")
+            .column_as(Expr::cust("NULL::varchar"), "user_avatar_url")
+            .column_as(Expr::cust("NULL::varchar"), "room_title")
+    }
+}
+
+fn before_anchor_condition(anchor: &EnrichedMessage) -> Condition {
+    Condition::any()
+        .add(messages::Column::SentAt.lt(anchor.sent_at))
+        .add(
+            Condition::all()
+                .add(messages::Column::SentAt.eq(anchor.sent_at))
+                .add(messages::Column::MessageId.lt(anchor.message_id.clone())),
+        )
+}
+
+fn after_anchor_condition(anchor: &EnrichedMessage) -> Condition {
+    Condition::any()
+        .add(messages::Column::SentAt.gt(anchor.sent_at))
+        .add(
+            Condition::all()
+                .add(messages::Column::SentAt.eq(anchor.sent_at))
+                .add(messages::Column::MessageId.gt(anchor.message_id.clone())),
+        )
+}
+
+fn join_message_users(query: Select<messages::Entity>) -> Select<messages::Entity> {
+    query.join(
+        JoinType::LeftJoin,
+        messages::Entity::belongs_to(users::Entity)
+            .from(messages::Column::SentBy)
+            .to(users::Column::UserId)
+            .into(),
+    )
+}
+
+fn join_message_rooms(query: Select<messages::Entity>) -> Select<messages::Entity> {
+    query.join(
+        JoinType::LeftJoin,
+        messages::Entity::belongs_to(rooms::Entity)
+            .from(messages::Column::RoomId)
+            .to(rooms::Column::RoomId)
+            .into(),
+    )
+}
+
+fn join_message_gps(query: Select<messages::Entity>) -> Select<messages::Entity> {
+    query.join(
+        JoinType::InnerJoin,
+        messages::Entity::belongs_to(image_gps::Entity)
+            .from(messages::Column::MessageId)
+            .to(image_gps::Column::MessageId)
+            .into(),
+    )
+}
+
+fn apply_query_parts(
+    mut query: Select<messages::Entity>,
+    parts: &QueryParts,
+    user_room_already_joined: bool,
+) -> Select<messages::Entity> {
+    if parts.join_users && !user_room_already_joined {
+        query = join_message_users(query);
+    }
+    if parts.join_rooms && !user_room_already_joined {
+        query = join_message_rooms(query);
+    }
+    if parts.join_gps {
+        query = join_message_gps(query);
+    }
+    if parts.has_condition {
+        query = query.filter(parts.condition.clone());
+    }
+    query
+}
+
+fn two_part_cursor_condition(
+    sort_column: messages::Column,
+    reverse: bool,
+    value: DateTime<Utc>,
+    message_id: String,
+) -> Condition {
+    if reverse {
+        Condition::any().add(sort_column.gt(value)).add(
+            Condition::all()
+                .add(sort_column.eq(value))
+                .add(messages::Column::MessageId.gt(message_id)),
+        )
+    } else {
+        Condition::any().add(sort_column.lt(value)).add(
+            Condition::all()
+                .add(sort_column.eq(value))
+                .add(messages::Column::MessageId.lt(message_id)),
+        )
+    }
+}
+
+fn three_part_cursor_condition(
+    reverse: bool,
+    sent_at: DateTime<Utc>,
+    created_at: DateTime<Utc>,
+    message_id: String,
+) -> Condition {
+    if reverse {
+        Condition::any()
+            .add(messages::Column::SentAt.gt(sent_at))
+            .add(
+                Condition::all()
+                    .add(messages::Column::SentAt.eq(sent_at))
+                    .add(messages::Column::CreatedAt.gt(created_at)),
+            )
+            .add(
+                Condition::all()
+                    .add(messages::Column::SentAt.eq(sent_at))
+                    .add(messages::Column::CreatedAt.eq(created_at))
+                    .add(messages::Column::MessageId.gt(message_id)),
+            )
+    } else {
+        Condition::any()
+            .add(messages::Column::SentAt.lt(sent_at))
+            .add(
+                Condition::all()
+                    .add(messages::Column::SentAt.eq(sent_at))
+                    .add(messages::Column::CreatedAt.lt(created_at)),
+            )
+            .add(
+                Condition::all()
+                    .add(messages::Column::SentAt.eq(sent_at))
+                    .add(messages::Column::CreatedAt.eq(created_at))
+                    .add(messages::Column::MessageId.lt(message_id)),
+            )
+    }
+}
+
+fn apply_message_order(
+    mut query: Select<messages::Entity>,
+    use_three_part: bool,
+    reverse: bool,
+    sort_by_created_at: bool,
+) -> Select<messages::Entity> {
+    if use_three_part {
+        if reverse {
+            query = query
+                .order_by_asc(messages::Column::SentAt)
+                .order_by_asc(messages::Column::CreatedAt)
+                .order_by_asc(messages::Column::MessageId);
+        } else {
+            query = query
+                .order_by_desc(messages::Column::SentAt)
+                .order_by_desc(messages::Column::CreatedAt)
+                .order_by_desc(messages::Column::MessageId);
+        }
+    } else {
+        let sort_column = if sort_by_created_at {
+            messages::Column::CreatedAt
+        } else {
+            messages::Column::SentAt
+        };
+        if reverse {
+            query = query
+                .order_by_asc(sort_column)
+                .order_by_asc(messages::Column::MessageId);
+        } else {
+            query = query
+                .order_by_desc(sort_column)
+                .order_by_desc(messages::Column::MessageId);
+        }
+    }
+    query
 }
 
 fn build_query_parts(filters: &MessageFilters, include_visible_only: bool) -> QueryParts {
     let mut p = QueryParts::default();
-    let mut n: u32 = 0;
-
-    let mut needs_user_join = false;
-    let mut needs_room_join = false;
-
-    macro_rules! next_n {
-        () => {{
-            n += 1;
-            n
+    macro_rules! add_condition {
+        ($condition:expr) => {{
+            p.condition = std::mem::replace(&mut p.condition, Condition::all()).add($condition);
+            p.has_condition = true;
         }};
     }
 
     if let Some(ref v) = filters.room_id {
-        p.conditions
-            .push_str(&format!(" AND m.room_id = ${}", next_n!()));
-        p.params.push(BindVal::Text(v.clone()));
+        add_condition!(messages::Column::RoomId.eq(v.clone()));
     }
 
-    if let Some(ref ids) = filters.room_ids {
-        if !ids.is_empty() {
-            p.conditions
-                .push_str(&format!(" AND m.room_id = ANY(${})", next_n!()));
-            p.params.push(BindVal::TextArray(ids.clone()));
-        }
+    if let Some(ref ids) = filters.room_ids
+        && !ids.is_empty()
+    {
+        add_condition!(messages::Column::RoomId.is_in(ids.iter().cloned()));
     }
 
     if let Some(ref v) = filters.account_id {
-        needs_room_join = true;
-        p.joins
-            .push_str(" LEFT JOIN rooms r ON m.room_id = r.room_id");
-        p.conditions.push_str(&format!(
-            " AND r.account_ids @> ARRAY[${}]::varchar[]",
-            next_n!()
+        p.join_rooms = true;
+        add_condition!(Expr::cust_with_values(
+            r#""rooms"."account_ids" @> ARRAY[$1]::varchar[]"#,
+            [v.as_str()],
         ));
-        p.params.push(BindVal::Text(v.clone()));
     } else if filters.user_or_account_id.is_some() {
         let Some(id) = filters.user_or_account_id.as_ref() else {
             unreachable!("checked is_some above")
         };
-        needs_room_join = true;
-        p.joins
-            .push_str(" LEFT JOIN rooms r ON m.room_id = r.room_id");
-        p.conditions.push_str(&format!(
-            " AND (m.sent_by = ${next} OR r.account_ids @> ARRAY[${next}]::varchar[])",
-            next = next_n!()
-        ));
-        p.params.push(BindVal::Text(id.clone()));
+        p.join_rooms = true;
+        add_condition!(
+            Condition::any()
+                .add(messages::Column::SentBy.eq(id.clone()))
+                .add(Expr::cust_with_values(
+                    r#""rooms"."account_ids" @> ARRAY[$1]::varchar[]"#,
+                    [id.as_str()],
+                ))
+        );
     }
 
     if let Some(ref v) = filters.user_id {
-        p.conditions
-            .push_str(&format!(" AND m.sent_by = ${}", next_n!()));
-        p.params.push(BindVal::Text(v.clone()));
+        add_condition!(messages::Column::SentBy.eq(v.clone()));
     }
 
-    if let Some(ref types) = filters.content_types {
-        if !types.is_empty() {
-            p.conditions
-                .push_str(&format!(" AND m.content_type = ANY(${})", next_n!()));
-            p.params.push(BindVal::TextArray(types.clone()));
-        }
+    if let Some(ref types) = filters.content_types
+        && !types.is_empty()
+    {
+        add_condition!(messages::Column::ContentType.is_in(types.iter().cloned()));
     }
 
     if let Some(ref types) = filters.message_types {
-        let mut type_conds: Vec<String> = Vec::new();
+        let mut type_conditions = Condition::any();
+        let mut has_type_condition = false;
         if types.iter().any(|t| t == "deleted") {
-            let nn = next_n!();
-            type_conds.push(format!("m.is_deleted = ${}", nn));
-            p.params.push(BindVal::Bool(true));
+            type_conditions = type_conditions.add(messages::Column::IsDeleted.eq(true));
+            has_type_condition = true;
         }
         if types.iter().any(|t| t == "recalled") {
-            let nn = next_n!();
-            type_conds.push(format!("m.is_recalled = ${}", nn));
-            p.params.push(BindVal::Bool(true));
+            type_conditions = type_conditions.add(messages::Column::IsRecalled.eq(true));
+            has_type_condition = true;
         }
         if types.iter().any(|t| t == "edited") {
-            let nn = next_n!();
-            type_conds.push(format!("m.is_edited = ${}", nn));
-            p.params.push(BindVal::Bool(true));
+            type_conditions = type_conditions.add(messages::Column::IsEdited.eq(true));
+            has_type_condition = true;
         }
-        if !type_conds.is_empty() {
-            p.conditions
-                .push_str(&format!(" AND ({})", type_conds.join(" OR ")));
+        if has_type_condition {
+            add_condition!(type_conditions);
         }
     }
 
     if let Some(ref q) = filters.search_query {
         let is_uuid = q.contains('-') && q.len() >= 36 && q.matches('-').count() >= 4;
         if is_uuid {
-            p.conditions
-                .push_str(&format!(" AND m.message_id = ${}", next_n!()));
-            p.params.push(BindVal::Text(q.clone()));
+            add_condition!(messages::Column::MessageId.eq(q.clone()));
         } else {
-            p.conditions.push_str(&format!(
-                " AND m.content_tsv @@ plainto_tsquery('zhparser', ${})",
-                next_n!()
+            // `content_tsv` is a DB-maintained search vector intentionally
+            // omitted from `lilium_models::dzmm::message::Model`.
+            add_condition!(Expr::cust_with_values(
+                r#""messages"."content_tsv" @@ plainto_tsquery('zhparser', $1)"#,
+                [q.as_str()],
             ));
-            p.params.push(BindVal::Text(q.clone()));
         }
     }
 
     if let Some(ref name) = filters.sender_name {
-        needs_user_join = true;
-        if !p.joins.contains("LEFT JOIN users") {
-            p.joins
-                .push_str(" LEFT JOIN users u ON m.sent_by = u.user_id");
-        }
-        p.conditions.push_str(&format!(
-            " AND u.name_tsv @@ plainto_tsquery('zhparser', ${})",
-            next_n!()
+        p.join_users = true;
+        // `name_tsv` is a DB-maintained search vector intentionally omitted
+        // from `lilium_models::dzmm::user::Model`.
+        add_condition!(Expr::cust_with_values(
+            r#""users"."name_tsv" @@ plainto_tsquery('zhparser', $1)"#,
+            [name.as_str()],
         ));
-        p.params.push(BindVal::Text(name.clone()));
     }
 
     if let Some(ref v) = filters.start_time {
-        p.conditions
-            .push_str(&format!(" AND m.sent_at >= ${}", next_n!()));
-        p.params.push(BindVal::Timestamp(*v));
+        add_condition!(messages::Column::SentAt.gte(*v));
     }
 
     if let Some(ref v) = filters.end_time {
-        p.conditions
-            .push_str(&format!(" AND m.sent_at <= ${}", next_n!()));
-        p.params.push(BindVal::Timestamp(*v));
+        add_condition!(messages::Column::SentAt.lte(*v));
     }
 
     if let Some(v) = filters.has_attachment {
         if v {
-            p.conditions.push_str(" AND m.attachment_file IS NOT NULL");
+            add_condition!(messages::Column::AttachmentFile.is_not_null());
         } else {
-            p.conditions.push_str(" AND m.attachment_file IS NULL");
+            add_condition!(messages::Column::AttachmentFile.is_null());
         }
     }
 
     if let Some(v) = filters.has_reference {
         if v {
-            p.conditions
-                .push_str(" AND m.reference_message_id IS NOT NULL");
+            add_condition!(messages::Column::ReferenceMessageId.is_not_null());
         } else {
-            p.conditions.push_str(" AND m.reference_message_id IS NULL");
+            add_condition!(messages::Column::ReferenceMessageId.is_null());
         }
     }
 
     if let Some(ref v) = filters.source {
-        p.conditions
-            .push_str(&format!(" AND m.source = ${}", next_n!()));
-        p.params.push(BindVal::Text(v.clone()));
+        add_condition!(messages::Column::Source.eq(v.clone()));
     }
 
     if let Some(ref v) = filters.created_after {
-        p.conditions
-            .push_str(&format!(" AND m.created_at > ${}", next_n!()));
-        p.params.push(BindVal::Timestamp(*v));
+        add_condition!(messages::Column::CreatedAt.gt(*v));
     }
 
     if filters.gps_only.unwrap_or(false) {
-        p.joins
-            .push_str(" INNER JOIN image_gps g ON m.message_id = g.message_id");
+        p.join_gps = true;
     }
 
     if include_visible_only {
-        p.conditions
-            .push_str(" AND m.is_deleted = false AND m.is_recalled = false");
-    }
-
-    if needs_user_join && !p.joins.contains("LEFT JOIN users") {
-        p.joins
-            .push_str(" LEFT JOIN users u ON m.sent_by = u.user_id");
-    }
-    if needs_room_join && !p.joins.contains("LEFT JOIN rooms") {
-        p.joins
-            .push_str(" LEFT JOIN rooms r ON m.room_id = r.room_id");
+        add_condition!(messages::Column::IsDeleted.eq(false));
+        add_condition!(messages::Column::IsRecalled.eq(false));
     }
 
     p
 }
 
-fn apply_binds<'q>(
-    mut q: sqlx::query::QueryAs<'q, sqlx::Postgres, EnrichedMessage, sqlx::postgres::PgArguments>,
-    params: &[BindVal],
-) -> sqlx::query::QueryAs<'q, sqlx::Postgres, EnrichedMessage, sqlx::postgres::PgArguments> {
-    for p in params {
-        q = match p {
-            BindVal::Text(v) => q.bind(v.clone()),
-            BindVal::Timestamp(v) => q.bind(*v),
-            BindVal::Bool(v) => q.bind(*v),
-            BindVal::TextArray(v) => q.bind(v.clone()),
-        };
-    }
-    q
+async fn insert_message_if_missing<C: ConnectionTrait>(
+    db: &C,
+    message: &Message,
+) -> crate::Result<bool> {
+    let result = messages::Entity::insert(message_active_model(message))
+        .on_conflict(
+            OnConflict::columns([messages::Column::MessageId, messages::Column::SentAt])
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec_without_returning(db)
+        .await
+        .map_err(db_error)?;
+    Ok(result > 0)
 }
 
-async fn insert_message_if_missing(session: &mut DbSession, message: &Message) -> Result<bool> {
-    let result = sqlx::query(
-        r#"INSERT INTO messages (
-               message_id, room_id, sent_at, sent_by, content_type, content_text,
-               attachment_url, attachment_file, sticker_id, alt_text, metadata, raw_data, source,
-               created_at, updated_at, is_deleted, deleted_at, deleted_by, is_recalled, is_edited,
-               history, reference_message_id, reference_data
-           ) VALUES (
-               $1, $2, $3, $4, $5, $6,
-               $7, $8, $9, $10, $11, $12, $13,
-               $14, $15, $16, $17, $18, $19, $20,
-               $21, $22, $23
-           )
-           ON CONFLICT DO NOTHING"#,
-    )
-    .bind(&message.message_id)
-    .bind(&message.room_id)
-    .bind(message.sent_at)
-    .bind(&message.sent_by)
-    .bind(&message.content_type)
-    .bind(&message.content_text)
-    .bind(&message.attachment_url)
-    .bind(&message.attachment_file)
-    .bind(&message.sticker_id)
-    .bind(&message.alt_text)
-    .bind(&message.metadata)
-    .bind(&message.raw_data)
-    .bind(&message.source)
-    .bind(message.created_at)
-    .bind(message.updated_at)
-    .bind(message.is_deleted)
-    .bind(message.deleted_at)
-    .bind(&message.deleted_by)
-    .bind(message.is_recalled)
-    .bind(message.is_edited)
-    .bind(&message.history)
-    .bind(&message.reference_message_id)
-    .bind(&message.reference_data)
-    .execute(session.as_mut())
-    .await?;
-    Ok(result.rows_affected() > 0)
-}
-
-async fn set_message_recalled(session: &mut DbSession, message_id: &str) -> Result<()> {
-    sqlx::query("UPDATE messages SET is_recalled = true, updated_at = NOW() WHERE message_id = $1")
-        .bind(message_id)
-        .execute(session.as_mut())
-        .await?;
+async fn set_message_recalled<C: ConnectionTrait>(db: &C, message_id: &str) -> crate::Result<()> {
+    let now = Utc::now();
+    let active = messages::ActiveModel {
+        is_recalled: Set(true),
+        updated_at: Set(Some(now)),
+        ..Default::default()
+    };
+    messages::Entity::update_many()
+        .set(active)
+        .filter(messages::Column::MessageId.eq(message_id))
+        .exec(db)
+        .await
+        .map_err(db_error)?;
     Ok(())
 }
 
-async fn get_message_by_id_at(
-    session: &mut DbSession,
-    message_id: &str,
-    sent_at: chrono::DateTime<chrono::Utc>,
-) -> Result<Option<Message>> {
-    sqlx::query_as::<_, Message>(
-        r#"SELECT message_id, room_id, sent_at, sent_by, content_type, content_text,
-           content_tsv::text, attachment_url, attachment_file, sticker_id, alt_text,
-           metadata, raw_data, source, created_at, updated_at,
-           is_deleted, deleted_at, deleted_by, is_recalled, is_edited,
-           history, reference_message_id, reference_data
-           FROM messages
-           WHERE message_id = $1 AND sent_at = $2"#,
-    )
-    .bind(message_id)
-    .bind(sent_at)
-    .fetch_optional(session.as_mut())
-    .await
-    .map_err(|e| e.into())
-}
-
-async fn update_message_content(
-    session: &mut DbSession,
+async fn update_message_content<C: ConnectionTrait>(
+    db: &C,
     message_id: &str,
     text: &str,
-) -> Result<()> {
-    sqlx::query(
-        r#"UPDATE messages SET
-           content_text = $1,
-           is_edited = true,
-           updated_at = NOW(),
-           history = COALESCE(history, '[]'::jsonb) || jsonb_build_object(
-               'content', content_text,
-               'edited_at', NOW()
-           )
-           WHERE message_id = $2"#,
-    )
-    .bind(text)
-    .bind(message_id)
-    .execute(session.as_mut())
-    .await?;
+) -> crate::Result<()> {
+    messages::Entity::update_many()
+        .col_expr(messages::Column::ContentText, Expr::value(text.to_owned()))
+        .col_expr(messages::Column::IsEdited, Expr::value(true))
+        .col_expr(messages::Column::UpdatedAt, Expr::cust("NOW()"))
+        .col_expr(
+            messages::Column::History,
+            Expr::cust(
+                "COALESCE(history, '[]'::jsonb) || jsonb_build_object('content', content_text, 'edited_at', NOW())",
+            ),
+        )
+        .filter(messages::Column::MessageId.eq(message_id))
+        .exec(db)
+    .await
+    .map_err(db_error)?;
     Ok(())
 }
 
@@ -365,7 +522,7 @@ pub struct PaginationParams {
     pub sort_by: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, FromQueryResult, serde::Serialize, serde::Deserialize)]
 pub struct EnrichedMessage {
     pub message_id: String,
     pub room_id: String,
@@ -373,7 +530,6 @@ pub struct EnrichedMessage {
     pub sent_by: String,
     pub content_type: String,
     pub content_text: Option<String>,
-    pub content_tsv: Option<String>,
     pub attachment_url: Option<String>,
     pub attachment_file: Option<String>,
     pub sticker_id: Option<String>,
@@ -434,6 +590,7 @@ enum Cursor {
     ThreePart(DateTime<Utc>, DateTime<Utc>, String),
 }
 
+#[allow(clippy::result_large_err)]
 fn decode_cursor(cursor: &str) -> std::result::Result<Cursor, LiliumError> {
     let parts: Vec<&str> = cursor.splitn(3, '|').collect();
     match parts.len() {
@@ -485,9 +642,9 @@ fn encode_cursor_three(
     )
 }
 
-#[instrument(skip(session, filters, pagination), fields(enriched))]
-pub async fn get_messages(
-    session: &mut DbSession,
+#[instrument(skip(db, filters, pagination), fields(enriched))]
+pub async fn get_messages<C: ConnectionTrait>(
+    db: &C,
     filters: &MessageFilters,
     pagination: &PaginationParams,
     enriched: bool,
@@ -500,150 +657,75 @@ pub async fn get_messages(
     .min(200);
 
     let query_parts = build_query_parts(filters, filters.visible_only.unwrap_or(false));
+    let sort_by_created_at = pagination.sort_by.as_deref() == Some("created_at");
+    let use_three_part = !sort_by_created_at
+        && pagination
+            .cursor
+            .as_deref()
+            .map(|cursor| cursor.split('|').count() == 3)
+            .unwrap_or(false);
 
-    let select_clause = if enriched {
-        SELECT_ENRICHED
-    } else {
-        SELECT_BASE
-    };
-    let enriched_joins = if enriched {
-        if !query_parts.joins.contains("LEFT JOIN users") {
-            " LEFT JOIN users u ON m.sent_by = u.user_id"
-        } else {
-            ""
-        }
-        .to_string()
-            + if !query_parts.joins.contains("LEFT JOIN rooms") {
-                " LEFT JOIN rooms r ON m.room_id = r.room_id"
-            } else {
-                ""
-            }
-    } else {
-        String::new()
-    };
-
-    let sort_column = if pagination.sort_by.as_deref() == Some("created_at") {
-        "m.created_at"
-    } else {
-        "m.sent_at"
-    };
-
-    let mut sql = format!(
-        "SELECT {} FROM messages m{}{} WHERE 1=1{}",
-        select_clause, query_parts.joins, enriched_joins, query_parts.conditions
-    );
-
-    let mut param_idx = if query_parts.params.is_empty() {
-        1
-    } else {
-        query_parts.params.len() as u32 + 1
-    };
-
-    let use_three_part = if pagination.sort_by.as_deref() != Some("created_at") {
-        if let Some(ref cursor) = pagination.cursor {
-            let parts: Vec<&str> = cursor.split('|').collect();
-            parts.len() == 3
-        } else {
-            false
-        }
-    } else {
-        false
-    };
+    let mut query = apply_query_parts(enriched_message_query(enriched), &query_parts, true);
 
     if let Some(ref cursor) = pagination.cursor {
         let decoded = decode_cursor(cursor)?;
 
         match (&decoded, use_three_part) {
             (Cursor::ThreePart(..), true) => {
-                let p1 = param_idx;
-                param_idx += 1;
-                let p2 = param_idx;
-                param_idx += 1;
-                let p3 = param_idx;
-
-                let cmp = if pagination.reverse { ">" } else { "<" };
-                sql.push_str(&format!(
-                    " AND ((m.sent_at, m.created_at, m.message_id) {cmp} (${p1}, ${p2}, ${p3}))"
-                ));
+                if let Cursor::ThreePart(sa, ca, mid) = decoded {
+                    query =
+                        query.filter(three_part_cursor_condition(pagination.reverse, sa, ca, mid));
+                }
             }
             _ => {
-                let p1 = param_idx;
-                param_idx += 1;
-                let p2 = param_idx;
-                param_idx += 1;
-                let p3 = param_idx;
-
-                if pagination.reverse {
-                    sql.push_str(&format!(
-                        " AND (m.{sort} > ${p1} OR (m.{sort} = ${p2} AND m.message_id > ${p3}))",
-                        sort = sort_column
-                    ));
+                let sort_column = if sort_by_created_at {
+                    messages::Column::CreatedAt
                 } else {
-                    sql.push_str(&format!(
-                        " AND (m.{sort} < ${p1} OR (m.{sort} = ${p2} AND m.message_id < ${p3}))",
-                        sort = sort_column
-                    ));
+                    messages::Column::SentAt
+                };
+                match decoded {
+                    Cursor::TwoPart(sa, mid) => {
+                        query = query.filter(two_part_cursor_condition(
+                            sort_column,
+                            pagination.reverse,
+                            sa,
+                            mid,
+                        ));
+                    }
+                    Cursor::ThreePart(sa, _, mid) => {
+                        query = query.filter(two_part_cursor_condition(
+                            sort_column,
+                            pagination.reverse,
+                            sa,
+                            mid,
+                        ));
+                    }
                 }
             }
         }
     }
 
     if pagination.page.unwrap_or(1) > 1 && pagination.cursor.is_none() {
-        param_idx += 1;
-        sql.push_str(&format!(" OFFSET ${}", param_idx));
-    }
-
-    if use_three_part {
-        if pagination.reverse {
-            sql.push_str(" ORDER BY m.sent_at ASC, m.created_at ASC, m.message_id ASC");
-        } else {
-            sql.push_str(" ORDER BY m.sent_at DESC, m.created_at DESC, m.message_id DESC");
-        }
-    } else if pagination.reverse {
-        sql.push_str(&format!(" ORDER BY {} ASC, m.message_id ASC", sort_column));
-    } else {
-        sql.push_str(&format!(
-            " ORDER BY {} DESC, m.message_id DESC",
-            sort_column
-        ));
-    }
-
-    let limit_param = param_idx;
-    sql.push_str(&format!(" LIMIT ${}", limit_param));
-
-    let mut q = sqlx::query_as::<_, EnrichedMessage>(&sql);
-    q = apply_binds(q, &query_parts.params);
-
-    if let Some(ref cursor) = pagination.cursor {
-        let decoded = decode_cursor(cursor)?;
-        match (&decoded, use_three_part) {
-            (Cursor::ThreePart(sa, ca, mid), true) => {
-                q = q.bind(*sa).bind(*ca).bind(mid.clone());
-                q = q.bind(*sa).bind(*ca).bind(mid.clone());
-            }
-            (Cursor::TwoPart(sa, mid), _) => {
-                q = q.bind(*sa).bind(mid.clone()).bind(mid.clone());
-            }
-            _ => {
-                let (sa, mid) = match decoded {
-                    Cursor::TwoPart(s, m) => (s, m),
-                    Cursor::ThreePart(s, _, m) => (s, m),
-                };
-                q = q.bind(sa).bind(mid.clone()).bind(mid.clone());
-            }
+        let offset = (pagination.page.unwrap() - 1) * pagination.per_page;
+        if offset > 0 {
+            query = query.offset(offset as u64);
         }
     }
 
-    if pagination.page.unwrap_or(1) > 1 && pagination.cursor.is_none() {
-        let pp = pagination.page.unwrap();
-        let offset = (pp - 1) * pagination.per_page;
-        q = q.bind(offset);
-    }
+    let fetch_limit = (per_page + 1).max(0) as u64;
+    let mut messages = apply_message_order(
+        query,
+        use_three_part,
+        pagination.reverse,
+        sort_by_created_at,
+    )
+    .limit(fetch_limit)
+    .into_model::<EnrichedMessage>()
+    .all(db)
+    .await
+    .map_err(db_error)?;
 
-    q = q.bind(per_page + 1);
-    let mut messages = q.fetch_all(session.as_mut()).await?;
-
-    let has_more = messages.len() as i64 > per_page;
+    let has_more = per_page >= 0 && messages.len() as i64 > per_page;
     if has_more {
         messages.pop();
     }
@@ -670,78 +752,46 @@ pub async fn get_messages(
     })
 }
 
-#[instrument(skip(session), fields(message_id = %message_id, enriched))]
-pub async fn get_by_id(
-    session: &mut DbSession,
+#[instrument(skip(db), fields(message_id = %message_id, enriched))]
+pub async fn get_by_id<C: ConnectionTrait>(
+    db: &C,
     message_id: &str,
     enriched: bool,
-) -> Result<Option<EnrichedMessage>> {
-    let select_clause = if enriched {
-        SELECT_ENRICHED
-    } else {
-        SELECT_BASE
-    };
-    let join_clause = if enriched {
-        " LEFT JOIN users u ON m.sent_by = u.user_id LEFT JOIN rooms r ON m.room_id = r.room_id"
-    } else {
-        ""
-    };
-
-    sqlx::query_as::<_, EnrichedMessage>(&format!(
-        "SELECT {} FROM messages m{} WHERE m.message_id = $1 ORDER BY m.sent_at DESC LIMIT 1",
-        select_clause, join_clause,
-    ))
-    .bind(message_id)
-    .fetch_optional(session.as_mut())
-    .await
-    .map_err(anyhow::Error::from)
+) -> crate::Result<Option<EnrichedMessage>> {
+    enriched_message_query(enriched)
+        .filter(messages::Column::MessageId.eq(message_id))
+        .order_by_desc(messages::Column::SentAt)
+        .limit(1)
+        .into_model::<EnrichedMessage>()
+        .one(db)
+        .await
+        .map_err(db_error)
 }
 
-#[instrument(skip(session), fields(message_id = %message_id, sent_at = %sent_at, enriched))]
-pub async fn get_by_id_at(
-    session: &mut DbSession,
+#[instrument(skip(db), fields(message_id = %message_id, sent_at = %sent_at, enriched))]
+pub async fn get_by_id_at<C: ConnectionTrait>(
+    db: &C,
     message_id: &str,
     sent_at: DateTime<Utc>,
     enriched: bool,
-) -> Result<Option<EnrichedMessage>> {
-    let select_clause = if enriched {
-        SELECT_ENRICHED
-    } else {
-        SELECT_BASE
-    };
-    let join_clause = if enriched {
-        " LEFT JOIN users u ON m.sent_by = u.user_id LEFT JOIN rooms r ON m.room_id = r.room_id"
-    } else {
-        ""
-    };
-
-    sqlx::query_as::<_, EnrichedMessage>(&format!(
-        "SELECT {} FROM messages m{} WHERE m.message_id = $1 AND m.sent_at = $2",
-        select_clause, join_clause,
-    ))
-    .bind(message_id)
-    .bind(sent_at)
-    .fetch_optional(session.as_mut())
-    .await
-    .map_err(anyhow::Error::from)
+) -> crate::Result<Option<EnrichedMessage>> {
+    enriched_message_query(enriched)
+        .filter(messages::Column::MessageId.eq(message_id))
+        .filter(messages::Column::SentAt.eq(sent_at))
+        .into_model::<EnrichedMessage>()
+        .one(db)
+        .await
+        .map_err(db_error)
 }
 
-#[instrument(skip(session), fields(message_id = %message_id, before_count, after_count))]
-pub async fn get_context(
-    session: &mut DbSession,
+#[instrument(skip(db), fields(message_id = %message_id, before_count, after_count))]
+pub async fn get_context<C: ConnectionTrait>(
+    db: &C,
     message_id: &str,
     before_count: i64,
     after_count: i64,
-) -> Result<Option<MessageContextResult>> {
-    let anchor = sqlx::query_as::<_, Message>(&format!(
-        "SELECT {} FROM messages WHERE message_id = $1 ORDER BY sent_at DESC LIMIT 1",
-        SELECT_MESSAGE_COLS
-    ))
-    .bind(message_id)
-    .fetch_optional(session.as_mut())
-    .await?;
-
-    let anchor = match anchor {
+) -> crate::Result<Option<MessageContextResult>> {
+    let anchor = match get_by_id(db, message_id, false).await? {
         Some(m) => m,
         None => return Ok(None),
     };
@@ -749,31 +799,31 @@ pub async fn get_context(
     let before_limit = before_count.min(50);
     let after_limit = after_count.min(50);
 
-    let before = sqlx::query_as::<_, EnrichedMessage>(&format!(
-            "SELECT {} FROM messages m{} WHERE m.room_id = $1 AND (m.sent_at < $2 OR (m.sent_at = $2 AND m.message_id < $3)) ORDER BY m.sent_at DESC, m.message_id DESC LIMIT $4",
-            SELECT_ENRICHED,
-            " LEFT JOIN users u ON m.sent_by = u.user_id LEFT JOIN rooms r ON m.room_id = r.room_id",
-        ))
-        .bind(&anchor.room_id)
-        .bind(anchor.sent_at)
-        .bind(&anchor.message_id)
-        .bind(before_limit)
-        .fetch_all(session.as_mut())
-        .await?;
+    let before = enriched_message_query(true)
+        .filter(messages::Column::RoomId.eq(anchor.room_id.clone()))
+        .filter(before_anchor_condition(&anchor))
+        .order_by_desc(messages::Column::SentAt)
+        .order_by_desc(messages::Column::MessageId)
+        .limit(before_limit as u64)
+        .into_model::<EnrichedMessage>()
+        .all(db)
+        .await
+        .map_err(db_error)?;
 
-    let after = sqlx::query_as::<_, EnrichedMessage>(&format!(
-            "SELECT {} FROM messages m{} WHERE m.room_id = $1 AND (m.sent_at > $2 OR (m.sent_at = $2 AND m.message_id > $3)) ORDER BY m.sent_at ASC, m.message_id ASC LIMIT $4",
-            SELECT_ENRICHED,
-            " LEFT JOIN users u ON m.sent_by = u.user_id LEFT JOIN rooms r ON m.room_id = r.room_id",
-        ))
-        .bind(&anchor.room_id)
-        .bind(anchor.sent_at)
-        .bind(&anchor.message_id)
-        .bind(after_limit)
-        .fetch_all(session.as_mut())
-        .await?;
+    let after = enriched_message_query(true)
+        .filter(messages::Column::RoomId.eq(anchor.room_id.clone()))
+        .filter(after_anchor_condition(&anchor))
+        .order_by_asc(messages::Column::SentAt)
+        .order_by_asc(messages::Column::MessageId)
+        .limit(after_limit as u64)
+        .into_model::<EnrichedMessage>()
+        .all(db)
+        .await
+        .map_err(db_error)?;
 
-    let anchor_enriched = enrich_single(session, &anchor).await?;
+    let anchor_enriched = get_by_id_at(db, &anchor.message_id, anchor.sent_at, true)
+        .await?
+        .ok_or_else(|| LiliumError::database("anchor message disappeared during context fetch"))?;
     let before_count_actual = before.len() as i64;
     let after_count_actual = after.len() as i64;
 
@@ -791,13 +841,13 @@ pub async fn get_context(
     }))
 }
 
-#[instrument(skip(session), fields(message_id = %message_id, count))]
-pub async fn get_before(
-    session: &mut DbSession,
+#[instrument(skip(db), fields(message_id = %message_id, count))]
+pub async fn get_before<C: ConnectionTrait>(
+    db: &C,
     message_id: &str,
     count: i64,
-) -> Result<Vec<EnrichedMessage>> {
-    let target = get_by_id(session, message_id, false).await?;
+) -> crate::Result<Vec<EnrichedMessage>> {
+    let target = get_by_id(db, message_id, false).await?;
     let target = match target {
         Some(m) => m,
         None => return Ok(Vec::new()),
@@ -805,29 +855,28 @@ pub async fn get_before(
 
     let limit = count.min(50);
 
-    let mut messages = sqlx::query_as::<_, EnrichedMessage>(&format!(
-            "SELECT {} FROM messages m{} WHERE m.room_id = $1 AND (m.sent_at < $2 OR (m.sent_at = $2 AND m.message_id < $3)) ORDER BY m.sent_at DESC, m.message_id DESC LIMIT $4",
-            SELECT_ENRICHED,
-            " LEFT JOIN users u ON m.sent_by = u.user_id LEFT JOIN rooms r ON m.room_id = r.room_id",
-        ))
-        .bind(&target.room_id)
-        .bind(target.sent_at)
-        .bind(&target.message_id)
-        .bind(limit)
-        .fetch_all(session.as_mut())
-        .await?;
+    let mut messages = enriched_message_query(true)
+        .filter(messages::Column::RoomId.eq(target.room_id.clone()))
+        .filter(before_anchor_condition(&target))
+        .order_by_desc(messages::Column::SentAt)
+        .order_by_desc(messages::Column::MessageId)
+        .limit(limit as u64)
+        .into_model::<EnrichedMessage>()
+        .all(db)
+        .await
+        .map_err(db_error)?;
 
     messages.reverse();
     Ok(messages)
 }
 
-#[instrument(skip(session), fields(message_id = %message_id, count))]
-pub async fn get_after(
-    session: &mut DbSession,
+#[instrument(skip(db), fields(message_id = %message_id, count))]
+pub async fn get_after<C: ConnectionTrait>(
+    db: &C,
     message_id: &str,
     count: i64,
-) -> Result<Vec<EnrichedMessage>> {
-    let target = get_by_id(session, message_id, false).await?;
+) -> crate::Result<Vec<EnrichedMessage>> {
+    let target = get_by_id(db, message_id, false).await?;
     let target = match target {
         Some(m) => m,
         None => return Ok(Vec::new()),
@@ -835,405 +884,314 @@ pub async fn get_after(
 
     let limit = count.min(50);
 
-    sqlx::query_as::<_, EnrichedMessage>(&format!(
-            "SELECT {} FROM messages m{} WHERE m.room_id = $1 AND (m.sent_at > $2 OR (m.sent_at = $2 AND m.message_id > $3)) ORDER BY m.sent_at ASC, m.message_id ASC LIMIT $4",
-            SELECT_ENRICHED,
-            " LEFT JOIN users u ON m.sent_by = u.user_id LEFT JOIN rooms r ON m.room_id = r.room_id",
-        ))
-        .bind(&target.room_id)
-        .bind(target.sent_at)
-        .bind(&target.message_id)
-        .bind(limit)
-        .fetch_all(session.as_mut())
+    enriched_message_query(true)
+        .filter(messages::Column::RoomId.eq(target.room_id.clone()))
+        .filter(after_anchor_condition(&target))
+        .order_by_asc(messages::Column::SentAt)
+        .order_by_asc(messages::Column::MessageId)
+        .limit(limit as u64)
+        .into_model::<EnrichedMessage>()
+        .all(db)
         .await
-        .map_err(anyhow::Error::from)
+        .map_err(db_error)
 }
 
-async fn enrich_single(session: &mut DbSession, message: &Message) -> Result<EnrichedMessage> {
-    let user_data = sqlx::query_as::<_, (Option<String>, Option<String>)>(
-        "SELECT full_name, avatar_url FROM users WHERE user_id = $1",
-    )
-    .bind(&message.sent_by)
-    .fetch_optional(session.as_mut())
-    .await?;
-
-    let room_data =
-        sqlx::query_as::<_, (Option<String>,)>("SELECT title FROM rooms WHERE room_id = $1")
-            .bind(&message.room_id)
-            .fetch_optional(session.as_mut())
-            .await?;
-
-    let (user_display_name, user_avatar_url) = user_data.unwrap_or((None, None));
-    let room_title = room_data.and_then(|(t,)| t);
-
-    Ok(EnrichedMessage {
-        message_id: message.message_id.clone(),
-        room_id: message.room_id.clone(),
-        sent_at: message.sent_at,
-        sent_by: message.sent_by.clone(),
-        content_type: message.content_type.clone(),
-        content_text: message.content_text.clone(),
-        content_tsv: message.content_tsv.clone(),
-        attachment_url: message.attachment_url.clone(),
-        attachment_file: message.attachment_file.clone(),
-        sticker_id: message.sticker_id.clone(),
-        alt_text: message.alt_text.clone(),
-        metadata: message.metadata.clone(),
-        raw_data: message.raw_data.clone(),
-        source: message.source.clone(),
-        created_at: message.created_at,
-        updated_at: message.updated_at,
-        is_deleted: message.is_deleted,
-        deleted_at: message.deleted_at,
-        deleted_by: message.deleted_by.clone(),
-        is_recalled: message.is_recalled,
-        is_edited: message.is_edited,
-        history: message.history.clone(),
-        reference_message_id: message.reference_message_id.clone(),
-        reference_data: message.reference_data.clone(),
-        user_display_name,
-        user_avatar_url,
-        room_title,
-    })
-}
-
-#[instrument(skip(session, messages), fields(message_count = messages.len()))]
-pub async fn enrich_batch(
-    session: &mut DbSession,
+#[instrument(skip(db, messages), fields(message_count = messages.len()))]
+pub async fn enrich_batch<C: ConnectionTrait>(
+    db: &C,
     messages: &[Message],
-) -> Result<Vec<EnrichedMessage>> {
+) -> crate::Result<Vec<EnrichedMessage>> {
     if messages.is_empty() {
         return Ok(Vec::new());
     }
 
-    let user_ids: Vec<String> = messages
-        .iter()
-        .map(|m| m.sent_by.clone())
-        .filter(|id| !id.is_empty())
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    let mut identity_condition = Condition::any();
+    for msg in messages {
+        identity_condition = identity_condition.add(
+            Condition::all()
+                .add(messages::Column::MessageId.eq(msg.message_id.clone()))
+                .add(messages::Column::SentAt.eq(msg.sent_at)),
+        );
+    }
 
-    let room_ids: Vec<String> = messages
-        .iter()
-        .map(|m| m.room_id.clone())
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
-
-    let users_map: HashMap<String, (Option<String>, Option<String>)> = if !user_ids.is_empty() {
-        let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
-            "SELECT user_id, full_name, avatar_url FROM users WHERE user_id = ANY($1)",
-        )
-        .bind(&user_ids)
-        .fetch_all(session.as_mut())
-        .await?;
-        rows.into_iter()
-            .map(|(id, name, avatar)| (id, (name, avatar)))
-            .collect()
-    } else {
-        HashMap::new()
-    };
-
-    let rooms_map: HashMap<String, String> = if !room_ids.is_empty() {
-        let rows = sqlx::query_as::<_, (String, String)>(
-            "SELECT room_id, title FROM rooms WHERE room_id = ANY($1)",
-        )
-        .bind(&room_ids)
-        .fetch_all(session.as_mut())
-        .await?;
-        rows.into_iter().collect()
-    } else {
-        HashMap::new()
-    };
+    let enriched_by_id: HashMap<(String, DateTime<Utc>), EnrichedMessage> =
+        enriched_message_query(true)
+            .filter(identity_condition)
+            .into_model::<EnrichedMessage>()
+            .all(db)
+            .await
+            .map_err(db_error)?
+            .into_iter()
+            .map(|msg| ((msg.message_id.clone(), msg.sent_at), msg))
+            .collect();
 
     let enriched = messages
         .iter()
-        .map(|msg| {
-            let (user_display_name, user_avatar_url) =
-                users_map.get(&msg.sent_by).cloned().unwrap_or((None, None));
-            let room_title = rooms_map.get(&msg.room_id).cloned();
-            EnrichedMessage {
-                message_id: msg.message_id.clone(),
-                room_id: msg.room_id.clone(),
-                sent_at: msg.sent_at,
-                sent_by: msg.sent_by.clone(),
-                content_type: msg.content_type.clone(),
-                content_text: msg.content_text.clone(),
-                content_tsv: msg.content_tsv.clone(),
-                attachment_url: msg.attachment_url.clone(),
-                attachment_file: msg.attachment_file.clone(),
-                sticker_id: msg.sticker_id.clone(),
-                alt_text: msg.alt_text.clone(),
-                metadata: msg.metadata.clone(),
-                raw_data: msg.raw_data.clone(),
-                source: msg.source.clone(),
-                created_at: msg.created_at,
-                updated_at: msg.updated_at,
-                is_deleted: msg.is_deleted,
-                deleted_at: msg.deleted_at,
-                deleted_by: msg.deleted_by.clone(),
-                is_recalled: msg.is_recalled,
-                is_edited: msg.is_edited,
-                history: msg.history.clone(),
-                reference_message_id: msg.reference_message_id.clone(),
-                reference_data: msg.reference_data.clone(),
-                user_display_name,
-                user_avatar_url,
-                room_title,
-            }
+        .filter_map(|msg| {
+            enriched_by_id
+                .get(&(msg.message_id.clone(), msg.sent_at))
+                .cloned()
         })
         .collect();
 
     Ok(enriched)
 }
 
-#[instrument(skip(session), fields(room_id = ?room_id, limit))]
-pub async fn get_deleted_messages(
-    session: &mut DbSession,
+#[instrument(skip(db), fields(room_id = ?room_id, limit))]
+pub async fn get_deleted_messages<C: ConnectionTrait>(
+    db: &C,
     room_id: Option<&str>,
     limit: i64,
-) -> Result<Vec<Message>> {
-    let mut sql = format!(
-        "SELECT {} FROM messages WHERE (is_deleted = true OR is_recalled = true)",
-        SELECT_MESSAGE_COLS
+) -> crate::Result<Vec<MessageRow>> {
+    let mut query = messages::Entity::find().filter(
+        Condition::any()
+            .add(messages::Column::IsDeleted.eq(true))
+            .add(messages::Column::IsRecalled.eq(true)),
     );
-    let mut param_idx = 0;
 
-    if room_id.is_some() {
-        param_idx += 1;
-        sql.push_str(&format!(" AND room_id = ${}", param_idx));
-    }
-
-    param_idx += 1;
-    sql.push_str(&format!(
-        " ORDER BY deleted_at DESC NULLS LAST LIMIT ${}",
-        param_idx
-    ));
-
-    let mut q = sqlx::query_as::<_, Message>(&sql);
     if let Some(rid) = room_id {
-        q = q.bind(rid);
+        query = query.filter(messages::Column::RoomId.eq(rid));
     }
-    q = q.bind(limit);
-    let rows = q.fetch_all(session.as_mut()).await?;
-    Ok(rows)
+
+    let messages = query
+        .order_by_with_nulls(messages::Column::DeletedAt, Order::Desc, NullOrdering::Last)
+        .limit(limit as u64)
+        .all(db)
+        .await
+        .map_err(db_error)?;
+    Ok(messages.into_iter().collect())
 }
 
-#[instrument(skip(session), fields(room_id = %room_id))]
-pub async fn get_room_stats(session: &mut DbSession, room_id: &str) -> Result<MessageStats> {
-    let row = sqlx::query_as::<_, (i64, i64, i64, i64)>(
-        "SELECT COUNT(*)::bigint,
-                    COALESCE(SUM(CASE WHEN is_deleted THEN 1 ELSE 0 END), 0)::bigint,
-                    COALESCE(SUM(CASE WHEN is_recalled THEN 1 ELSE 0 END), 0)::bigint,
-                    COALESCE(SUM(CASE WHEN is_edited THEN 1 ELSE 0 END), 0)::bigint
-             FROM messages WHERE room_id = $1",
-    )
-    .bind(room_id)
-    .fetch_one(session.as_mut())
-    .await?;
-
-    let type_rows = sqlx::query_as::<_, (String, i64)>(
-            "SELECT content_type, COUNT(*)::bigint FROM messages WHERE room_id = $1 GROUP BY content_type",
+#[instrument(skip(db), fields(room_id = %room_id))]
+pub async fn get_room_stats<C: ConnectionTrait>(
+    db: &C,
+    room_id: &str,
+) -> crate::Result<MessageStats> {
+    let row = messages::Entity::find()
+        .select_only()
+        .column_as(messages::Column::MessageId.count(), "total")
+        .column_as(
+            Expr::cust(
+                r#"COALESCE(SUM(CASE WHEN "messages"."is_deleted" THEN 1 ELSE 0 END), 0)::bigint"#,
+            ),
+            "deleted",
         )
-        .bind(room_id)
-        .fetch_all(session.as_mut())
-        .await?;
+        .column_as(
+            Expr::cust(
+                r#"COALESCE(SUM(CASE WHEN "messages"."is_recalled" THEN 1 ELSE 0 END), 0)::bigint"#,
+            ),
+            "recalled",
+        )
+        .column_as(
+            Expr::cust(
+                r#"COALESCE(SUM(CASE WHEN "messages"."is_edited" THEN 1 ELSE 0 END), 0)::bigint"#,
+            ),
+            "edited",
+        )
+        .filter(messages::Column::RoomId.eq(room_id))
+        .into_model::<MessageStatsRow>()
+        .one(db)
+        .await
+        .map_err(db_error)?
+        .unwrap_or(MessageStatsRow {
+            total: 0,
+            deleted: 0,
+            recalled: 0,
+            edited: 0,
+        });
+
+    let type_rows = messages::Entity::find()
+        .select_only()
+        .column_as(messages::Column::ContentType, "key")
+        .column_as(messages::Column::MessageId.count(), "count")
+        .filter(messages::Column::RoomId.eq(room_id))
+        .group_by(messages::Column::ContentType)
+        .into_model::<CountPairRow>()
+        .all(db)
+        .await
+        .map_err(db_error)?;
 
     Ok(MessageStats {
-        total: row.0,
-        deleted: row.1,
-        recalled: row.2,
-        edited: row.3,
-        by_content_type: type_rows.into_iter().collect(),
+        total: row.total,
+        deleted: row.deleted,
+        recalled: row.recalled,
+        edited: row.edited,
+        by_content_type: type_rows
+            .into_iter()
+            .map(|row| (row.key, row.count))
+            .collect(),
         by_room: None,
     })
 }
 
-#[instrument(skip(session), fields(user_id = %user_id))]
-pub async fn get_user_stats(session: &mut DbSession, user_id: &str) -> Result<MessageStats> {
-    let row = sqlx::query_as::<_, (i64, i64, i64, i64)>(
-        "SELECT COUNT(*)::bigint,
-                    COALESCE(SUM(CASE WHEN is_deleted THEN 1 ELSE 0 END), 0)::bigint,
-                    COALESCE(SUM(CASE WHEN is_recalled THEN 1 ELSE 0 END), 0)::bigint,
-                    COALESCE(SUM(CASE WHEN is_edited THEN 1 ELSE 0 END), 0)::bigint
-             FROM messages WHERE sent_by = $1",
-    )
-    .bind(user_id)
-    .fetch_one(session.as_mut())
-    .await?;
-
-    let type_rows = sqlx::query_as::<_, (String, i64)>(
-            "SELECT content_type, COUNT(*)::bigint FROM messages WHERE sent_by = $1 GROUP BY content_type",
+#[instrument(skip(db), fields(user_id = %user_id))]
+pub async fn get_user_stats<C: ConnectionTrait>(
+    db: &C,
+    user_id: &str,
+) -> crate::Result<MessageStats> {
+    let row = messages::Entity::find()
+        .select_only()
+        .column_as(messages::Column::MessageId.count(), "total")
+        .column_as(
+            Expr::cust(
+                r#"COALESCE(SUM(CASE WHEN "messages"."is_deleted" THEN 1 ELSE 0 END), 0)::bigint"#,
+            ),
+            "deleted",
         )
-        .bind(user_id)
-        .fetch_all(session.as_mut())
-        .await?;
-
-    let room_rows = sqlx::query_as::<_, (String, i64)>(
-            "SELECT room_id, COUNT(*)::bigint FROM messages WHERE sent_by = $1 GROUP BY room_id ORDER BY COUNT(*) DESC LIMIT 10",
+        .column_as(
+            Expr::cust(
+                r#"COALESCE(SUM(CASE WHEN "messages"."is_recalled" THEN 1 ELSE 0 END), 0)::bigint"#,
+            ),
+            "recalled",
         )
-        .bind(user_id)
-        .fetch_all(session.as_mut())
-        .await?;
+        .column_as(
+            Expr::cust(
+                r#"COALESCE(SUM(CASE WHEN "messages"."is_edited" THEN 1 ELSE 0 END), 0)::bigint"#,
+            ),
+            "edited",
+        )
+        .filter(messages::Column::SentBy.eq(user_id))
+        .into_model::<MessageStatsRow>()
+        .one(db)
+        .await
+        .map_err(db_error)?
+        .unwrap_or(MessageStatsRow {
+            total: 0,
+            deleted: 0,
+            recalled: 0,
+            edited: 0,
+        });
+
+    let type_rows = messages::Entity::find()
+        .select_only()
+        .column_as(messages::Column::ContentType, "key")
+        .column_as(messages::Column::MessageId.count(), "count")
+        .filter(messages::Column::SentBy.eq(user_id))
+        .group_by(messages::Column::ContentType)
+        .into_model::<CountPairRow>()
+        .all(db)
+        .await
+        .map_err(db_error)?;
+
+    let room_rows = messages::Entity::find()
+        .select_only()
+        .column_as(messages::Column::RoomId, "key")
+        .column_as(messages::Column::MessageId.count(), "count")
+        .filter(messages::Column::SentBy.eq(user_id))
+        .group_by(messages::Column::RoomId)
+        .order_by_desc(Expr::cust("COUNT(*)"))
+        .limit(10)
+        .into_model::<CountPairRow>()
+        .all(db)
+        .await
+        .map_err(db_error)?;
 
     Ok(MessageStats {
-        total: row.0,
-        deleted: row.1,
-        recalled: row.2,
-        edited: row.3,
-        by_content_type: type_rows.into_iter().collect(),
-        by_room: Some(room_rows.into_iter().collect()),
+        total: row.total,
+        deleted: row.deleted,
+        recalled: row.recalled,
+        edited: row.edited,
+        by_content_type: type_rows
+            .into_iter()
+            .map(|row| (row.key, row.count))
+            .collect(),
+        by_room: Some(
+            room_rows
+                .into_iter()
+                .map(|row| (row.key, row.count))
+                .collect(),
+        ),
     })
 }
 
-#[instrument(skip(session), fields(message_id = %message_id))]
-pub async fn message_exists(session: &mut DbSession, message_id: &str) -> Result<bool> {
-    let exists = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM messages WHERE message_id = $1)",
-    )
-    .bind(message_id)
-    .fetch_one(session.as_mut())
-    .await?;
+#[instrument(skip(db), fields(message_id = %message_id))]
+pub async fn message_exists<C: ConnectionTrait>(db: &C, message_id: &str) -> crate::Result<bool> {
+    let exists = messages::Entity::find()
+        .select_only()
+        .column(messages::Column::MessageId)
+        .filter(messages::Column::MessageId.eq(message_id))
+        .into_tuple::<(String,)>()
+        .one(db)
+        .await
+        .map_err(db_error)?
+        .is_some();
     Ok(exists)
 }
 
-#[instrument(skip(session, message), fields(message_id = %message.message_id))]
-pub async fn create_message(session: &mut DbSession, message: &Message) -> Result<()> {
-    sqlx::query(
-            r#"INSERT INTO messages (message_id, room_id, sent_at, sent_by, content_type, content_text,
-               attachment_url, attachment_file, sticker_id, alt_text, metadata, raw_data, source,
-               created_at, updated_at, is_deleted, deleted_at, deleted_by, is_recalled, is_edited,
-               history, reference_message_id, reference_data)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)"#,
-        )
-        .bind(&message.message_id)
-        .bind(&message.room_id)
-        .bind(message.sent_at)
-        .bind(&message.sent_by)
-        .bind(&message.content_type)
-        .bind(&message.content_text)
-        .bind(&message.attachment_url)
-        .bind(&message.attachment_file)
-        .bind(&message.sticker_id)
-        .bind(&message.alt_text)
-        .bind(&message.metadata)
-        .bind(&message.raw_data)
-        .bind(&message.source)
-        .bind(message.created_at)
-        .bind(message.updated_at)
-        .bind(message.is_deleted)
-        .bind(message.deleted_at)
-        .bind(&message.deleted_by)
-        .bind(message.is_recalled)
-        .bind(message.is_edited)
-        .bind(&message.history)
-        .bind(&message.reference_message_id)
-        .bind(&message.reference_data)
-        .execute(session.as_mut())
-        .await?;
+#[instrument(skip(db, message), fields(message_id = %message.message_id))]
+pub async fn create_message<C: ConnectionTrait>(db: &C, message: &Message) -> crate::Result<()> {
+    messages::Entity::insert(message_active_model(message))
+        .exec(db)
+        .await
+        .map_err(db_error)?;
     Ok(())
 }
 
-#[instrument(skip(session, message), fields(message_id = %message.message_id))]
-pub async fn create_message_if_missing(session: &mut DbSession, message: &Message) -> Result<bool> {
-    insert_message_if_missing(session, message).await
+#[instrument(skip(db, message), fields(message_id = %message.message_id))]
+pub async fn create_message_if_missing<C: ConnectionTrait>(
+    db: &C,
+    message: &Message,
+) -> crate::Result<bool> {
+    insert_message_if_missing(db, message).await
 }
 
-#[instrument(skip(session, messages), fields(message_count = messages.len()))]
-pub async fn batch_create_if_missing(
-    session: &mut DbSession,
-    messages: &[Message],
-) -> Result<Vec<(String, DateTime<Utc>)>> {
-    if messages.is_empty() {
+#[instrument(skip(db, items), fields(message_count = items.len()))]
+pub async fn batch_create_if_missing<C: ConnectionTrait>(
+    db: &C,
+    items: &[Message],
+) -> crate::Result<Vec<(String, DateTime<Utc>)>> {
+    if items.is_empty() {
         return Ok(Vec::new());
     }
 
-    let mut sql = String::from(
-        "INSERT INTO messages (message_id, room_id, sent_at, sent_by, content_type, content_text, attachment_url, attachment_file, sticker_id, alt_text, metadata, raw_data, source, created_at, updated_at, is_deleted, deleted_at, deleted_by, is_recalled, is_edited, history, reference_message_id, reference_data) VALUES ",
-    );
-    let mut param_idx = 0u32;
-    let mut value_rows: Vec<String> = Vec::new();
-    const COLS_PER_ROW: u32 = 23;
-
-    for _i in 0..messages.len() {
-        let base = param_idx;
-        let col_nums: Vec<String> = (1..=COLS_PER_ROW)
-            .map(|offset| format!("${}", base + offset))
-            .collect();
-        value_rows.push(format!("({})", col_nums.join(",")));
-        param_idx += COLS_PER_ROW;
-    }
-
-    sql.push_str(&value_rows.join(", "));
-    sql.push_str(" ON CONFLICT (message_id, sent_at) DO NOTHING RETURNING message_id, sent_at");
-
-    let mut q = sqlx::query_as::<_, (String, DateTime<Utc>)>(&sql);
-    for msg in messages {
-        q = q
-            .bind(&msg.message_id)
-            .bind(&msg.room_id)
-            .bind(msg.sent_at)
-            .bind(&msg.sent_by)
-            .bind(&msg.content_type)
-            .bind(&msg.content_text)
-            .bind(&msg.attachment_url)
-            .bind(&msg.attachment_file)
-            .bind(&msg.sticker_id)
-            .bind(&msg.alt_text)
-            .bind(&msg.metadata)
-            .bind(&msg.raw_data)
-            .bind(&msg.source)
-            .bind(msg.created_at)
-            .bind(msg.updated_at)
-            .bind(msg.is_deleted)
-            .bind(msg.deleted_at)
-            .bind(&msg.deleted_by)
-            .bind(msg.is_recalled)
-            .bind(msg.is_edited)
-            .bind(&msg.history)
-            .bind(&msg.reference_message_id)
-            .bind(&msg.reference_data);
-    }
-
-    let rows = q.fetch_all(session.as_mut()).await?;
-    Ok(rows)
+    let rows = messages::Entity::insert_many(items.iter().map(message_active_model))
+        .on_conflict(
+            OnConflict::columns([messages::Column::MessageId, messages::Column::SentAt])
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec_with_returning_many(db)
+        .await
+        .map_err(db_error)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.message_id, row.sent_at))
+        .collect())
 }
 
-#[instrument(skip(session, message), fields(message_id = %message.message_id))]
-pub async fn update_message(session: &mut DbSession, message: &Message) -> Result<()> {
-    sqlx::query(
-        r#"UPDATE messages SET
-               content_type = $3, content_text = $4, attachment_url = $5,
-               attachment_file = $6, sticker_id = $7, alt_text = $8,
-               metadata = $9, updated_at = NOW(), is_edited = $10, history = $11
-               WHERE message_id = $1 AND sent_at = $2"#,
-    )
-    .bind(&message.message_id)
-    .bind(message.sent_at)
-    .bind(&message.content_type)
-    .bind(&message.content_text)
-    .bind(&message.attachment_url)
-    .bind(&message.attachment_file)
-    .bind(&message.sticker_id)
-    .bind(&message.alt_text)
-    .bind(&message.metadata)
-    .bind(message.is_edited)
-    .bind(&message.history)
-    .execute(session.as_mut())
-    .await?;
+#[instrument(skip(db, message), fields(message_id = %message.message_id))]
+pub async fn update_message<C: ConnectionTrait>(db: &C, message: &Message) -> crate::Result<()> {
+    messages::Entity::update_many()
+        .set(messages::ActiveModel {
+            content_type: Set(message.content_type.clone()),
+            content_text: Set(message.content_text.clone()),
+            attachment_url: Set(message.attachment_url.clone()),
+            attachment_file: Set(message.attachment_file.clone()),
+            sticker_id: Set(message.sticker_id.clone()),
+            alt_text: Set(message.alt_text.clone()),
+            metadata: Set(message.metadata.clone()),
+            updated_at: Set(Some(Utc::now())),
+            is_edited: Set(message.is_edited),
+            history: Set(message.history.clone()),
+            ..Default::default()
+        })
+        .filter(messages::Column::MessageId.eq(message.message_id.clone()))
+        .filter(messages::Column::SentAt.eq(message.sent_at))
+        .exec(db)
+        .await
+        .map_err(db_error)?;
     Ok(())
 }
 
-#[instrument(skip(session, payload), fields(message_id = %message_id))]
-pub async fn update_message_from_payload(
-    session: &mut DbSession,
+#[instrument(skip(db, payload), fields(message_id = %message_id))]
+pub async fn update_message_from_payload<C: ConnectionTrait>(
+    db: &C,
     message_id: &str,
     payload: &serde_json::Value,
-) -> Result<()> {
+) -> crate::Result<()> {
     if let Some(content) = payload.get("message").and_then(|m| m.get("content")) {
         if content.get("type").and_then(|v| v.as_str()) == Some("recalled") {
-            set_message_recalled(session, message_id).await
+            set_message_recalled(db, message_id).await
         } else {
             let sent_at = payload
                 .get("message")
@@ -1243,12 +1201,12 @@ pub async fn update_message_from_payload(
                 .map(|dt| dt.with_timezone(&chrono::Utc));
 
             if let Some(sent_at) = sent_at {
-                let existing = get_message_by_id_at(session, message_id, sent_at).await?;
+                let existing = get_by_id_at(db, message_id, sent_at, false).await?;
                 if existing.is_none() {
                     return Ok(());
                 }
                 if let Some(text) = content.get("text").and_then(|v| v.as_str()) {
-                    update_message_content(session, message_id, text).await
+                    update_message_content(db, message_id, text).await
                 } else {
                     Ok(())
                 }
@@ -1261,239 +1219,227 @@ pub async fn update_message_from_payload(
     }
 }
 
-#[instrument(skip(session), fields(message_id = %message_id, has_deleted_by = deleted_by.is_some()))]
-pub async fn mark_deleted(
-    session: &mut DbSession,
+#[instrument(skip(db), fields(message_id = %message_id, has_deleted_by = deleted_by.is_some()))]
+pub async fn mark_deleted<C: ConnectionTrait>(
+    db: &C,
     message_id: &str,
     deleted_by: Option<&str>,
-) -> Result<()> {
-    sqlx::query(
-        r#"UPDATE messages
-               SET is_deleted = true, deleted_at = NOW(), deleted_by = $2, updated_at = NOW()
-               WHERE message_id = $1"#,
-    )
-    .bind(message_id)
-    .bind(deleted_by)
-    .execute(session.as_mut())
-    .await?;
+) -> crate::Result<()> {
+    let now = Utc::now();
+    let active = messages::ActiveModel {
+        is_deleted: Set(true),
+        deleted_at: Set(Some(now)),
+        deleted_by: Set(deleted_by.map(|v| v.to_owned())),
+        updated_at: Set(Some(now)),
+        ..Default::default()
+    };
+    messages::Entity::update_many()
+        .set(active)
+        .filter(messages::Column::MessageId.eq(message_id))
+        .exec(db)
+        .await
+        .map_err(db_error)?;
     Ok(())
 }
 
-#[instrument(skip(session, message_ids), fields(message_count = message_ids.len(), has_deleted_by = deleted_by.is_some()))]
-pub async fn mark_deleted_batch(
-    session: &mut DbSession,
+#[instrument(skip(db, message_ids), fields(message_count = message_ids.len(), has_deleted_by = deleted_by.is_some()))]
+pub async fn mark_deleted_batch<C: ConnectionTrait>(
+    db: &C,
     message_ids: &[String],
     deleted_by: Option<&str>,
-) -> Result<i64> {
+) -> crate::Result<i64> {
     if message_ids.is_empty() {
         return Ok(0);
     }
-    let result = sqlx::query(
-        r#"UPDATE messages
-               SET is_deleted = true, deleted_at = NOW(), deleted_by = $2, updated_at = NOW()
-               WHERE message_id = ANY($1)"#,
-    )
-    .bind(message_ids)
-    .bind(deleted_by)
-    .execute(session.as_mut())
-    .await?;
-    Ok(result.rows_affected() as i64)
+    let now = Utc::now();
+    let active = messages::ActiveModel {
+        is_deleted: Set(true),
+        deleted_at: Set(Some(now)),
+        deleted_by: Set(deleted_by.map(|v| v.to_owned())),
+        updated_at: Set(Some(now)),
+        ..Default::default()
+    };
+    let result = messages::Entity::update_many()
+        .set(active)
+        .filter(messages::Column::MessageId.is_in(message_ids.iter().cloned()))
+        .exec(db)
+        .await
+        .map_err(db_error)?;
+    Ok(result.rows_affected as i64)
 }
 
-#[instrument(skip(session), fields(message_id = %message_id))]
-pub async fn mark_recalled(session: &mut DbSession, message_id: &str) -> Result<()> {
-    set_message_recalled(session, message_id).await
+#[instrument(skip(db), fields(message_id = %message_id))]
+pub async fn mark_recalled<C: ConnectionTrait>(db: &C, message_id: &str) -> crate::Result<()> {
+    let now = Utc::now();
+    let active = messages::ActiveModel {
+        is_recalled: Set(true),
+        updated_at: Set(Some(now)),
+        ..Default::default()
+    };
+    messages::Entity::update_many()
+        .set(active)
+        .filter(messages::Column::MessageId.eq(message_id))
+        .exec(db)
+        .await
+        .map_err(db_error)?;
+    Ok(())
 }
 
-#[instrument(skip(session, message_ids), fields(message_count = message_ids.len()))]
-pub async fn mark_recalled_batch(session: &mut DbSession, message_ids: &[String]) -> Result<i64> {
+#[instrument(skip(db, message_ids), fields(message_count = message_ids.len()))]
+pub async fn mark_recalled_batch<C: ConnectionTrait>(
+    db: &C,
+    message_ids: &[String],
+) -> crate::Result<i64> {
     if message_ids.is_empty() {
         return Ok(0);
     }
-    let result = sqlx::query(
-        "UPDATE messages SET is_recalled = true, updated_at = NOW() WHERE message_id = ANY($1)",
-    )
-    .bind(message_ids)
-    .execute(session.as_mut())
-    .await?;
-    Ok(result.rows_affected() as i64)
+    let now = Utc::now();
+    let active = messages::ActiveModel {
+        is_recalled: Set(true),
+        updated_at: Set(Some(now)),
+        ..Default::default()
+    };
+    let result = messages::Entity::update_many()
+        .set(active)
+        .filter(messages::Column::MessageId.is_in(message_ids.iter().cloned()))
+        .exec(db)
+        .await
+        .map_err(db_error)?;
+    Ok(result.rows_affected as i64)
 }
 
-#[instrument(skip(session, messages), fields(message_count = messages.len()))]
-pub async fn batch_create(session: &mut DbSession, messages: &[Message]) -> Result<i64> {
-    if messages.is_empty() {
+#[instrument(skip(db, items), fields(message_count = items.len()))]
+pub async fn batch_create<C: ConnectionTrait>(db: &C, items: &[Message]) -> crate::Result<i64> {
+    if items.is_empty() {
         return Ok(0);
     }
 
-    let mut sql = String::from(
-        "INSERT INTO messages (message_id, room_id, sent_at, sent_by, content_type, content_text, attachment_url, attachment_file, sticker_id, alt_text, metadata, raw_data, source, created_at, updated_at, is_deleted, deleted_at, deleted_by, is_recalled, is_edited, history, reference_message_id, reference_data) VALUES ",
-    );
-    let mut param_idx = 0u32;
-    let mut value_rows: Vec<String> = Vec::new();
-    const COLS_PER_ROW: u32 = 23;
-
-    for _i in 0..messages.len() {
-        let base = param_idx;
-        let col_nums: Vec<String> = (1..=COLS_PER_ROW)
-            .map(|o| format!("${}", base + o))
-            .collect();
-        value_rows.push(format!("({})", col_nums.join(",")));
-        param_idx += COLS_PER_ROW;
-    }
-
-    sql.push_str(&value_rows.join(", "));
-
-    let mut q = sqlx::query(&sql);
-    for msg in messages {
-        q = q
-            .bind(&msg.message_id)
-            .bind(&msg.room_id)
-            .bind(msg.sent_at)
-            .bind(&msg.sent_by)
-            .bind(&msg.content_type)
-            .bind(&msg.content_text)
-            .bind(&msg.attachment_url)
-            .bind(&msg.attachment_file)
-            .bind(&msg.sticker_id)
-            .bind(&msg.alt_text)
-            .bind(&msg.metadata)
-            .bind(&msg.raw_data)
-            .bind(&msg.source)
-            .bind(msg.created_at)
-            .bind(msg.updated_at)
-            .bind(msg.is_deleted)
-            .bind(msg.deleted_at)
-            .bind(&msg.deleted_by)
-            .bind(msg.is_recalled)
-            .bind(msg.is_edited)
-            .bind(&msg.history)
-            .bind(&msg.reference_message_id)
-            .bind(&msg.reference_data);
-    }
-
-    let result = q.execute(session.as_mut()).await?;
-    Ok(result.rows_affected() as i64)
+    let rows_affected = messages::Entity::insert_many(items.iter().map(message_active_model))
+        .exec_without_returning(db)
+        .await
+        .map_err(db_error)?;
+    Ok(rows_affected as i64)
 }
 
-#[instrument(skip(session), fields(room_id = %room_id))]
-pub async fn get_latest_message_time(
-    session: &mut DbSession,
+#[instrument(skip(db), fields(room_id = %room_id))]
+pub async fn get_latest_message_time<C: ConnectionTrait>(
+    db: &C,
     room_id: &str,
-) -> Result<Option<DateTime<Utc>>> {
-    sqlx::query_scalar(
-        "SELECT sent_at FROM messages WHERE room_id = $1 ORDER BY sent_at DESC LIMIT 1",
-    )
-    .bind(room_id)
-    .fetch_optional(session.as_mut())
-    .await
-    .map_err(anyhow::Error::from)
+) -> crate::Result<Option<DateTime<Utc>>> {
+    messages::Entity::find()
+        .select_only()
+        .column(messages::Column::SentAt)
+        .filter(messages::Column::RoomId.eq(room_id))
+        .order_by_desc(messages::Column::SentAt)
+        .into_tuple()
+        .one(db)
+        .await
+        .map_err(db_error)
 }
 
-#[instrument(skip(session), fields(room_id = %room_id))]
-pub async fn get_earliest_message_time(
-    session: &mut DbSession,
+#[instrument(skip(db), fields(room_id = %room_id))]
+pub async fn get_earliest_message_time<C: ConnectionTrait>(
+    db: &C,
     room_id: &str,
-) -> Result<Option<DateTime<Utc>>> {
-    sqlx::query_scalar(
-        "SELECT sent_at FROM messages WHERE room_id = $1 ORDER BY sent_at ASC LIMIT 1",
-    )
-    .bind(room_id)
-    .fetch_optional(session.as_mut())
-    .await
-    .map_err(anyhow::Error::from)
+) -> crate::Result<Option<DateTime<Utc>>> {
+    messages::Entity::find()
+        .select_only()
+        .column(messages::Column::SentAt)
+        .filter(messages::Column::RoomId.eq(room_id))
+        .order_by_asc(messages::Column::SentAt)
+        .into_tuple()
+        .one(db)
+        .await
+        .map_err(db_error)
 }
 
-#[instrument(skip(session, filters), fields(has_gps_only = filters.gps_only.unwrap_or(false)))]
-pub async fn count_messages(
-    session: &mut DbSession,
+#[instrument(skip(db, filters), fields(has_gps_only = filters.gps_only.unwrap_or(false)))]
+pub async fn count_messages<C: ConnectionTrait>(
+    db: &C,
     filters: &MessageFilters,
-) -> Result<MessageCounts> {
+) -> crate::Result<MessageCounts> {
     let query_parts = build_query_parts(filters, false);
 
-    if query_parts.params.is_empty()
-        && query_parts.conditions.is_empty()
-        && !filters.gps_only.unwrap_or(false)
-    {
-        let row = sqlx::query_as::<_, (i64, i64, i64, i64)>(
-            "SELECT COALESCE(SUM(message_count), 0)::bigint,
-                        COALESCE(SUM(deleted_count), 0)::bigint,
-                        COALESCE(SUM(recalled_count), 0)::bigint,
-                        COALESCE(SUM(edited_count), 0)::bigint
-                 FROM rooms",
-        )
-        .fetch_one(session.as_mut())
-        .await?;
+    if !query_parts.has_condition && !query_parts.join_gps {
+        let row = rooms::Entity::find()
+            .select_only()
+            .column_as(
+                Expr::cust(r#"COALESCE(SUM("rooms"."message_count"), 0)::bigint"#),
+                "total",
+            )
+            .column_as(
+                Expr::cust(r#"COALESCE(SUM("rooms"."deleted_count"), 0)::bigint"#),
+                "deleted",
+            )
+            .column_as(
+                Expr::cust(r#"COALESCE(SUM("rooms"."recalled_count"), 0)::bigint"#),
+                "recalled",
+            )
+            .column_as(
+                Expr::cust(r#"COALESCE(SUM("rooms"."edited_count"), 0)::bigint"#),
+                "edited",
+            )
+            .into_model::<MessageStatsRow>()
+            .one(db)
+            .await
+            .map_err(db_error)?
+            .unwrap_or(MessageStatsRow {
+                total: 0,
+                deleted: 0,
+                recalled: 0,
+                edited: 0,
+            });
 
         return Ok(MessageCounts {
-            total_messages: row.0,
-            deleted_messages: row.1,
-            recalled_messages: row.2,
-            edited_messages: row.3,
+            total_messages: row.total,
+            deleted_messages: row.deleted,
+            recalled_messages: row.recalled,
+            edited_messages: row.edited,
         });
     }
 
-    let sql = format!(
-        "SELECT COUNT(*)::bigint,
-                    COALESCE(SUM(CASE WHEN m.is_deleted THEN 1 ELSE 0 END), 0)::bigint,
-                    COALESCE(SUM(CASE WHEN m.is_recalled THEN 1 ELSE 0 END), 0)::bigint,
-                    COALESCE(SUM(CASE WHEN m.is_edited THEN 1 ELSE 0 END), 0)::bigint
-             FROM messages m{} WHERE 1=1{}",
-        query_parts.joins, query_parts.conditions,
-    );
-
-    let mut q = sqlx::query_as::<_, (i64, i64, i64, i64)>(&sql);
-    for p in &query_parts.params {
-        q = match p {
-            BindVal::Text(v) => q.bind(v.clone()),
-            BindVal::Timestamp(v) => q.bind(*v),
-            BindVal::Bool(v) => q.bind(*v),
-            BindVal::TextArray(v) => q.bind(v.clone()),
-        };
-    }
-
-    let row = q.fetch_one(session.as_mut()).await?;
+    let row = apply_query_parts(
+        messages::Entity::find()
+            .select_only()
+            .column_as(Expr::cust("COUNT(*)::bigint"), "total")
+            .column_as(
+                Expr::cust(
+                    r#"COALESCE(SUM(CASE WHEN "messages"."is_deleted" THEN 1 ELSE 0 END), 0)::bigint"#,
+                ),
+                "deleted",
+            )
+            .column_as(
+                Expr::cust(
+                    r#"COALESCE(SUM(CASE WHEN "messages"."is_recalled" THEN 1 ELSE 0 END), 0)::bigint"#,
+                ),
+                "recalled",
+            )
+            .column_as(
+                Expr::cust(
+                    r#"COALESCE(SUM(CASE WHEN "messages"."is_edited" THEN 1 ELSE 0 END), 0)::bigint"#,
+                ),
+                "edited",
+            ),
+        &query_parts,
+        false,
+    )
+    .into_model::<MessageStatsRow>()
+    .one(db)
+    .await
+    .map_err(db_error)?
+    .unwrap_or(MessageStatsRow {
+        total: 0,
+        deleted: 0,
+        recalled: 0,
+        edited: 0,
+    });
 
     Ok(MessageCounts {
-        total_messages: row.0,
-        deleted_messages: row.1,
-        recalled_messages: row.2,
-        edited_messages: row.3,
+        total_messages: row.total,
+        deleted_messages: row.deleted,
+        recalled_messages: row.recalled,
+        edited_messages: row.edited,
     })
-}
-
-impl sqlx::FromRow<'_, sqlx::postgres::PgRow> for EnrichedMessage {
-    fn from_row(row: &sqlx::postgres::PgRow) -> sqlx::Result<Self> {
-        use sqlx::Row;
-        Ok(Self {
-            message_id: row.try_get("message_id")?,
-            room_id: row.try_get("room_id")?,
-            sent_at: row.try_get("sent_at")?,
-            sent_by: row.try_get("sent_by")?,
-            content_type: row.try_get("content_type")?,
-            content_text: row.try_get("content_text")?,
-            content_tsv: row.try_get("content_tsv")?,
-            attachment_url: row.try_get("attachment_url")?,
-            attachment_file: row.try_get("attachment_file")?,
-            sticker_id: row.try_get("sticker_id")?,
-            alt_text: row.try_get("alt_text")?,
-            metadata: row.try_get("metadata")?,
-            raw_data: row.try_get("raw_data")?,
-            source: row.try_get("source")?,
-            created_at: row.try_get("created_at")?,
-            updated_at: row.try_get("updated_at")?,
-            is_deleted: row.try_get("is_deleted")?,
-            deleted_at: row.try_get("deleted_at")?,
-            deleted_by: row.try_get("deleted_by")?,
-            is_recalled: row.try_get("is_recalled")?,
-            is_edited: row.try_get("is_edited")?,
-            history: row.try_get("history")?,
-            reference_message_id: row.try_get("reference_message_id")?,
-            reference_data: row.try_get("reference_data")?,
-            user_display_name: row.try_get("user_display_name")?,
-            user_avatar_url: row.try_get("user_avatar_url")?,
-            room_title: row.try_get("room_title")?,
-        })
-    }
 }
 
 #[cfg(test)]
@@ -1527,217 +1473,16 @@ mod tests {
         }
 
         #[test]
-        fn build_query_room_id_generates_condition() {
-            let f = MessageFilters {
-                room_id: Some("room1".into()),
-                ..Default::default()
-            };
-            let qp = build_query_parts(&f, false);
-            assert!(qp.conditions.contains("m.room_id"));
-            assert_eq!(qp.params.len(), 1);
+        fn build_query_default_no_filters() {
+            let qp = build_query_parts(&MessageFilters::default(), false);
+            assert!(!qp.has_condition);
+            assert!(!qp.join_users);
+            assert!(!qp.join_rooms);
+            assert!(!qp.join_gps);
         }
 
         #[test]
-        fn build_query_room_ids_generates_any_condition() {
-            let f = MessageFilters {
-                room_ids: Some(vec!["r1".into(), "r2".into()]),
-                ..Default::default()
-            };
-            let qp = build_query_parts(&f, false);
-            assert!(qp.conditions.contains("= ANY"));
-            assert!(qp.conditions.contains("m.room_id"));
-            assert_eq!(qp.params.len(), 1);
-        }
-
-        #[test]
-        fn build_query_room_ids_empty_skips() {
-            let f = MessageFilters {
-                room_ids: Some(vec![]),
-                ..Default::default()
-            };
-            let qp = build_query_parts(&f, false);
-            assert!(!qp.conditions.contains("room_id"));
-            assert_eq!(qp.params.len(), 0);
-        }
-
-        #[test]
-        fn build_query_user_id_generates_condition() {
-            let f = MessageFilters {
-                user_id: Some("user1".into()),
-                ..Default::default()
-            };
-            let qp = build_query_parts(&f, false);
-            assert!(qp.conditions.contains("m.sent_by"));
-            assert_eq!(qp.params.len(), 1);
-        }
-
-        #[test]
-        fn build_query_content_types_generates_any_condition() {
-            let f = MessageFilters {
-                content_types: Some(vec!["text".into(), "image".into()]),
-                ..Default::default()
-            };
-            let qp = build_query_parts(&f, false);
-            assert!(qp.conditions.contains("m.content_type"));
-            assert!(qp.conditions.contains("= ANY"));
-            assert_eq!(qp.params.len(), 1);
-        }
-
-        #[test]
-        fn build_query_content_types_empty_skips() {
-            let f = MessageFilters {
-                content_types: Some(vec![]),
-                ..Default::default()
-            };
-            let qp = build_query_parts(&f, false);
-            assert!(!qp.conditions.contains("content_type"));
-            assert_eq!(qp.params.len(), 0);
-        }
-
-        #[test]
-        fn build_query_message_type_deleted() {
-            let f = MessageFilters {
-                message_types: Some(vec!["deleted".into()]),
-                ..Default::default()
-            };
-            let qp = build_query_parts(&f, false);
-            assert!(qp.conditions.contains("is_deleted"));
-            assert_eq!(qp.params.len(), 1);
-        }
-
-        #[test]
-        fn build_query_message_type_recalled() {
-            let f = MessageFilters {
-                message_types: Some(vec!["recalled".into()]),
-                ..Default::default()
-            };
-            let qp = build_query_parts(&f, false);
-            assert!(qp.conditions.contains("is_recalled"));
-            assert_eq!(qp.params.len(), 1);
-        }
-
-        #[test]
-        fn build_query_message_type_edited() {
-            let f = MessageFilters {
-                message_types: Some(vec!["edited".into()]),
-                ..Default::default()
-            };
-            let qp = build_query_parts(&f, false);
-            assert!(qp.conditions.contains("is_edited"));
-            assert_eq!(qp.params.len(), 1);
-        }
-
-        #[test]
-        fn build_query_message_types_multiple() {
-            let f = MessageFilters {
-                message_types: Some(vec!["deleted".into(), "recalled".into()]),
-                ..Default::default()
-            };
-            let qp = build_query_parts(&f, false);
-            assert!(qp.conditions.contains(" OR "));
-            assert!(qp.conditions.contains("is_deleted"));
-            assert!(qp.conditions.contains("is_recalled"));
-            assert_eq!(qp.params.len(), 2);
-        }
-
-        #[test]
-        fn build_query_start_time_generates_condition() {
-            let t = Utc::now();
-            let f = MessageFilters {
-                start_time: Some(t),
-                ..Default::default()
-            };
-            let qp = build_query_parts(&f, false);
-            assert!(qp.conditions.contains("m.sent_at >="));
-            assert_eq!(qp.params.len(), 1);
-        }
-
-        #[test]
-        fn build_query_end_time_generates_condition() {
-            let t = Utc::now();
-            let f = MessageFilters {
-                end_time: Some(t),
-                ..Default::default()
-            };
-            let qp = build_query_parts(&f, false);
-            assert!(qp.conditions.contains("m.sent_at <="));
-            assert_eq!(qp.params.len(), 1);
-        }
-
-        #[test]
-        fn build_query_has_attachment_true() {
-            let f = MessageFilters {
-                has_attachment: Some(true),
-                ..Default::default()
-            };
-            let qp = build_query_parts(&f, false);
-            assert!(qp.conditions.contains("attachment_file IS NOT NULL"));
-            assert_eq!(qp.params.len(), 0);
-        }
-
-        #[test]
-        fn build_query_has_attachment_false() {
-            let f = MessageFilters {
-                has_attachment: Some(false),
-                ..Default::default()
-            };
-            let qp = build_query_parts(&f, false);
-            assert!(qp.conditions.contains("attachment_file IS NULL"));
-            assert_eq!(qp.params.len(), 0);
-        }
-
-        #[test]
-        fn build_query_has_reference_true() {
-            let f = MessageFilters {
-                has_reference: Some(true),
-                ..Default::default()
-            };
-            let qp = build_query_parts(&f, false);
-            assert!(qp.conditions.contains("reference_message_id IS NOT NULL"));
-            assert_eq!(qp.params.len(), 0);
-        }
-
-        #[test]
-        fn build_query_has_reference_false() {
-            let f = MessageFilters {
-                has_reference: Some(false),
-                ..Default::default()
-            };
-            let qp = build_query_parts(&f, false);
-            assert!(qp.conditions.contains("reference_message_id IS NULL"));
-            assert_eq!(qp.params.len(), 0);
-        }
-
-        #[test]
-        fn build_query_gps_only_adds_join() {
-            let f = MessageFilters {
-                gps_only: Some(true),
-                ..Default::default()
-            };
-            let qp = build_query_parts(&f, false);
-            assert!(qp.joins.contains("image_gps"));
-        }
-
-        #[test]
-        fn build_query_gps_only_false_no_join() {
-            let f = MessageFilters {
-                gps_only: Some(false),
-                ..Default::default()
-            };
-            let qp = build_query_parts(&f, false);
-            assert!(!qp.joins.contains("image_gps"));
-        }
-
-        #[test]
-        fn build_query_visible_only_adds_condition() {
-            let f = MessageFilters::default();
-            let qp = build_query_parts(&f, true);
-            assert!(qp.conditions.contains("is_deleted = false"));
-            assert!(qp.conditions.contains("is_recalled = false"));
-        }
-
-        #[test]
-        fn build_query_combined_filters() {
+        fn build_query_simple_filters_add_conditions_without_joins() {
             let t = Utc::now();
             let f = MessageFilters {
                 room_id: Some("room1".into()),
@@ -1747,110 +1492,52 @@ mod tests {
                 end_time: Some(t),
                 has_attachment: Some(true),
                 has_reference: Some(true),
-                ..Default::default()
-            };
-            let qp = build_query_parts(&f, false);
-            assert_eq!(qp.params.len(), 5);
-            assert!(qp.conditions.contains("m.room_id"));
-            assert!(qp.conditions.contains("m.sent_by"));
-            assert!(qp.conditions.contains("m.content_type"));
-            assert!(qp.conditions.contains("m.sent_at >="));
-            assert!(qp.conditions.contains("m.sent_at <="));
-            assert!(qp.conditions.contains("attachment_file IS NOT NULL"));
-            assert!(qp.conditions.contains("reference_message_id IS NOT NULL"));
-        }
-
-        #[test]
-        fn build_query_source_filter() {
-            let f = MessageFilters {
                 source: Some("spider".into()),
-                ..Default::default()
-            };
-            let qp = build_query_parts(&f, false);
-            assert!(qp.conditions.contains("m.source"));
-            assert_eq!(qp.params.len(), 1);
-        }
-
-        #[test]
-        fn build_query_created_after_filter() {
-            let t = Utc::now();
-            let f = MessageFilters {
                 created_after: Some(t),
                 ..Default::default()
             };
             let qp = build_query_parts(&f, false);
-            assert!(qp.conditions.contains("m.created_at >"));
-            assert_eq!(qp.params.len(), 1);
+            assert!(qp.has_condition);
+            assert!(!qp.join_users);
+            assert!(!qp.join_rooms);
+            assert!(!qp.join_gps);
         }
 
         #[test]
-        fn build_query_account_id_adds_room_join() {
+        fn build_query_join_filters_set_join_flags() {
             let f = MessageFilters {
                 account_id: Some("acct1".into()),
-                ..Default::default()
-            };
-            let qp = build_query_parts(&f, false);
-            assert!(qp.joins.contains("LEFT JOIN rooms"));
-            assert!(qp.conditions.contains("account_ids"));
-            assert_eq!(qp.params.len(), 1);
-        }
-
-        #[test]
-        fn build_query_user_or_account_id_adds_room_join() {
-            let f = MessageFilters {
-                user_or_account_id: Some("id1".into()),
-                ..Default::default()
-            };
-            let qp = build_query_parts(&f, false);
-            assert!(qp.joins.contains("LEFT JOIN rooms"));
-            assert!(qp.conditions.contains("m.sent_by"));
-            assert!(qp.conditions.contains("account_ids"));
-            assert_eq!(qp.params.len(), 1);
-        }
-
-        #[test]
-        fn build_query_sender_name_adds_user_join() {
-            let f = MessageFilters {
                 sender_name: Some("Test".into()),
+                gps_only: Some(true),
                 ..Default::default()
             };
             let qp = build_query_parts(&f, false);
-            assert!(qp.joins.contains("LEFT JOIN users"));
-            assert!(qp.conditions.contains("name_tsv"));
-            assert_eq!(qp.params.len(), 1);
+            assert!(qp.has_condition);
+            assert!(qp.join_users);
+            assert!(qp.join_rooms);
+            assert!(qp.join_gps);
         }
 
         #[test]
-        fn build_query_search_query_uuid_detection() {
+        fn build_query_visible_only_adds_condition() {
+            let qp = build_query_parts(&MessageFilters::default(), true);
+            assert!(qp.has_condition);
+            assert!(!qp.join_users);
+            assert!(!qp.join_rooms);
+            assert!(!qp.join_gps);
+        }
+
+        #[test]
+        fn build_query_empty_vector_filters_are_noops() {
             let f = MessageFilters {
-                search_query: Some("550e8400-e29b-41d4-a716-446655440000".into()),
+                room_ids: Some(vec![]),
+                content_types: Some(vec![]),
+                gps_only: Some(false),
                 ..Default::default()
             };
             let qp = build_query_parts(&f, false);
-            assert!(qp.conditions.contains("m.message_id"));
-            assert!(!qp.conditions.contains("content_tsv"));
-            assert_eq!(qp.params.len(), 1);
-        }
-
-        #[test]
-        fn build_query_search_query_non_uuid_uses_fts() {
-            let f = MessageFilters {
-                search_query: Some("Hello".into()),
-                ..Default::default()
-            };
-            let qp = build_query_parts(&f, false);
-            assert!(qp.conditions.contains("content_tsv"));
-            assert!(qp.conditions.contains("zhparser"));
-            assert_eq!(qp.params.len(), 1);
-        }
-
-        #[test]
-        fn build_query_default_no_filters() {
-            let f = MessageFilters::default();
-            let qp = build_query_parts(&f, false);
-            assert!(qp.conditions.trim().is_empty() || qp.conditions == " AND ".repeat(0));
-            assert!(qp.joins.is_empty());
-            assert!(qp.params.is_empty());
+            assert!(!qp.has_condition);
+            assert!(!qp.join_gps);
         }
     }
 
@@ -2123,47 +1810,20 @@ mod tests {
         }
     }
 
-    mod bind_val {
-        use super::*;
-
-        #[test]
-        fn text_variant() {
-            let v = BindVal::Text("hello".into());
-            assert!(matches!(v, BindVal::Text(_)));
-        }
-
-        #[test]
-        fn timestamp_variant() {
-            let v = BindVal::Timestamp(Utc::now());
-            assert!(matches!(v, BindVal::Timestamp(_)));
-        }
-
-        #[test]
-        fn bool_variant() {
-            let v = BindVal::Bool(true);
-            assert!(matches!(v, BindVal::Bool(true)));
-        }
-
-        #[test]
-        fn text_array_variant() {
-            let v = BindVal::TextArray(vec!["a".into()]);
-            assert!(matches!(v, BindVal::TextArray(_)));
-        }
-    }
-
     mod query_parts {
         use super::QueryParts;
 
         #[test]
         fn default_empty() {
             let qp = QueryParts::default();
-            assert!(qp.conditions.is_empty() || qp.conditions.trim().is_empty());
-            assert!(qp.joins.is_empty());
-            assert!(qp.params.is_empty());
+            assert!(!qp.has_condition);
+            assert!(!qp.join_users);
+            assert!(!qp.join_rooms);
+            assert!(!qp.join_gps);
         }
     }
 
-    mod message_service_integration {
+    mod message_integration {
         use super::*;
         use chrono::{TimeZone, Utc};
 
@@ -2175,7 +1835,6 @@ mod tests {
                 sent_by: "test_user".into(),
                 content_type: "text".into(),
                 content_text: Some("Hello".into()),
-                content_tsv: None,
                 attachment_url: None,
                 attachment_file: None,
                 sticker_id: None,

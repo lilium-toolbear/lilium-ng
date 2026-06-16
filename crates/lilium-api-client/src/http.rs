@@ -82,16 +82,13 @@ fn is_trpc_business_forbidden(body_text: &str) -> bool {
     };
 
     for item in items {
-        if let Some(obj) = item.as_object() {
-            if let Some(error) = obj.get("error") {
-                if let Some(error_obj) = error.as_object() {
-                    if let Some(error_json) = error_obj.get("json") {
-                        if error_json.get("code").and_then(|c| c.as_i64()) == Some(-32003) {
-                            return true;
-                        }
-                    }
-                }
-            }
+        if let Some(obj) = item.as_object()
+            && let Some(error) = obj.get("error")
+            && let Some(error_obj) = error.as_object()
+            && let Some(error_json) = error_obj.get("json")
+            && error_json.get("code").and_then(|c| c.as_i64()) == Some(-32003)
+        {
+            return true;
         }
     }
 
@@ -133,247 +130,6 @@ fn parse_trpc_response(response: &Value, index: usize, default: Option<Value>) -
     })
 }
 
-#[cfg(test)]
-fn extract_balanced_json_object(text: &str, start: usize) -> Result<Value> {
-    let chars: Vec<char> = text.chars().collect();
-    let mut depth = 0i32;
-    let mut in_str = false;
-    let mut escaped = false;
-
-    for (i, &c) in chars.iter().enumerate().skip(start) {
-        if in_str {
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == '"' {
-                in_str = false;
-            }
-        } else {
-            match c {
-                '"' => in_str = true,
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        let s: String = chars[start..=i].iter().collect();
-                        let obj: Value = serde_json::from_str(&s)
-                            .context("Failed to parse balanced JSON object")?;
-                        if !obj.is_object() {
-                            bail!("Expected JSON object");
-                        }
-                        return Ok(obj);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    bail!("Unterminated JSON object")
-}
-
-#[cfg(test)]
-fn extract_balanced_json_array(text: &str, start: usize) -> Result<String> {
-    let chars: Vec<char> = text.chars().collect();
-    let mut depth = 0i32;
-    let mut in_str = false;
-    let mut escaped = false;
-
-    for (i, &c) in chars.iter().enumerate().skip(start) {
-        if in_str {
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == '"' {
-                in_str = false;
-            }
-        } else {
-            match c {
-                '"' => in_str = true,
-                '[' => depth += 1,
-                ']' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        let s: String = chars[start..=i].iter().collect();
-                        return Ok(s);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    bail!("Unterminated JSON array")
-}
-
-#[cfg(test)]
-fn extract_next_flight_text(html: &str) -> String {
-    let mut chunks: Vec<String> = Vec::new();
-    let marker = "self.__next_f.push(";
-
-    let mut start = 0usize;
-    while let Some(i) = html[start..].find(marker) {
-        let call_index = start + i;
-
-        let array_start = match html[call_index + marker.len()..].find('[') {
-            Some(i) => call_index + marker.len() + i,
-            None => break,
-        };
-
-        let payload_str = match extract_balanced_json_array(html, array_start) {
-            Ok(s) => s,
-            Err(_) => {
-                start = array_start + 1;
-                continue;
-            }
-        };
-
-        let payload: Value = match serde_json::from_str(&payload_str) {
-            Ok(v) => v,
-            Err(_) => {
-                start = array_start + 1;
-                continue;
-            }
-        };
-
-        if let Some(arr) = payload.as_array() {
-            if arr.len() >= 2 && arr[0] == Value::Number(1.into()) {
-                if let Some(s) = arr[1].as_str() {
-                    chunks.push(s.to_string());
-                }
-            }
-        }
-
-        start = array_start + 1;
-    }
-
-    chunks.join("")
-}
-
-#[cfg(test)]
-fn extract_next_scalar_field(text: &str, field: &str) -> Option<Value> {
-    let marker = format!("\"{}\":", field);
-    let index = text.find(&marker)?;
-
-    let start = index + marker.len();
-    let rest = &text[start..];
-    let trimmed_start = rest.len() - rest.trim_start().len();
-    let after_ws = &text[start + trimmed_start..];
-
-    if after_ws.is_empty() {
-        return None;
-    }
-
-    let c = after_ws.chars().next().unwrap();
-    if c == '"' {
-        let end = after_ws[1..].find('"').map(|i| i + 1)?;
-        Some(Value::String(after_ws[1..end].to_string()))
-    } else if c == 't' && after_ws.starts_with("true") {
-        Some(Value::Bool(true))
-    } else if c == 'f' && after_ws.starts_with("false") {
-        Some(Value::Bool(false))
-    } else if c == 'n' && after_ws.starts_with("null") {
-        Some(Value::Null)
-    } else {
-        let end = after_ws
-            .find(|ch: char| !ch.is_ascii_digit() && ch != '.' && ch != '-')
-            .unwrap_or(after_ws.len());
-        if end == 0 {
-            return None;
-        }
-        serde_json::from_str(&after_ws[..end]).ok()
-    }
-}
-
-#[cfg(test)]
-fn extract_next_public_profile(html: &str, user_id: &str) -> Value {
-    let flight = extract_next_flight_text(html).replace(r#"\""#, "\"");
-    let profile_marker = "\"profile\":";
-    let profile_index = match flight.find(profile_marker) {
-        Some(i) => i,
-        None => return Value::Object(serde_json::Map::new()),
-    };
-
-    let profile_start = match flight[profile_index..].find('{') {
-        Some(i) => profile_index + i,
-        None => return Value::Object(serde_json::Map::new()),
-    };
-
-    let profile = match extract_balanced_json_object(&flight, profile_start) {
-        Ok(v) => v,
-        Err(_) => return Value::Object(serde_json::Map::new()),
-    };
-
-    let target_user_id = extract_next_scalar_field(&flight, "targetUserId")
-        .and_then(|v| v.as_str().map(String::from));
-
-    if let Some(ref tid) = target_user_id {
-        if tid != user_id {
-            return Value::Object(serde_json::Map::new());
-        }
-    }
-
-    let mut public_profile = if let Value::Object(map) = &profile {
-        map.clone()
-    } else {
-        serde_json::Map::new()
-    };
-
-    for field in &[
-        "joinDate",
-        "followersCount",
-        "followingCount",
-        "dmDeniedReason",
-        "showFavorites",
-        "showLikes",
-    ] {
-        if let Some(value) = extract_next_scalar_field(&flight, field) {
-            public_profile.insert(field.to_string(), value);
-        }
-    }
-
-    let mut data = serde_json::Map::new();
-    data.insert(
-        "id".to_string(),
-        Value::String(target_user_id.unwrap_or_else(|| user_id.to_string())),
-    );
-    if let Some(v) = profile.get("fullName") {
-        data.insert("fullName".to_string(), v.clone());
-    }
-    if let Some(v) = profile.get("avatarUrl") {
-        data.insert("avatarUrl".to_string(), v.clone());
-    }
-    if let Some(v) = profile.get("bio") {
-        data.insert("bio".to_string(), v.clone());
-    }
-    if let Some(v) = profile.get("birthday") {
-        data.insert("birthday".to_string(), v.clone());
-    }
-    if let Some(v) = profile.get("birthdayPublic") {
-        data.insert("birthdayPublic".to_string(), v.clone());
-    }
-    if let Some(v) = profile.get("quirk") {
-        data.insert("quirk".to_string(), v.clone());
-    }
-    if let Some(v) = profile.get("gender") {
-        data.insert("gender".to_string(), v.clone());
-    }
-    data.insert("isBot".to_string(), Value::Bool(false));
-    data.insert("isPremium".to_string(), Value::Bool(false));
-    let mut metadata = serde_json::Map::new();
-    metadata.insert(
-        "profile_source".to_string(),
-        Value::String("public_profile".to_string()),
-    );
-    metadata.insert("publicProfile".to_string(), Value::Object(public_profile));
-    data.insert("metadata".to_string(), Value::Object(metadata));
-
-    data.retain(|_, v| !v.is_null());
-    Value::Object(data)
-}
-
 fn extract_cookie_kv(set_cookie: &str) -> Option<(String, String)> {
     let main_part = set_cookie.split(';').next()?;
     let mut parts = main_part.splitn(2, '=');
@@ -388,10 +144,10 @@ fn extract_cookie_kv(set_cookie: &str) -> Option<(String, String)> {
 fn extract_response_cookies(headers: &HeaderMap) -> HashMap<String, String> {
     let mut cookies = HashMap::new();
     for value in headers.get_all(SET_COOKIE) {
-        if let Ok(s) = value.to_str() {
-            if let Some((name, val)) = extract_cookie_kv(s) {
-                cookies.insert(name, val);
-            }
+        if let Ok(s) = value.to_str()
+            && let Some((name, val)) = extract_cookie_kv(s)
+        {
+            cookies.insert(name, val);
         }
     }
     cookies
@@ -544,6 +300,7 @@ impl DzmmApi {
         ),
         fields(user_id = ?user_id.as_deref(), auto_refresh)
     )]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         email: Option<String>,
         password: Option<String>,
@@ -581,6 +338,7 @@ impl DzmmApi {
         ),
         fields(user_id = ?user_id.as_deref(), auto_refresh, base_url = %config.base_url)
     )]
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_config(
         config: ApiClientConfig,
         email: Option<String>,
@@ -649,10 +407,10 @@ impl DzmmApi {
 
     async fn combined_cookie_map(&self) -> HashMap<String, String> {
         let mut map = self.cookie_map.lock().await.clone();
-        if let Some(header) = self.cookie_jar.cookies(&self.cookie_url) {
-            if let Ok(cookie_header) = header.to_str() {
-                map.extend(parse_cookie_header(cookie_header));
-            }
+        if let Some(header) = self.cookie_jar.cookies(&self.cookie_url)
+            && let Ok(cookie_header) = header.to_str()
+        {
+            map.extend(parse_cookie_header(cookie_header));
         }
         map
     }
@@ -1016,6 +774,7 @@ impl DzmmApi {
         skip(self, query, json_body, multipart_form, extra_headers, timeout),
         fields(method = ?method, endpoint = %endpoint, user_id = ?self.user_id.as_deref())
     )]
+    #[allow(clippy::too_many_arguments)]
     async fn _request_inner(
         &self,
         method: Method,
@@ -1063,6 +822,7 @@ impl DzmmApi {
     }
 
     #[instrument(skip(self, query, json_body, multipart_form, extra_headers, timeout), fields(method = ?method, endpoint = %endpoint))]
+    #[allow(clippy::too_many_arguments)]
     async fn _request(
         &self,
         method: Method,
@@ -1434,18 +1194,17 @@ impl DzmmApi {
                 .get("result")
                 .and_then(|r| r.get("data"))
                 .and_then(|d| d.get("json"))
+                && !json_data.is_null()
             {
-                if !json_data.is_null() {
-                    return Ok(json_data.clone());
-                }
+                return Ok(json_data.clone());
             }
             return Ok(response);
         }
 
-        if let Some(arr) = response.as_array() {
-            if !arr.is_empty() {
-                return Ok(parse_trpc_response(&response, 0, None));
-            }
+        if let Some(arr) = response.as_array()
+            && !arr.is_empty()
+        {
+            return Ok(parse_trpc_response(&response, 0, None));
         }
 
         Ok(response)
@@ -1770,10 +1529,10 @@ impl DzmmApi {
             Value::Object(serde_json::Map::new())
         };
 
-        if let Some(book) = parsed.get("book") {
-            if book.is_object() {
-                return Ok(book.clone());
-            }
+        if let Some(book) = parsed.get("book")
+            && book.is_object()
+        {
+            return Ok(book.clone());
         }
 
         bail!("Invalid tRPC response for fetch_novel_book: {}", response);
@@ -2426,6 +2185,7 @@ impl DzmmApi {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_image_edit(
         &self,
         prompt: &str,
@@ -2619,6 +2379,242 @@ mod tests {
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    fn extract_balanced_json_object(text: &str, start: usize) -> Result<Value> {
+        let chars: Vec<char> = text.chars().collect();
+        let mut depth = 0i32;
+        let mut in_str = false;
+        let mut escaped = false;
+
+        for (i, &c) in chars.iter().enumerate().skip(start) {
+            if in_str {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    in_str = false;
+                }
+            } else {
+                match c {
+                    '"' => in_str = true,
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            let s: String = chars[start..=i].iter().collect();
+                            let obj: Value = serde_json::from_str(&s)
+                                .context("Failed to parse balanced JSON object")?;
+                            if !obj.is_object() {
+                                bail!("Expected JSON object");
+                            }
+                            return Ok(obj);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        bail!("Unterminated JSON object")
+    }
+
+    fn extract_balanced_json_array(text: &str, start: usize) -> Result<String> {
+        let chars: Vec<char> = text.chars().collect();
+        let mut depth = 0i32;
+        let mut in_str = false;
+        let mut escaped = false;
+
+        for (i, &c) in chars.iter().enumerate().skip(start) {
+            if in_str {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    in_str = false;
+                }
+            } else {
+                match c {
+                    '"' => in_str = true,
+                    '[' => depth += 1,
+                    ']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            let s: String = chars[start..=i].iter().collect();
+                            return Ok(s);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        bail!("Unterminated JSON array")
+    }
+
+    fn extract_next_flight_text(html: &str) -> String {
+        let mut chunks: Vec<String> = Vec::new();
+        let marker = "self.__next_f.push(";
+
+        let mut start = 0usize;
+        while let Some(i) = html[start..].find(marker) {
+            let call_index = start + i;
+
+            let array_start = match html[call_index + marker.len()..].find('[') {
+                Some(i) => call_index + marker.len() + i,
+                None => break,
+            };
+
+            let payload_str = match extract_balanced_json_array(html, array_start) {
+                Ok(s) => s,
+                Err(_) => {
+                    start = array_start + 1;
+                    continue;
+                }
+            };
+
+            let payload: Value = match serde_json::from_str(&payload_str) {
+                Ok(v) => v,
+                Err(_) => {
+                    start = array_start + 1;
+                    continue;
+                }
+            };
+
+            if let Some(arr) = payload.as_array()
+                && arr.len() >= 2
+                && arr[0] == Value::Number(1.into())
+                && let Some(s) = arr[1].as_str()
+            {
+                chunks.push(s.to_string());
+            }
+
+            start = array_start + 1;
+        }
+
+        chunks.join("")
+    }
+
+    fn extract_next_scalar_field(text: &str, field: &str) -> Option<Value> {
+        let marker = format!("\"{}\":", field);
+        let index = text.find(&marker)?;
+
+        let start = index + marker.len();
+        let rest = &text[start..];
+        let trimmed_start = rest.len() - rest.trim_start().len();
+        let after_ws = &text[start + trimmed_start..];
+
+        if after_ws.is_empty() {
+            return None;
+        }
+
+        let c = after_ws.chars().next().unwrap();
+        if c == '"' {
+            let end = after_ws[1..].find('"').map(|i| i + 1)?;
+            Some(Value::String(after_ws[1..end].to_string()))
+        } else if c == 't' && after_ws.starts_with("true") {
+            Some(Value::Bool(true))
+        } else if c == 'f' && after_ws.starts_with("false") {
+            Some(Value::Bool(false))
+        } else if c == 'n' && after_ws.starts_with("null") {
+            Some(Value::Null)
+        } else {
+            let end = after_ws
+                .find(|ch: char| !ch.is_ascii_digit() && ch != '.' && ch != '-')
+                .unwrap_or(after_ws.len());
+            if end == 0 {
+                return None;
+            }
+            serde_json::from_str(&after_ws[..end]).ok()
+        }
+    }
+
+    fn extract_next_public_profile(html: &str, user_id: &str) -> Value {
+        let flight = extract_next_flight_text(html).replace(r#"\""#, "\"");
+        let profile_marker = "\"profile\":";
+        let profile_index = match flight.find(profile_marker) {
+            Some(i) => i,
+            None => return Value::Object(serde_json::Map::new()),
+        };
+
+        let profile_start = match flight[profile_index..].find('{') {
+            Some(i) => profile_index + i,
+            None => return Value::Object(serde_json::Map::new()),
+        };
+
+        let profile = match extract_balanced_json_object(&flight, profile_start) {
+            Ok(v) => v,
+            Err(_) => return Value::Object(serde_json::Map::new()),
+        };
+
+        let target_user_id = extract_next_scalar_field(&flight, "targetUserId")
+            .and_then(|v| v.as_str().map(String::from));
+
+        if let Some(ref tid) = target_user_id
+            && tid != user_id
+        {
+            return Value::Object(serde_json::Map::new());
+        }
+
+        let mut public_profile = if let Value::Object(map) = &profile {
+            map.clone()
+        } else {
+            serde_json::Map::new()
+        };
+
+        for field in &[
+            "joinDate",
+            "followersCount",
+            "followingCount",
+            "dmDeniedReason",
+            "showFavorites",
+            "showLikes",
+        ] {
+            if let Some(value) = extract_next_scalar_field(&flight, field) {
+                public_profile.insert(field.to_string(), value);
+            }
+        }
+
+        let mut data = serde_json::Map::new();
+        data.insert(
+            "id".to_string(),
+            Value::String(target_user_id.unwrap_or_else(|| user_id.to_string())),
+        );
+        if let Some(v) = profile.get("fullName") {
+            data.insert("fullName".to_string(), v.clone());
+        }
+        if let Some(v) = profile.get("avatarUrl") {
+            data.insert("avatarUrl".to_string(), v.clone());
+        }
+        if let Some(v) = profile.get("bio") {
+            data.insert("bio".to_string(), v.clone());
+        }
+        if let Some(v) = profile.get("birthday") {
+            data.insert("birthday".to_string(), v.clone());
+        }
+        if let Some(v) = profile.get("birthdayPublic") {
+            data.insert("birthdayPublic".to_string(), v.clone());
+        }
+        if let Some(v) = profile.get("quirk") {
+            data.insert("quirk".to_string(), v.clone());
+        }
+        if let Some(v) = profile.get("gender") {
+            data.insert("gender".to_string(), v.clone());
+        }
+        data.insert("isBot".to_string(), Value::Bool(false));
+        data.insert("isPremium".to_string(), Value::Bool(false));
+        let mut metadata = serde_json::Map::new();
+        metadata.insert(
+            "profile_source".to_string(),
+            Value::String("public_profile".to_string()),
+        );
+        metadata.insert("publicProfile".to_string(), Value::Object(public_profile));
+        data.insert("metadata".to_string(), Value::Object(metadata));
+
+        data.retain(|_, v| !v.is_null());
+        Value::Object(data)
+    }
 
     #[derive(Debug, Clone)]
     struct RecordedRequest {

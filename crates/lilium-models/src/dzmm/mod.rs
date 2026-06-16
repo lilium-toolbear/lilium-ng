@@ -1,7 +1,9 @@
 pub mod account;
+pub mod image_gps;
 pub mod message;
 pub mod outgoing_command;
 pub mod room;
 pub mod room_member;
 pub mod user;
+pub mod user_history;
 pub mod websocket_connection;

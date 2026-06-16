@@ -128,3 +128,9 @@ impl From<sqlx::Error> for LiliumError {
         LiliumError::Database(value.to_string())
     }
 }
+
+impl From<sea_orm::DbErr> for LiliumError {
+    fn from(value: sea_orm::DbErr) -> Self {
+        LiliumError::Database(value.to_string())
+    }
+}

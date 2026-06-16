@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -94,10 +96,10 @@ impl ControlCommand {
             .to_string();
 
         let data = payload.get("data").cloned();
-        if let Some(ref value) = data {
-            if !value.is_object() {
-                return Err("Control command data must be a JSON object".to_string());
-            }
+        if let Some(ref value) = data
+            && !value.is_object()
+        {
+            return Err("Control command data must be a JSON object".to_string());
         }
 
         Ok(Self {

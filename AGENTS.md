@@ -48,3 +48,4 @@ Pull requests should explain the change, reference any related issue or audit no
 Before changing behavior, confirm the root cause with code or runtime evidence. Avoid speculative fixes, avoid noisy reruns, and resolve PR review threads after addressing them.
 For Python parity work, read the real Python source first and treat markdown analysis as index or hints only, not as the source of truth.
 Always uses rust 2024 edition
+Do not add test backdoors to production code. Avoid `#[cfg(test)]` / `#[cfg(not(test))]` behavior branches, magic `__test` values, noop implementations, or test-only constructors in production modules. When tests need to isolate network, workers, time, or external services, define an explicit dependency boundary and use a real mock library or fixture in the test module.

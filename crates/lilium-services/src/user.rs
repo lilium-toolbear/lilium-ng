@@ -2,13 +2,15 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use lilium_api_client::http::DzmmApi;
 use lilium_common::LiliumError;
-use lilium_database::DbSession;
-use lilium_database::entities::users;
-use lilium_database::orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter};
+use lilium_models::dzmm::{user as users, user::User as ApiUser, user_history};
+use sea_orm::sea_query::{Expr, OnConflict};
+use sea_orm::{
+    ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+};
 use std::collections::{HashMap, HashSet};
 use tracing::{info, instrument};
 
-use lilium_models::dzmm::user::User;
+type User = users::Model;
 
 #[derive(Debug, Clone)]
 pub struct SearchUsersParams {
@@ -55,6 +57,7 @@ pub struct UserProfile {
 }
 
 impl UpsertUserData {
+    #[allow(clippy::result_large_err)]
     #[instrument(skip(data))]
     pub fn from_api_payload(data: &serde_json::Value) -> crate::Result<Self> {
         let obj = data.as_object().ok_or_else(|| {
@@ -161,7 +164,10 @@ pub fn avatar_url_changed(existing: Option<&str>, candidate: Option<&str>) -> bo
 }
 
 #[instrument(skip(user, existing), fields(user_id = %user.user_id, existing = existing.is_some()))]
-pub fn apply_avatar_sync_plan(user: &mut User, existing: Option<&User>) -> Option<AvatarDownload> {
+pub fn apply_avatar_sync_plan(
+    user: &mut ApiUser,
+    existing: Option<&User>,
+) -> Option<AvatarDownload> {
     match existing {
         Some(existing_user) if user.avatar_url == existing_user.avatar_url => {
             user.avatar_file = existing_user.avatar_file.clone();
@@ -184,8 +190,7 @@ where
 {
     let user = users::Entity::find_by_id(user_id.to_owned())
         .one(db)
-        .await?
-        .map(Into::into);
+        .await?;
     Ok(user)
 }
 
@@ -203,153 +208,148 @@ where
         .all(db)
         .await?
         .into_iter()
-        .map(Into::into)
         .collect();
     Ok(users)
 }
 
-async fn get_by_ids_raw(session: &mut DbSession, user_ids: &[String]) -> Result<Vec<User>> {
-    if user_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let users = sqlx::query_as::<_, User>(
-        r#"SELECT user_id, full_name, avatar_url, avatar_file, bio, birthday,
-                  birthday_public, quirk, is_bot, gender, metadata, raw_data,
-                  last_seen, message_count, deleted_count, recalled_count,
-                  created_at, updated_at
-           FROM users WHERE user_id = ANY($1)"#,
-    )
-    .bind(user_ids)
-    .fetch_all(session.as_mut())
-    .await?;
-    Ok(users)
-}
-
-#[instrument(skip(session, params), fields(has_query = params.query.is_some(), limit = params.limit, offset = params.offset))]
-pub async fn search_users(
-    session: &mut DbSession,
-    params: &SearchUsersParams,
-) -> Result<Vec<User>> {
+#[instrument(skip(db, params), fields(has_query = params.query.is_some(), limit = params.limit, offset = params.offset))]
+pub async fn search_users<C>(db: &C, params: &SearchUsersParams) -> Result<Vec<User>>
+where
+    C: ConnectionTrait,
+{
     let limit = params.limit.unwrap_or(50).min(200);
     let offset = params.offset.unwrap_or(0);
 
-    let users = if let Some(ref query) = params.query {
-        if query.trim().is_empty() {
-            sqlx::query_as::<_, User>(
-                r#"SELECT user_id, full_name, avatar_url, avatar_file, bio, birthday,
-                          birthday_public, quirk, is_bot, gender, metadata, raw_data,
-                          last_seen, message_count, deleted_count, recalled_count,
-                          created_at, updated_at
-                   FROM users
-                   ORDER BY updated_at DESC
-                   LIMIT $1 OFFSET $2"#,
-            )
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(session.as_mut())
-            .await?
-        } else {
-            sqlx::query_as::<_, User>(
-                r#"SELECT user_id, full_name, avatar_url, avatar_file, bio, birthday,
-                          birthday_public, quirk, is_bot, gender, metadata, raw_data,
-                          last_seen, message_count, deleted_count, recalled_count,
-                          created_at, updated_at
-                   FROM users
-                   WHERE name_tsv @@ plainto_tsquery('simple', $1)
-                      OR user_id ILIKE '%' || $1 || '%'
-                      OR full_name ILIKE '%' || $1 || '%'
-                   ORDER BY updated_at DESC
-                   LIMIT $2 OFFSET $3"#,
-            )
-            .bind(query)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(session.as_mut())
-            .await?
-        }
-    } else {
-        sqlx::query_as::<_, User>(
-            r#"SELECT user_id, full_name, avatar_url, avatar_file, bio, birthday,
-                      birthday_public, quirk, is_bot, gender, metadata, raw_data,
-                      last_seen, message_count, deleted_count, recalled_count,
-                      created_at, updated_at
-               FROM users
-               ORDER BY updated_at DESC
-               LIMIT $1 OFFSET $2"#,
-        )
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(session.as_mut())
+    let mut query = users::Entity::find().order_by_desc(users::Column::UpdatedAt);
+    if let Some(ref query_text) = params.query
+        && !query_text.trim().is_empty()
+    {
+        query = query.filter(
+            Condition::any()
+                // `name_tsv` is a DB-maintained search vector intentionally
+                // omitted from `lilium_models::dzmm::user::Model`.
+                .add(Expr::cust_with_values(
+                    "name_tsv @@ plainto_tsquery('simple', $1)",
+                    [query_text.as_str()],
+                ))
+                .add(Expr::cust_with_values(
+                    "user_id ILIKE '%' || $1 || '%'",
+                    [query_text.as_str()],
+                ))
+                .add(Expr::cust_with_values(
+                    "full_name ILIKE '%' || $1 || '%'",
+                    [query_text.as_str()],
+                )),
+        );
+    }
+
+    let users = query
+        .limit(limit as u64)
+        .offset(offset as u64)
+        .all(db)
         .await?
-    };
+        .into_iter()
+        .collect();
 
     Ok(users)
 }
 
-#[instrument(skip(session, data), fields(user_id = %data.user_id, has_full_name = data.full_name.is_some(), has_avatar_url = data.avatar_url.is_some(), has_raw_data = data.raw_data.is_some()))]
-pub async fn upsert_user(session: &mut DbSession, data: &UpsertUserData) -> Result<User> {
+#[instrument(skip(db, data), fields(user_id = %data.user_id, has_full_name = data.full_name.is_some(), has_avatar_url = data.avatar_url.is_some(), has_raw_data = data.raw_data.is_some()))]
+pub async fn upsert_user<C>(db: &C, data: &UpsertUserData) -> Result<User>
+where
+    C: ConnectionTrait,
+{
     let now = Utc::now();
-    let existing = get_by_ids_raw(session, std::slice::from_ref(&data.user_id))
-        .await?
-        .into_iter()
-        .next();
-    if let Some(existing_user) = existing.as_ref() {
-        if has_profile_changed(existing_user, data) {
-            save_user_history(session, existing_user).await?;
-        }
+    let existing = get_by_id(db, &data.user_id).await?;
+    if let Some(existing_user) = existing.as_ref()
+        && has_profile_changed(existing_user, data)
+    {
+        save_user_history(db, existing_user).await?;
     }
 
-    let user = sqlx::query_as::<_, User>(
-        r#"INSERT INTO users (
-                user_id, full_name, avatar_url, avatar_file, bio, birthday,
-                birthday_public, quirk, is_bot, gender, metadata, raw_data,
-                last_seen, message_count, deleted_count, recalled_count,
-                created_at, updated_at
-            ) VALUES (
-                $1, $2, $3, $4, $5, $6,
-                $7, $8, $9, $10, $11, $12,
-                $13, 0, 0, 0,
-                $14, $14
-            )
-            ON CONFLICT (user_id) DO UPDATE SET
-                full_name = COALESCE(EXCLUDED.full_name, users.full_name),
-                avatar_url = COALESCE(EXCLUDED.avatar_url, users.avatar_url),
-                avatar_file = CASE
-                    WHEN EXCLUDED.avatar_url IS NOT NULL
-                         AND EXCLUDED.avatar_url IS DISTINCT FROM users.avatar_url
-                    THEN EXCLUDED.avatar_file
-                    ELSE COALESCE(EXCLUDED.avatar_file, users.avatar_file)
-                END,
-                bio = COALESCE(EXCLUDED.bio, users.bio),
-                birthday = COALESCE(EXCLUDED.birthday, users.birthday),
-                birthday_public = COALESCE(EXCLUDED.birthday_public, users.birthday_public),
-                quirk = COALESCE(EXCLUDED.quirk, users.quirk),
-                is_bot = COALESCE(EXCLUDED.is_bot, users.is_bot),
-                gender = COALESCE(EXCLUDED.gender, users.gender),
-                metadata = COALESCE(EXCLUDED.metadata, users.metadata),
-                raw_data = COALESCE(EXCLUDED.raw_data, users.raw_data),
-                last_seen = COALESCE(EXCLUDED.last_seen, users.last_seen),
-                updated_at = $14
-            RETURNING user_id, full_name, avatar_url, avatar_file, bio, birthday,
-                      birthday_public, quirk, is_bot, gender, metadata, raw_data,
-                      last_seen, message_count, deleted_count, recalled_count,
-                      created_at, updated_at"#,
+    let user = users::Entity::insert(users::ActiveModel {
+        user_id: Set(data.user_id.clone()),
+        full_name: Set(data.full_name.clone()),
+        avatar_url: Set(data.avatar_url.clone()),
+        avatar_file: Set(data.avatar_file.clone()),
+        bio: Set(data.bio.clone()),
+        birthday: Set(data.birthday.clone()),
+        birthday_public: Set(data.birthday_public),
+        quirk: Set(data.quirk.clone()),
+        is_bot: Set(data.is_bot),
+        gender: Set(data.gender.clone()),
+        metadata: Set(data.metadata.clone()),
+        raw_data: Set(data.raw_data.clone()),
+        last_seen: Set(data.last_seen),
+        message_count: Set(0),
+        deleted_count: Set(0),
+        recalled_count: Set(0),
+        created_at: Set(now),
+        updated_at: Set(now),
+    })
+    .on_conflict(
+        OnConflict::column(users::Column::UserId)
+            .values([
+                (
+                    users::Column::FullName,
+                    Expr::cust("COALESCE(EXCLUDED.full_name, users.full_name)"),
+                ),
+                (
+                    users::Column::AvatarUrl,
+                    Expr::cust("COALESCE(EXCLUDED.avatar_url, users.avatar_url)"),
+                ),
+                (
+                    users::Column::AvatarFile,
+                    Expr::cust(
+                        r#"CASE
+                            WHEN EXCLUDED.avatar_url IS NOT NULL
+                                 AND EXCLUDED.avatar_url IS DISTINCT FROM users.avatar_url
+                            THEN EXCLUDED.avatar_file
+                            ELSE COALESCE(EXCLUDED.avatar_file, users.avatar_file)
+                        END"#,
+                    ),
+                ),
+                (
+                    users::Column::Bio,
+                    Expr::cust("COALESCE(EXCLUDED.bio, users.bio)"),
+                ),
+                (
+                    users::Column::Birthday,
+                    Expr::cust("COALESCE(EXCLUDED.birthday, users.birthday)"),
+                ),
+                (
+                    users::Column::BirthdayPublic,
+                    Expr::cust("COALESCE(EXCLUDED.birthday_public, users.birthday_public)"),
+                ),
+                (
+                    users::Column::Quirk,
+                    Expr::cust("COALESCE(EXCLUDED.quirk, users.quirk)"),
+                ),
+                (
+                    users::Column::IsBot,
+                    Expr::cust("COALESCE(EXCLUDED.is_bot, users.is_bot)"),
+                ),
+                (
+                    users::Column::Gender,
+                    Expr::cust("COALESCE(EXCLUDED.gender, users.gender)"),
+                ),
+                (
+                    users::Column::Metadata,
+                    Expr::cust("COALESCE(EXCLUDED.metadata, users.metadata)"),
+                ),
+                (
+                    users::Column::RawData,
+                    Expr::cust("COALESCE(EXCLUDED.raw_data, users.raw_data)"),
+                ),
+                (
+                    users::Column::LastSeen,
+                    Expr::cust("COALESCE(EXCLUDED.last_seen, users.last_seen)"),
+                ),
+                (users::Column::UpdatedAt, Expr::cust("EXCLUDED.updated_at")),
+            ])
+            .to_owned(),
     )
-    .bind(&data.user_id)
-    .bind(&data.full_name)
-    .bind(&data.avatar_url)
-    .bind(&data.avatar_file)
-    .bind(&data.bio)
-    .bind(&data.birthday)
-    .bind(data.birthday_public)
-    .bind(&data.quirk)
-    .bind(data.is_bot)
-    .bind(&data.gender)
-    .bind(&data.metadata)
-    .bind(&data.raw_data)
-    .bind(data.last_seen)
-    .bind(now)
-    .fetch_one(session.as_mut())
+    .exec_with_returning(db)
     .await
     .context("Failed to upsert user")?;
 
@@ -383,88 +383,123 @@ fn has_profile_changed(existing: &User, data: &UpsertUserData) -> bool {
             .is_some_and(|value| existing.gender.as_ref() != Some(value))
 }
 
-async fn save_user_history(session: &mut DbSession, user: &User) -> Result<()> {
-    sqlx::query(
-        r#"INSERT INTO user_history (
-               user_id, full_name, avatar_url, bio, birthday, birthday_public,
-               quirk, is_bot, gender, metadata, raw_data, recorded_at, avatar_file
-           ) VALUES (
-               $1, $2, $3, $4, $5, $6,
-               $7, $8, $9, $10, $11, NOW(), $12
-           )"#,
-    )
-    .bind(&user.user_id)
-    .bind(&user.full_name)
-    .bind(&user.avatar_url)
-    .bind(&user.bio)
-    .bind(&user.birthday)
-    .bind(user.birthday_public)
-    .bind(&user.quirk)
-    .bind(user.is_bot)
-    .bind(&user.gender)
-    .bind(&user.metadata)
-    .bind(&user.raw_data)
-    .bind(&user.avatar_file)
-    .execute(session.as_mut())
+async fn save_user_history<C>(db: &C, user: &User) -> Result<()>
+where
+    C: ConnectionTrait,
+{
+    user_history::Entity::insert(user_history::ActiveModel {
+        user_id: Set(user.user_id.clone()),
+        full_name: Set(user.full_name.clone()),
+        avatar_url: Set(user.avatar_url.clone()),
+        bio: Set(user.bio.clone()),
+        birthday: Set(user.birthday.clone()),
+        birthday_public: Set(user.birthday_public),
+        quirk: Set(user.quirk.clone()),
+        is_bot: Set(user.is_bot),
+        gender: Set(user.gender.clone()),
+        metadata: Set(user.metadata.clone()),
+        raw_data: Set(user.raw_data.clone()),
+        recorded_at: Set(Utc::now()),
+        avatar_file: Set(user.avatar_file.clone()),
+        ..Default::default()
+    })
+    .exec_without_returning(db)
     .await
     .context("Failed to save user history")?;
 
     Ok(())
 }
 
-#[instrument(skip(session), fields(user_id = %user_id))]
-pub async fn increment_message_count(session: &mut DbSession, user_id: &str) -> Result<()> {
-    sqlx::query(
-        r#"INSERT INTO users (user_id, message_count, deleted_count, recalled_count, created_at, updated_at)
-           VALUES ($1, 1, 0, 0, NOW(), NOW())
-           ON CONFLICT (user_id) DO UPDATE SET
-               message_count = users.message_count + 1,
-               updated_at = NOW()"#,
-    )
-    .bind(user_id)
-    .execute(session.as_mut())
-    .await
-    .context("Failed to increment message count")?;
+#[instrument(skip(db), fields(user_id = %user_id))]
+pub async fn increment_message_count<C>(db: &C, user_id: &str) -> Result<()>
+where
+    C: ConnectionTrait,
+{
+    increment_user_counter(db, user_id, users::Column::MessageCount, (1, 0, 0))
+        .await
+        .context("Failed to increment message count")?;
     Ok(())
 }
 
-#[instrument(skip(session), fields(user_id = %user_id))]
-pub async fn increment_deleted_count(session: &mut DbSession, user_id: &str) -> Result<()> {
-    sqlx::query(
-        r#"INSERT INTO users (user_id, message_count, deleted_count, recalled_count, created_at, updated_at)
-           VALUES ($1, 0, 1, 0, NOW(), NOW())
-           ON CONFLICT (user_id) DO UPDATE SET
-               deleted_count = users.deleted_count + 1,
-               updated_at = NOW()"#,
-    )
-    .bind(user_id)
-    .execute(session.as_mut())
-    .await
-    .context("Failed to increment deleted count")?;
+#[instrument(skip(db), fields(user_id = %user_id))]
+pub async fn increment_deleted_count<C>(db: &C, user_id: &str) -> Result<()>
+where
+    C: ConnectionTrait,
+{
+    increment_user_counter(db, user_id, users::Column::DeletedCount, (0, 1, 0))
+        .await
+        .context("Failed to increment deleted count")?;
     Ok(())
 }
 
-#[instrument(skip(session), fields(user_id = %user_id))]
-pub async fn increment_recalled_count(session: &mut DbSession, user_id: &str) -> Result<()> {
-    sqlx::query(
-        r#"INSERT INTO users (user_id, message_count, deleted_count, recalled_count, created_at, updated_at)
-           VALUES ($1, 0, 0, 1, NOW(), NOW())
-           ON CONFLICT (user_id) DO UPDATE SET
-               recalled_count = users.recalled_count + 1,
-               updated_at = NOW()"#,
-    )
-    .bind(user_id)
-    .execute(session.as_mut())
-    .await
-    .context("Failed to increment recalled count")?;
+#[instrument(skip(db), fields(user_id = %user_id))]
+pub async fn increment_recalled_count<C>(db: &C, user_id: &str) -> Result<()>
+where
+    C: ConnectionTrait,
+{
+    increment_user_counter(db, user_id, users::Column::RecalledCount, (0, 0, 1))
+        .await
+        .context("Failed to increment recalled count")?;
     Ok(())
 }
 
-#[instrument(skip(session, user_room_pairs), fields(pair_count = user_room_pairs.len()))]
-pub async fn batch_fetch_and_update(
-    session: &mut DbSession,
+async fn increment_user_counter<C>(
+    db: &C,
+    user_id: &str,
+    counter: users::Column,
+    initial_counts: (i32, i32, i32),
+) -> Result<()>
+where
+    C: ConnectionTrait,
+{
+    let now = Utc::now();
+    if let Some(user) = get_by_id(db, user_id).await? {
+        let mut active = users::ActiveModel {
+            user_id: Set(user.user_id),
+            updated_at: Set(now),
+            ..Default::default()
+        };
+
+        match counter {
+            users::Column::MessageCount => {
+                active.message_count = Set(user.message_count + 1);
+            }
+            users::Column::DeletedCount => {
+                active.deleted_count = Set(user.deleted_count + 1);
+            }
+            users::Column::RecalledCount => {
+                active.recalled_count = Set(user.recalled_count + 1);
+            }
+            _ => unreachable!("counter must be a user count column"),
+        }
+
+        users::Entity::update(active).exec(db).await?;
+    } else {
+        users::Entity::insert(users::ActiveModel {
+            user_id: Set(user_id.to_owned()),
+            message_count: Set(initial_counts.0),
+            deleted_count: Set(initial_counts.1),
+            recalled_count: Set(initial_counts.2),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        })
+        .on_conflict_do_nothing()
+        .exec(db)
+        .await?;
+    }
+
+    Ok(())
+}
+
+#[instrument(skip(db, user_room_pairs), fields(pair_count = user_room_pairs.len()))]
+pub async fn batch_fetch_and_update<C>(
+    db: &C,
     user_room_pairs: &[(String, String)],
-) -> Result<(i64, i64)> {
+) -> Result<(i64, i64)>
+where
+    C: ConnectionTrait,
+{
     // This is the lightweight DB-only fallback used by the event processor.
     // The Python implementation performs API fetch + cache checks + avatar
     // download in higher-level sync code. That richer flow is represented in
@@ -483,7 +518,7 @@ pub async fn batch_fetch_and_update(
 
     let mut existing_users = Vec::new();
     for chunk in unique_user_ids.chunks(5000) {
-        existing_users.extend(get_by_ids_raw(session, chunk).await?);
+        existing_users.extend(get_by_ids(db, chunk).await?);
     }
     let existing_users: HashMap<String, User> = existing_users
         .into_iter()
@@ -496,21 +531,28 @@ pub async fn batch_fetch_and_update(
 
     for user_id in unique_user_ids {
         if existing_users.contains_key(&user_id) {
-            sqlx::query("UPDATE users SET last_seen = $2, updated_at = $2 WHERE user_id = $1")
-                .bind(user_id)
-                .bind(now)
-                .execute(session.as_mut())
+            users::Entity::update_many()
+                .set(users::ActiveModel {
+                    last_seen: Set(Some(now)),
+                    updated_at: Set(now),
+                    ..Default::default()
+                })
+                .filter(users::Column::UserId.eq(user_id))
+                .exec(db)
                 .await?;
             updated_count += 1;
         } else {
-            sqlx::query(
-                r#"INSERT INTO users (user_id, created_at, updated_at)
-                   VALUES ($1, $2, $2)
-                   ON CONFLICT (user_id) DO NOTHING"#,
-            )
-            .bind(user_id)
-            .bind(now)
-            .execute(session.as_mut())
+            users::Entity::insert(users::ActiveModel {
+                user_id: Set(user_id),
+                message_count: Set(0),
+                deleted_count: Set(0),
+                recalled_count: Set(0),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            })
+            .on_conflict_do_nothing()
+            .exec(db)
             .await?;
             new_count += 1;
         }
@@ -526,13 +568,16 @@ pub async fn batch_fetch_and_update(
     Ok((new_count, updated_count))
 }
 
-#[instrument(skip(session, auth, user_room_pairs), fields(pair_count = user_room_pairs.len(), cache_hours))]
-pub async fn batch_fetch_and_update_with_auth(
-    session: &mut DbSession,
+#[instrument(skip(db, auth, user_room_pairs), fields(pair_count = user_room_pairs.len(), cache_hours))]
+pub async fn batch_fetch_and_update_with_auth<C>(
+    db: &C,
     auth: &DzmmApi,
     user_room_pairs: &[(String, String)],
     cache_hours: i64,
-) -> Result<BatchFetchUsersResult> {
+) -> Result<BatchFetchUsersResult>
+where
+    C: ConnectionTrait,
+{
     let mut seen = HashSet::new();
     let mut unique_user_ids = Vec::new();
     let mut user_to_room = HashMap::new();
@@ -551,7 +596,7 @@ pub async fn batch_fetch_and_update_with_auth(
 
     let mut existing_users = Vec::new();
     for chunk in unique_user_ids.chunks(5000) {
-        existing_users.extend(get_by_ids_raw(session, chunk).await?);
+        existing_users.extend(get_by_ids(db, chunk).await?);
     }
     let existing_users: HashMap<String, User> = existing_users
         .into_iter()
@@ -591,7 +636,7 @@ pub async fn batch_fetch_and_update_with_auth(
 
         let fetched = auth.batch_get_user_info(&pairs_to_fetch).await?;
         for (user_data, (user_id, _room_id)) in fetched.into_iter().zip(pairs_to_fetch) {
-            let Some(mut user) = User::from_api(&user_data) else {
+            let Some(mut user) = ApiUser::from_api(&user_data) else {
                 continue;
             };
 
@@ -616,8 +661,8 @@ pub async fn batch_fetch_and_update_with_auth(
                 last_seen: user.last_seen,
             };
 
-            let is_new = existing_users.get(&user.user_id).is_none();
-            upsert_user(session, &data).await?;
+            let is_new = !existing_users.contains_key(&user.user_id);
+            upsert_user(db, &data).await?;
             if is_new {
                 new_count += 1;
             } else {
@@ -661,6 +706,7 @@ where
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
+    use sea_orm::PaginatorTrait;
     use serde_json::json;
 
     mod user_struct {
@@ -721,7 +767,7 @@ mod tests {
         }
     }
 
-    mod user_service_integration {
+    mod user_integration {
         use super::*;
 
         #[tokio::test]
@@ -991,11 +1037,10 @@ mod tests {
                     .await
                     .expect("insert initial");
 
-                let initial_history_count: i64 =
-                    sqlx::query_scalar("SELECT COUNT(*) FROM user_history WHERE user_id = $1")
-                        .bind("history_user")
-                        .fetch_one(session.as_mut())
-                        .await?;
+                let initial_history_count = user_history::Entity::find()
+                    .filter(user_history::Column::UserId.eq("history_user"))
+                    .count(session)
+                    .await?;
                 assert_eq!(initial_history_count, 0);
 
                 let changed = UpsertUserData {
@@ -1008,24 +1053,19 @@ mod tests {
                     .await
                     .expect("upsert changed");
 
-                let snapshot =
-                    sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>)>(
-                        r#"SELECT user_id, full_name, avatar_url, bio
-                       FROM user_history WHERE user_id = $1"#,
-                    )
-                    .bind("history_user")
-                    .fetch_one(session.as_mut())
-                    .await?;
+                let snapshot = user_history::Entity::find()
+                    .filter(user_history::Column::UserId.eq("history_user"))
+                    .one(session)
+                    .await?
+                    .expect("history snapshot");
 
+                assert_eq!(snapshot.user_id, "history_user");
+                assert_eq!(snapshot.full_name.as_deref(), Some("Old Name"));
                 assert_eq!(
-                    snapshot,
-                    (
-                        "history_user".to_string(),
-                        Some("Old Name".to_string()),
-                        Some("https://example.com/old.png".to_string()),
-                        Some("old bio".to_string()),
-                    )
+                    snapshot.avatar_url.as_deref(),
+                    Some("https://example.com/old.png")
                 );
+                assert_eq!(snapshot.bio.as_deref(), Some("old bio"));
 
                 Ok(())
             })

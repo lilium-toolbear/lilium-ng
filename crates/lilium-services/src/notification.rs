@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::Result;
+use lilium_database::{NotificationConnection, NotificationDatabaseConfig};
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::time::timeout;
 use tracing::instrument;
@@ -15,13 +16,50 @@ struct Subscriber {
 
 pub struct NotificationService {
     subscribers: Arc<RwLock<Vec<Subscriber>>>,
+    listener: Option<NotificationConnection>,
+}
+
+impl Default for NotificationService {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl NotificationService {
     pub fn new() -> Self {
         Self {
             subscribers: Arc::new(RwLock::new(Vec::new())),
+            listener: None,
         }
+    }
+
+    pub async fn attach_listener(&mut self, config: NotificationDatabaseConfig) -> Result<()> {
+        let listener = NotificationConnection::connect(config)
+            .await
+            .map_err(|error| lilium_common::LiliumError::database(error.to_string()))?;
+        self.listener = Some(listener);
+        Ok(())
+    }
+
+    pub async fn listen_channel(&mut self, channel: &str) -> Result<()> {
+        let listener = self.listener.as_mut().ok_or_else(|| {
+            lilium_common::LiliumError::config("notification listener is not attached")
+        })?;
+        listener
+            .listen(channel)
+            .await
+            .map_err(|error| lilium_common::LiliumError::database(error.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn receive_payload(&mut self) -> Result<Option<String>> {
+        let listener = self.listener.as_mut().ok_or_else(|| {
+            lilium_common::LiliumError::config("notification listener is not attached")
+        })?;
+        listener
+            .try_recv_payload()
+            .await
+            .map_err(|error| lilium_common::LiliumError::database(error.to_string()))
     }
 
     #[instrument(skip(self), fields(channel = %channel))]
@@ -294,5 +332,17 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_receive_payload_without_listener_errors() {
+        let mut service = NotificationService::new();
+        let error = service.receive_payload().await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("notification listener is not attached")
+        );
     }
 }

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
-use lilium_database::DbSession;
-use sqlx::QueryBuilder;
+use lilium_models::dzmm::{account as dzmm_account, room as rooms, user as users};
+use sea_orm::{ConnectionTrait, EntityTrait, Set};
 
 #[derive(Copy, Clone, Debug)]
 struct UserSeed {
@@ -111,146 +111,114 @@ const MESSAGE_SERVICE_TEST_ROOMS: &[RoomSeed] = &[RoomSeed {
     is_active: true,
 }];
 
-pub async fn seed_shared_profile(session: &mut DbSession) -> Result<()> {
-    seed_users(session, DEFAULT_TEST_USERS).await
+pub async fn seed_shared_profile<C: ConnectionTrait>(db: &C) -> Result<()> {
+    seed_users(db, DEFAULT_TEST_USERS).await
 }
 
-pub async fn seed_user_profile(session: &mut DbSession) -> Result<()> {
-    seed_users(session, DEFAULT_TEST_USERS).await
+pub async fn seed_user_profile<C: ConnectionTrait>(db: &C) -> Result<()> {
+    seed_users(db, DEFAULT_TEST_USERS).await
 }
 
-pub async fn seed_message_profile(session: &mut DbSession) -> Result<()> {
-    seed_users(session, MESSAGE_SERVICE_TEST_USERS).await?;
-    seed_rooms(session, MESSAGE_SERVICE_TEST_ROOMS).await
+pub async fn seed_message_profile<C: ConnectionTrait>(db: &C) -> Result<()> {
+    seed_users(db, MESSAGE_SERVICE_TEST_USERS).await?;
+    seed_rooms(db, MESSAGE_SERVICE_TEST_ROOMS).await
 }
 
-pub async fn seed_websocket_profile(session: &mut DbSession) -> Result<()> {
-    seed_users(session, WEBSOCKET_SERVICE_TEST_USERS).await?;
-    seed_dzmm_accounts(session, WEBSOCKET_SERVICE_ACCOUNT_USER_IDS).await
+pub async fn seed_websocket_profile<C: ConnectionTrait>(db: &C) -> Result<()> {
+    seed_users(db, WEBSOCKET_SERVICE_TEST_USERS).await?;
+    seed_dzmm_accounts(db, WEBSOCKET_SERVICE_ACCOUNT_USER_IDS).await
 }
 
-pub async fn seed_test_users(session: &mut DbSession, user_ids: &[&str]) -> Result<()> {
+pub async fn seed_test_users<C: ConnectionTrait>(db: &C, user_ids: &[&str]) -> Result<()> {
     if user_ids.is_empty() {
         return Ok(());
     }
 
     let now = Utc::now();
-    let mut query = QueryBuilder::new(
-        "INSERT INTO users (\
-            user_id, full_name, message_count, deleted_count, recalled_count, created_at, updated_at\
-        ) ",
-    );
-    query.push_values(user_ids, |mut row, user_id| {
-        row.push_bind(user_id);
-        let full_name: Option<&str> = None;
-        row.push_bind(full_name);
-        row.push_bind(0_i32);
-        row.push_bind(0_i32);
-        row.push_bind(0_i32);
-        row.push_bind(now);
-        row.push_bind(now);
-    });
-    query.push(" ON CONFLICT (user_id) DO UPDATE SET full_name = EXCLUDED.full_name");
-
-    query
-        .build()
-        .execute(session.as_mut())
-        .await
-        .context("seed test users")?;
+    users::Entity::insert_many(user_ids.iter().map(|user_id| users::ActiveModel {
+        user_id: Set((*user_id).to_owned()),
+        full_name: Set(None),
+        message_count: Set(0),
+        deleted_count: Set(0),
+        recalled_count: Set(0),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }))
+    .exec(db)
+    .await
+    .context("seed test users")?;
 
     Ok(())
 }
 
-async fn seed_users(session: &mut DbSession, users: &[UserSeed]) -> Result<()> {
-    if users.is_empty() {
+async fn seed_users<C: ConnectionTrait>(db: &C, users_to_seed: &[UserSeed]) -> Result<()> {
+    if users_to_seed.is_empty() {
         return Ok(());
     }
 
     let now = Utc::now();
-    let mut query = QueryBuilder::new(
-        "INSERT INTO users (\
-            user_id, full_name, message_count, deleted_count, recalled_count, created_at, updated_at\
-        ) ",
-    );
-    query.push_values(users, |mut row, user| {
-        row.push_bind(user.user_id);
-        row.push_bind(user.full_name);
-        row.push_bind(user.message_count);
-        row.push_bind(user.deleted_count);
-        row.push_bind(user.recalled_count);
-        row.push_bind(now);
-        row.push_bind(now);
-    });
-    query.push(" ON CONFLICT (user_id) DO UPDATE SET full_name = EXCLUDED.full_name");
-
-    query
-        .build()
-        .execute(session.as_mut())
-        .await
-        .context("seed users")?;
+    users::Entity::insert_many(users_to_seed.iter().map(|user| users::ActiveModel {
+        user_id: Set(user.user_id.to_owned()),
+        full_name: Set(user.full_name.map(str::to_owned)),
+        message_count: Set(user.message_count),
+        deleted_count: Set(user.deleted_count),
+        recalled_count: Set(user.recalled_count),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }))
+    .exec(db)
+    .await
+    .context("seed users")?;
 
     Ok(())
 }
 
-async fn seed_rooms(session: &mut DbSession, rooms: &[RoomSeed]) -> Result<()> {
-    if rooms.is_empty() {
+async fn seed_rooms<C: ConnectionTrait>(db: &C, rooms_to_seed: &[RoomSeed]) -> Result<()> {
+    if rooms_to_seed.is_empty() {
         return Ok(());
     }
 
     let now = Utc::now();
-    let mut query = QueryBuilder::new(
-        "INSERT INTO rooms (\
-            room_id, title, history_complete, message_count, deleted_count, recalled_count,\
-            edited_count, image_count, is_active, created_at, updated_at\
-        ) ",
-    );
-    query.push_values(rooms, |mut row, room| {
-        row.push_bind(room.room_id);
-        row.push_bind(room.title);
-        row.push_bind(room.history_complete);
-        row.push_bind(room.message_count);
-        row.push_bind(room.deleted_count);
-        row.push_bind(room.recalled_count);
-        row.push_bind(room.edited_count);
-        row.push_bind(room.image_count);
-        row.push_bind(room.is_active);
-        row.push_bind(now);
-        row.push_bind(now);
-    });
-    query.push(" ON CONFLICT (room_id) DO UPDATE SET title = EXCLUDED.title");
-
-    query
-        .build()
-        .execute(session.as_mut())
-        .await
-        .context("seed rooms")?;
+    rooms::Entity::insert_many(rooms_to_seed.iter().map(|room| rooms::ActiveModel {
+        room_id: Set(room.room_id.to_owned()),
+        title: Set(room.title.to_owned()),
+        history_complete: Set(room.history_complete),
+        message_count: Set(room.message_count),
+        deleted_count: Set(room.deleted_count),
+        recalled_count: Set(room.recalled_count),
+        edited_count: Set(room.edited_count),
+        image_count: Set(room.image_count),
+        is_active: Set(room.is_active),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }))
+    .exec(db)
+    .await
+    .context("seed rooms")?;
 
     Ok(())
 }
 
-async fn seed_dzmm_accounts(session: &mut DbSession, user_ids: &[&str]) -> Result<()> {
+async fn seed_dzmm_accounts<C: ConnectionTrait>(db: &C, user_ids: &[&str]) -> Result<()> {
     if user_ids.is_empty() {
         return Ok(());
     }
 
     let now = Utc::now();
-    let mut query = QueryBuilder::new(
-        "INSERT INTO dzmm_account (user_id, user_profile, is_enabled, created_at, updated_at) ",
-    );
-    query.push_values(user_ids, |mut row, user_id| {
-        row.push_bind(user_id);
-        row.push_bind(serde_json::json!({}));
-        row.push_bind(true);
-        row.push_bind(now);
-        row.push_bind(now);
-    });
-    query.push(" ON CONFLICT (user_id) DO UPDATE SET updated_at = EXCLUDED.updated_at");
-
-    query
-        .build()
-        .execute(session.as_mut())
-        .await
-        .context("seed dzmm_account")?;
+    dzmm_account::Entity::insert_many(user_ids.iter().map(|user_id| dzmm_account::ActiveModel {
+        user_id: Set((*user_id).to_owned()),
+        user_profile: Set(serde_json::json!({})),
+        is_enabled: Set(true),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }))
+    .exec(db)
+    .await
+    .context("seed dzmm_account")?;
 
     Ok(())
 }

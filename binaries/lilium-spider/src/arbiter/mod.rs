@@ -1,14 +1,12 @@
 use anyhow::Result;
 use lilium_database::Database;
-use lilium_services::account_service;
+use lilium_services::account;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::UnixListener;
 use tokio::sync::{Notify, RwLock};
 use tracing::{error, info, warn};
-
-#[cfg(test)]
-use std::path::PathBuf;
 
 use crate::config::Config;
 use crate::control::{
@@ -19,6 +17,7 @@ pub struct Arbiter {
     config: Config,
     database: Database,
     workers: Arc<RwLock<HashMap<String, WorkerHandle>>>,
+    worker_spawner: Arc<dyn WorkerSpawner>,
     shutdown: Arc<tokio::sync::Notify>,
 }
 
@@ -26,12 +25,75 @@ struct WorkerHandle {
     shutdown: Arc<Notify>,
 }
 
+#[derive(Clone)]
+struct WorkerSpec {
+    account: String,
+    database: Database,
+    queue_size: usize,
+    batch_size: usize,
+    buffer_dir: PathBuf,
+    websocket_url: String,
+    reconnect_delay_ms: u64,
+}
+
+trait WorkerSpawner: Send + Sync {
+    fn spawn_worker(&self, spec: WorkerSpec) -> WorkerHandle;
+}
+
+struct TokioWorkerSpawner;
+
+impl WorkerSpawner for TokioWorkerSpawner {
+    fn spawn_worker(&self, spec: WorkerSpec) -> WorkerHandle {
+        let shutdown = Arc::new(Notify::new());
+        let worker_shutdown = shutdown.clone();
+
+        tokio::spawn(async move {
+            let WorkerSpec {
+                account,
+                database,
+                queue_size,
+                batch_size,
+                buffer_dir,
+                websocket_url,
+                reconnect_delay_ms,
+            } = spec;
+
+            info!(account = %account, "Worker starting");
+            let worker = super::worker::Worker::new(
+                account.clone(),
+                database,
+                queue_size,
+                batch_size,
+                buffer_dir,
+                websocket_url,
+                reconnect_delay_ms,
+            );
+            if let Err(e) = worker.run(worker_shutdown).await {
+                error!(account = %account, error = %e, "Worker failed");
+            } else {
+                info!(account = %account, "Worker exited");
+            }
+        });
+
+        WorkerHandle { shutdown }
+    }
+}
+
 impl Arbiter {
     pub fn new(config: Config, database: Database) -> Self {
+        Self::with_worker_spawner(config, database, Arc::new(TokioWorkerSpawner))
+    }
+
+    fn with_worker_spawner(
+        config: Config,
+        database: Database,
+        worker_spawner: Arc<dyn WorkerSpawner>,
+    ) -> Self {
         Self {
             config,
             database,
             workers: Arc::new(RwLock::new(HashMap::new())),
+            worker_spawner,
             shutdown: Arc::new(tokio::sync::Notify::new()),
         }
     }
@@ -83,7 +145,7 @@ impl Arbiter {
 
     async fn load_enabled_accounts(&self) -> Result<Vec<String>> {
         lilium_database::transaction!(self.database, |session| {
-            let accounts = account_service::list_accounts(session, true).await?;
+            let accounts = account::list_accounts(session, true).await?;
             Ok(accounts
                 .into_iter()
                 .map(|account| account.user_id)
@@ -100,49 +162,17 @@ impl Arbiter {
         }
 
         let account = account_id.to_string();
-        let shutdown = Arc::new(Notify::new());
-        let worker_shutdown = shutdown.clone();
-        let database = self.database.clone();
-        let websocket_url = self.config.worker.websocket_url.clone();
-        let reconnect_delay_ms = self.config.worker.reconnect_delay_ms;
-        let queue_size = self.config.worker.queue_size;
-        let batch_size = self.config.worker.batch_size;
-        let buffer_dir = self.config.worker.buffer_dir.clone();
-
-        #[cfg(test)]
-        tokio::spawn(async move {
-            let _ = (
-                database,
-                queue_size,
-                batch_size,
-                buffer_dir,
-                websocket_url,
-                reconnect_delay_ms,
-                worker_shutdown,
-            );
-            info!(account = %account, "Worker starting (test noop)");
+        let handle = self.worker_spawner.spawn_worker(WorkerSpec {
+            account,
+            database: self.database.clone(),
+            queue_size: self.config.worker.queue_size,
+            batch_size: self.config.worker.batch_size,
+            buffer_dir: self.config.worker.buffer_dir.clone(),
+            websocket_url: self.config.worker.websocket_url.clone(),
+            reconnect_delay_ms: self.config.worker.reconnect_delay_ms,
         });
 
-        #[cfg(not(test))]
-        tokio::spawn(async move {
-            info!(account = %account, "Worker starting");
-            let worker = super::worker::Worker::new(
-                account.clone(),
-                database,
-                queue_size,
-                batch_size,
-                buffer_dir,
-                websocket_url,
-                reconnect_delay_ms,
-            );
-            if let Err(e) = worker.run(worker_shutdown).await {
-                error!(account = %account, error = %e, "Worker failed");
-            } else {
-                info!(account = %account, "Worker exited");
-            }
-        });
-
-        workers.insert(account_id.to_string(), WorkerHandle { shutdown });
+        workers.insert(account_id.to_string(), handle);
         Ok(())
     }
 
@@ -280,6 +310,7 @@ impl Arbiter {
             config: self.config.clone(),
             database: self.database.clone(),
             workers: self.workers.clone(),
+            worker_spawner: self.worker_spawner.clone(),
             shutdown: self.shutdown.clone(),
         }
     }
@@ -288,6 +319,14 @@ impl Arbiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mockall::mock! {
+        WorkerSpawner {}
+
+        impl WorkerSpawner for WorkerSpawner {
+            fn spawn_worker(&self, spec: WorkerSpec) -> WorkerHandle;
+        }
+    }
 
     #[tokio::test]
     async fn test_arbiter_start_stop() {
@@ -301,6 +340,7 @@ mod tests {
                 url: "postgres://localhost/lilium_test".to_string(),
                 max_connections: 1,
             },
+            notification_url: "postgres://localhost/lilium_test".to_string(),
             worker: crate::config::WorkerConfig {
                 queue_size: 100,
                 batch_size: 10,
@@ -311,7 +351,20 @@ mod tests {
             },
         };
 
-        let arbiter = Arbiter::new(config, test_db.database().clone());
+        let mut worker_spawner = MockWorkerSpawner::new();
+        worker_spawner
+            .expect_spawn_worker()
+            .withf(|spec| spec.account == "test_user")
+            .times(1)
+            .returning(|_| WorkerHandle {
+                shutdown: Arc::new(Notify::new()),
+            });
+
+        let arbiter = Arbiter::with_worker_spawner(
+            config,
+            test_db.database().clone(),
+            Arc::new(worker_spawner),
+        );
         arbiter.start_worker("test_user").await.unwrap();
         assert!(arbiter.workers.read().await.contains_key("test_user"));
 

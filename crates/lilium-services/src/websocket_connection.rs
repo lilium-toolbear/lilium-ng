@@ -1,11 +1,17 @@
 use crate::Result;
 use chrono::{Duration, Utc};
-use lilium_database::DbSession;
+use lilium_models::dzmm::websocket_connection as websocket_connections;
 use md5::{Digest, Md5};
+use sea_orm::sea_query::Expr;
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set,
+    Statement, Value,
+};
 
 use lilium_common::error::LiliumError;
-use lilium_models::dzmm::websocket_connection::WebsocketConnection;
 use tracing::instrument;
+
+type WebsocketConnection = websocket_connections::Model;
 
 #[instrument(fields(account_user_id = %account_user_id))]
 pub fn calculate_lock_id(account_user_id: &str) -> i64 {
@@ -16,22 +22,60 @@ pub fn calculate_lock_id(account_user_id: &str) -> i64 {
     lock_id as i64
 }
 
-#[instrument(skip(session), fields(user_id = %user_id))]
-pub async fn acquire_connection_lock(session: &mut DbSession, user_id: &str) -> Result<i64> {
-    let lock_id = calculate_lock_id(user_id);
-    acquire_connection_lock_inner(session, lock_id, user_id).await
+fn split_advisory_lock_id(lock_id: i64) -> (i64, i64) {
+    (lock_id >> 32, lock_id & 0xFFFFFFFF)
 }
 
-#[instrument(skip(session), fields(lock_id, user_id = %user_id))]
+fn statement<C: ConnectionTrait>(db: &C, sql: impl Into<String>, values: Vec<Value>) -> Statement {
+    Statement::from_sql_and_values(db.get_database_backend(), sql, values)
+}
+
+async fn query_bool<C: ConnectionTrait>(
+    db: &C,
+    sql: impl Into<String>,
+    values: Vec<Value>,
+) -> Result<bool> {
+    let row = db
+        .query_one(statement(db, sql, values))
+        .await?
+        .ok_or_else(|| LiliumError::database("expected one boolean row"))?;
+    row.try_get("", "value")
+        .map_err(|error| LiliumError::database(error.to_string()))
+}
+
+#[allow(clippy::result_large_err)]
+async fn query_i64s<C: ConnectionTrait>(
+    db: &C,
+    sql: impl Into<String>,
+    values: Vec<Value>,
+) -> Result<Vec<i64>> {
+    let rows = db.query_all(statement(db, sql, values)).await?;
+    rows.into_iter()
+        .map(|row| {
+            row.try_get("", "value")
+                .map_err(|error| LiliumError::database(error.to_string()))
+        })
+        .collect()
+}
+
+#[instrument(skip(db), fields(user_id = %user_id))]
+pub async fn acquire_connection_lock(db: &impl ConnectionTrait, user_id: &str) -> Result<i64> {
+    let lock_id = calculate_lock_id(user_id);
+    acquire_connection_lock_inner(db, lock_id, user_id).await
+}
+
+#[instrument(skip(db), fields(lock_id, user_id = %user_id))]
 async fn acquire_connection_lock_inner(
-    session: &mut DbSession,
+    db: &impl ConnectionTrait,
     lock_id: i64,
     user_id: &str,
 ) -> Result<i64> {
-    let lock_acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
-        .bind(lock_id)
-        .fetch_one(session.as_mut())
-        .await?;
+    let lock_acquired = query_bool(
+        db,
+        "SELECT pg_try_advisory_lock($1) AS value",
+        vec![lock_id.into()],
+    )
+    .await?;
 
     if !lock_acquired {
         return Err(LiliumError::connection_conflict(
@@ -40,69 +84,67 @@ async fn acquire_connection_lock_inner(
         ));
     }
 
-    replace_connection_record(session, lock_id, user_id).await?;
+    replace_connection_record(db, lock_id, user_id).await?;
 
     Ok(lock_id)
 }
 
-#[instrument(skip(session), fields(lock_id, user_id = %user_id))]
+#[instrument(skip(db), fields(lock_id, user_id = %user_id))]
 async fn replace_connection_record(
-    session: &mut DbSession,
+    db: &impl ConnectionTrait,
     lock_id: i64,
     user_id: &str,
 ) -> Result<()> {
-    sqlx::query("DELETE FROM websocket_connections WHERE lock_id = $1")
-        .bind(lock_id)
-        .execute(session.as_mut())
+    websocket_connections::Entity::delete_many()
+        .filter(websocket_connections::Column::LockId.eq(lock_id))
+        .exec(db)
         .await?;
 
     let now = Utc::now();
-    sqlx::query(
-        "INSERT INTO websocket_connections (lock_id, account_user_id, connected_at, last_heartbeat)
-             VALUES ($1, $2, $3, $4)",
-    )
-    .bind(lock_id)
-    .bind(user_id)
-    .bind(now)
-    .bind(now)
-    .execute(session.as_mut())
+    websocket_connections::ActiveModel {
+        lock_id: Set(lock_id),
+        account_user_id: Set(user_id.to_owned()),
+        connected_at: Set(now),
+        last_heartbeat: Set(now),
+    }
+    .insert(db)
     .await?;
     Ok(())
 }
 
-#[instrument(skip(session), fields(user_id = %user_id, has_expected_lock_id = expected_lock_id.is_some()))]
+#[instrument(skip(db), fields(user_id = %user_id, has_expected_lock_id = expected_lock_id.is_some()))]
 pub async fn ensure_connection_lock(
-    session: &mut DbSession,
+    db: &impl ConnectionTrait,
     user_id: &str,
     expected_lock_id: Option<i64>,
 ) -> Result<i64> {
     let lock_id = calculate_lock_id(user_id);
 
-    if let Some(expected) = expected_lock_id {
-        if expected != lock_id {
-            return Err(LiliumError::domain_service_with_code(
-                "WEBSOCKET_CONNECTION_INVALID_REQUEST",
-                format!(
-                    "Expected lock_id {} does not match user_id {}",
-                    expected, user_id
-                ),
-            ));
-        }
+    if let Some(expected) = expected_lock_id
+        && expected != lock_id
+    {
+        return Err(LiliumError::domain_service_with_code(
+            "WEBSOCKET_CONNECTION_INVALID_REQUEST",
+            format!(
+                "Expected lock_id {} does not match user_id {}",
+                expected, user_id
+            ),
+        ));
     }
 
-    if current_connection_holds_lock(session, lock_id).await? {
+    if current_connection_holds_lock(db, lock_id).await? {
         return Ok(lock_id);
     }
 
-    acquire_connection_lock_inner(session, lock_id, user_id).await
+    acquire_connection_lock_inner(db, lock_id, user_id).await
 }
 
-#[instrument(skip(session), fields(lock_id))]
-async fn current_connection_holds_lock(session: &mut DbSession, lock_id: i64) -> Result<bool> {
-    let classid = lock_id >> 32;
-    let objid = lock_id & 0xFFFFFFFF;
+#[instrument(skip(db), fields(lock_id))]
+async fn current_connection_holds_lock(db: &impl ConnectionTrait, lock_id: i64) -> Result<bool> {
+    let (classid, objid) = split_advisory_lock_id(lock_id);
 
-    let lock_held = sqlx::query_scalar::<_, bool>(
+    query_bool(
+        db,
         r#"SELECT EXISTS(
                 SELECT 1
                 FROM pg_locks
@@ -111,91 +153,84 @@ async fn current_connection_holds_lock(session: &mut DbSession, lock_id: i64) ->
                   AND objid = $2
                   AND locktype = 'advisory'
                   AND granted = true
-            )"#,
+            ) AS value"#,
+        vec![classid.into(), objid.into()],
     )
-    .bind(classid)
-    .bind(objid)
-    .fetch_one(session.as_mut())
-    .await?;
-
-    Ok(lock_held)
+    .await
 }
 
-#[instrument(skip(session), fields(lock_id))]
-pub async fn release_connection_lock(session: &mut DbSession, lock_id: i64) -> Result<()> {
-    let connection = sqlx::query_as::<_, WebsocketConnection>(
-        "SELECT * FROM websocket_connections WHERE lock_id = $1",
-    )
-    .bind(lock_id)
-    .fetch_optional(session.as_mut())
-    .await?;
+#[instrument(skip(db), fields(lock_id))]
+pub async fn release_connection_lock(db: &impl ConnectionTrait, lock_id: i64) -> Result<()> {
+    let connection = websocket_connections::Entity::find_by_id(lock_id)
+        .one(db)
+        .await?;
 
     if connection.is_some() {
-        sqlx::query("DELETE FROM websocket_connections WHERE lock_id = $1")
-            .bind(lock_id)
-            .execute(session.as_mut())
+        websocket_connections::Entity::delete_by_id(lock_id)
+            .exec(db)
             .await?;
     }
 
-    let _ = sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
-        .bind(lock_id)
-        .fetch_optional(session.as_mut())
-        .await;
+    let _ = query_bool(
+        db,
+        "SELECT pg_advisory_unlock($1) AS value",
+        vec![lock_id.into()],
+    )
+    .await;
     Ok(())
 }
 
-#[instrument(skip(session), fields(lock_id))]
-pub async fn update_heartbeat(session: &mut DbSession, lock_id: i64) -> Result<()> {
+#[instrument(skip(db), fields(lock_id))]
+pub async fn update_heartbeat(db: &impl ConnectionTrait, lock_id: i64) -> Result<()> {
     let now = Utc::now();
-    sqlx::query("UPDATE websocket_connections SET last_heartbeat = $1 WHERE lock_id = $2")
-        .bind(now)
-        .bind(lock_id)
-        .execute(session.as_mut())
+    websocket_connections::Entity::update_many()
+        .set(websocket_connections::ActiveModel {
+            last_heartbeat: Set(now),
+            ..Default::default()
+        })
+        .filter(websocket_connections::Column::LockId.eq(lock_id))
+        .exec(db)
         .await?;
     Ok(())
 }
 
-#[instrument(skip(session), fields(account_user_id = ?account_user_id))]
+#[instrument(skip(db), fields(account_user_id = ?account_user_id))]
 pub async fn get_active_connections(
-    session: &mut DbSession,
+    db: &impl ConnectionTrait,
     account_user_id: Option<&str>,
 ) -> Result<Vec<WebsocketConnection>> {
-    let rows = if let Some(uid) = account_user_id {
-        sqlx::query_as::<_, WebsocketConnection>(
-            r#"SELECT c.lock_id, c.account_user_id, c.connected_at, c.last_heartbeat
-                FROM websocket_connections c
-                INNER JOIN pg_locks l ON l.classid = (c.lock_id >> 32)
-                                      AND l.objid = (c.lock_id & 4294967295)
-                                      AND l.locktype = 'advisory'
-                                      AND l.granted = true
-                WHERE c.account_user_id = $1
-                ORDER BY c.connected_at DESC"#,
-        )
-        .bind(uid)
-        .fetch_all(session.as_mut())
-        .await?
-    } else {
-        sqlx::query_as::<_, WebsocketConnection>(
-            r#"SELECT c.lock_id, c.account_user_id, c.connected_at, c.last_heartbeat
-                FROM websocket_connections c
-                INNER JOIN pg_locks l ON l.classid = (c.lock_id >> 32)
-                                      AND l.objid = (c.lock_id & 4294967295)
-                                      AND l.locktype = 'advisory'
-                                      AND l.granted = true
-                ORDER BY c.connected_at DESC"#,
-        )
-        .fetch_all(session.as_mut())
-        .await?
-    };
+    let lock_is_held = Expr::cust(
+        r#"EXISTS(
+                SELECT 1
+                FROM pg_locks l
+                WHERE l.classid = (websocket_connections.lock_id >> 32)
+                  AND l.objid = (websocket_connections.lock_id & 4294967295)
+                  AND l.locktype = 'advisory'
+                  AND l.granted = true
+            )"#,
+    );
 
-    Ok(rows)
+    let mut query = websocket_connections::Entity::find()
+        .filter(lock_is_held)
+        .order_by_desc(websocket_connections::Column::ConnectedAt);
+
+    if let Some(uid) = account_user_id {
+        query = query.filter(websocket_connections::Column::AccountUserId.eq(uid));
+    }
+
+    let rows = query.all(db).await?;
+    Ok(rows.into_iter().collect())
 }
 
-#[instrument(skip(session), fields(account_user_id = %account_user_id))]
-pub async fn is_credential_in_use(session: &mut DbSession, account_user_id: &str) -> Result<bool> {
+#[instrument(skip(db), fields(account_user_id = %account_user_id))]
+pub async fn is_credential_in_use(
+    db: &impl ConnectionTrait,
+    account_user_id: &str,
+) -> Result<bool> {
     let lock_id = calculate_lock_id(account_user_id);
 
-    let exists = sqlx::query_scalar::<_, bool>(
+    query_bool(
+        db,
         r#"SELECT EXISTS(
                 SELECT 1
                 FROM websocket_connections c
@@ -204,46 +239,44 @@ pub async fn is_credential_in_use(session: &mut DbSession, account_user_id: &str
                                       AND l.locktype = 'advisory'
                                       AND l.granted = true
                 WHERE c.lock_id = $1
-            )"#,
+            ) AS value"#,
+        vec![lock_id.into()],
     )
-    .bind(lock_id)
-    .fetch_one(session.as_mut())
-    .await?;
-
-    Ok(exists)
+    .await
 }
 
-#[instrument(skip(session), fields(timeout_seconds))]
+#[instrument(skip(db), fields(timeout_seconds))]
 pub async fn cleanup_stale_connections(
-    session: &mut DbSession,
+    db: &impl ConnectionTrait,
     timeout_seconds: i64,
 ) -> Result<i64> {
     let stale_lock_ids = if timeout_seconds > 0 {
         let cutoff = Utc::now() - Duration::seconds(timeout_seconds);
-        sqlx::query_scalar::<_, i64>(
-            r#"SELECT c.lock_id
-                FROM websocket_connections c
-                LEFT JOIN pg_locks l ON l.classid = (c.lock_id >> 32)
-                                     AND l.objid = (c.lock_id & 4294967295)
-                                     AND l.locktype = 'advisory'
-                                     AND l.granted = true
-                WHERE l.classid IS NULL
-                  AND c.last_heartbeat < $1"#,
+        query_i64s(
+            db,
+            r#"SELECT c.lock_id AS value
+               FROM websocket_connections c
+               LEFT JOIN pg_locks l ON l.classid = (c.lock_id >> 32)
+                                    AND l.objid = (c.lock_id & 4294967295)
+                                    AND l.locktype = 'advisory'
+                                    AND l.granted = true
+               WHERE l.classid IS NULL
+                 AND c.last_heartbeat < $1"#,
+            vec![cutoff.into()],
         )
-        .bind(cutoff)
-        .fetch_all(session.as_mut())
         .await?
     } else {
-        sqlx::query_scalar::<_, i64>(
-            r#"SELECT c.lock_id
-                FROM websocket_connections c
-                LEFT JOIN pg_locks l ON l.classid = (c.lock_id >> 32)
-                                     AND l.objid = (c.lock_id & 4294967295)
-                                     AND l.locktype = 'advisory'
-                                     AND l.granted = true
-                WHERE l.classid IS NULL"#,
+        query_i64s(
+            db,
+            r#"SELECT c.lock_id AS value
+               FROM websocket_connections c
+               LEFT JOIN pg_locks l ON l.classid = (c.lock_id >> 32)
+                                    AND l.objid = (c.lock_id & 4294967295)
+                                    AND l.locktype = 'advisory'
+                                    AND l.granted = true
+               WHERE l.classid IS NULL"#,
+            Vec::new(),
         )
-        .fetch_all(session.as_mut())
         .await?
     };
 
@@ -252,12 +285,10 @@ pub async fn cleanup_stale_connections(
     }
 
     let count = stale_lock_ids.len() as i64;
-    for lock_id in &stale_lock_ids {
-        sqlx::query("DELETE FROM websocket_connections WHERE lock_id = $1")
-            .bind(lock_id)
-            .execute(session.as_mut())
-            .await?;
-    }
+    websocket_connections::Entity::delete_many()
+        .filter(websocket_connections::Column::LockId.is_in(stale_lock_ids))
+        .exec(db)
+        .await?;
 
     Ok(count)
 }
@@ -293,12 +324,10 @@ mod tests {
     }
 
     #[test]
-    fn test_calculate_lock_id_splits_for_pg_locks_query() {
-        let lock_id = 1746043848041696062i64;
-        let expected_classid = lock_id >> 32;
-        let expected_objid = lock_id & 0xFFFFFFFF;
-        assert_eq!(expected_classid, lock_id >> 32);
-        assert_eq!(expected_objid, lock_id & 0xFFFFFFFF);
+    fn test_advisory_lock_parts_reconstruct_lock_id() {
+        let lock_id = calculate_lock_id("user_test_split");
+        let (classid, objid) = split_advisory_lock_id(lock_id);
+        assert_eq!((classid << 32) | objid, lock_id);
     }
 
     #[tokio::test]

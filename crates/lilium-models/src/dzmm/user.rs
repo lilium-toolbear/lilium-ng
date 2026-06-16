@@ -1,9 +1,17 @@
 use chrono::{DateTime, Utc};
+use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
-pub struct User {
+// Python parity source: dzmm_archive@6a92a9914602d633ff6fa3f5908fa68d00c36fcd models/dzmm/user.py
+// Parity decision: Python exposes `name_tsv`, but Rust intentionally keeps
+// PostgreSQL search vectors out of the table row model. The DB column still
+// exists and is only referenced from search predicates.
+pub type User = Model;
+
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+#[sea_orm(table_name = "users")]
+pub struct Model {
+    #[sea_orm(primary_key, auto_increment = false)]
     pub user_id: String,
     pub full_name: Option<String>,
     pub avatar_url: Option<String>,
@@ -23,6 +31,11 @@ pub struct User {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
+
+#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+pub enum Relation {}
+
+impl ActiveModelBehavior for ActiveModel {}
 
 impl User {
     pub fn from_api(data: &serde_json::Value) -> Option<Self> {

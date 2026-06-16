@@ -1,9 +1,13 @@
 use crate::Result;
 use chrono::{Duration, Utc};
-use lilium_database::DbSession;
-
-use lilium_models::dzmm::outgoing_command::{OutgoingCommand, status};
+use lilium_models::dzmm::outgoing_command::{self as outgoing_commands, status};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set,
+};
 use tracing::instrument;
+
+type OutgoingCommand = outgoing_commands::Model;
 
 const STANDARD_MAX_ATTEMPTS: i32 = 3;
 const MESSAGE_SEND_RATE_LIMIT_MAX_ATTEMPTS: i32 = 6;
@@ -66,52 +70,59 @@ pub(crate) fn is_ready_for_processing(
     rate_limited_retry_not_before(command) <= now
 }
 
-#[instrument(skip(session, data), fields(account_user_id = %account_user_id, event = %event, require_ack, has_max_attempts = max_attempts.is_some()))]
-pub async fn create_command(
-    session: &mut DbSession,
+#[instrument(skip(db, data), fields(account_user_id = %account_user_id, event = %event, require_ack, has_max_attempts = max_attempts.is_some()))]
+pub async fn create_command<C>(
+    db: &C,
     account_user_id: &str,
     event: &str,
     data: serde_json::Value,
     require_ack: bool,
     max_attempts: Option<i32>,
-) -> Result<OutgoingCommand> {
+) -> Result<OutgoingCommand>
+where
+    C: ConnectionTrait,
+{
     let max_attempts = max_attempts.unwrap_or_else(|| default_max_attempts_for_event(event));
 
-    let command = sqlx::query_as::<_, OutgoingCommand>(
-        r#"INSERT INTO outgoing_commands (account_user_id, event, data, require_ack, status, attempt_count, max_attempts, created_at)
-             VALUES ($1, $2, $3, $4, $5, 0, $6, $7)
-             RETURNING *"#,
-    )
-    .bind(account_user_id)
-    .bind(event)
-    .bind(data)
-    .bind(require_ack)
-    .bind(status::PENDING)
-    .bind(max_attempts)
-    .bind(Utc::now())
-    .fetch_one(session.as_mut())
+    let command = outgoing_commands::ActiveModel {
+        account_user_id: Set(account_user_id.to_owned()),
+        event: Set(event.to_owned()),
+        data: Set(data),
+        require_ack: Set(require_ack),
+        status: Set(status::PENDING.to_owned()),
+        attempt_count: Set(0),
+        max_attempts: Set(max_attempts),
+        created_at: Set(Utc::now()),
+        ..Default::default()
+    }
+    .insert(db)
     .await?;
 
     Ok(command)
 }
 
-#[instrument(skip(session), fields(account_user_id = %account_user_id, limit))]
-pub async fn get_pending_commands(
-    session: &mut DbSession,
+#[instrument(skip(db), fields(account_user_id = %account_user_id, limit))]
+pub async fn get_pending_commands<C>(
+    db: &C,
     account_user_id: &str,
     limit: i64,
-) -> Result<Vec<OutgoingCommand>> {
-    let rows = sqlx::query_as::<_, OutgoingCommand>(
-        r#"SELECT * FROM outgoing_commands
-             WHERE account_user_id = $1 AND status = $2
-             ORDER BY id ASC
-             LIMIT $3"#,
-    )
-    .bind(account_user_id)
-    .bind(status::PENDING)
-    .bind(limit)
-    .fetch_all(session.as_mut())
-    .await?;
+) -> Result<Vec<OutgoingCommand>>
+where
+    C: ConnectionTrait,
+{
+    if limit <= 0 {
+        return Ok(Vec::new());
+    }
+
+    let rows = outgoing_commands::Entity::find()
+        .filter(outgoing_commands::Column::AccountUserId.eq(account_user_id))
+        .filter(outgoing_commands::Column::Status.eq(status::PENDING))
+        .order_by_asc(outgoing_commands::Column::Id)
+        .limit(limit as u64)
+        .all(db)
+        .await?
+        .into_iter()
+        .collect::<Vec<_>>();
 
     let now = Utc::now();
     let mut ready_commands = Vec::new();
@@ -124,89 +135,116 @@ pub async fn get_pending_commands(
     Ok(ready_commands)
 }
 
-#[instrument(skip(session), fields(command_id))]
-pub async fn get_command(
-    session: &mut DbSession,
-    command_id: i32,
-) -> Result<Option<OutgoingCommand>> {
-    let command =
-        sqlx::query_as::<_, OutgoingCommand>("SELECT * FROM outgoing_commands WHERE id = $1")
-            .bind(command_id)
-            .fetch_optional(session.as_mut())
-            .await?;
+#[instrument(skip(db), fields(command_id))]
+pub async fn get_command<C>(db: &C, command_id: i32) -> Result<Option<OutgoingCommand>>
+where
+    C: ConnectionTrait,
+{
+    let command = outgoing_commands::Entity::find_by_id(command_id)
+        .one(db)
+        .await?;
 
     Ok(command)
 }
 
-#[instrument(skip(session), fields(command_id))]
-pub async fn mark_processing(session: &mut DbSession, command_id: i32) -> Result<()> {
-    sqlx::query(
-        "UPDATE outgoing_commands SET status = $1, attempt_count = attempt_count + 1 WHERE id = $2",
-    )
-    .bind(status::PROCESSING)
-    .bind(command_id)
-    .execute(session.as_mut())
+#[instrument(skip(db), fields(command_id))]
+pub async fn mark_processing<C>(db: &C, command_id: i32) -> Result<()>
+where
+    C: ConnectionTrait,
+{
+    let command = match get_command(db, command_id).await? {
+        Some(command) => command,
+        None => return Ok(()),
+    };
+
+    outgoing_commands::ActiveModel {
+        id: Set(command_id),
+        status: Set(status::PROCESSING.to_owned()),
+        attempt_count: Set(command.attempt_count + 1),
+        ..Default::default()
+    }
+    .update(db)
     .await?;
+
     Ok(())
 }
 
-#[instrument(skip(session, ack_response), fields(command_id))]
-pub async fn mark_success(
-    session: &mut DbSession,
+#[instrument(skip(db, ack_response), fields(command_id))]
+pub async fn mark_success<C>(
+    db: &C,
     command_id: i32,
     ack_response: Option<serde_json::Value>,
-) -> Result<()> {
-    sqlx::query(
-        "UPDATE outgoing_commands SET status = $1, processed_at = $2, ack_response = $3 WHERE id = $4",
-    )
-    .bind(status::SUCCESS)
-    .bind(Utc::now())
-    .bind(ack_response)
-    .bind(command_id)
-    .execute(session.as_mut())
+) -> Result<()>
+where
+    C: ConnectionTrait,
+{
+    if get_command(db, command_id).await?.is_none() {
+        return Ok(());
+    }
+
+    outgoing_commands::ActiveModel {
+        id: Set(command_id),
+        status: Set(status::SUCCESS.to_owned()),
+        processed_at: Set(Some(Utc::now())),
+        ack_response: Set(ack_response),
+        ..Default::default()
+    }
+    .update(db)
     .await?;
+
     Ok(())
 }
 
-#[instrument(skip(session, error_message), fields(command_id))]
-pub async fn mark_failed(
-    session: &mut DbSession,
-    command_id: i32,
-    error_message: &str,
-) -> Result<()> {
-    sqlx::query(
-        "UPDATE outgoing_commands SET status = $1, processed_at = $2, error_message = $3 WHERE id = $4",
-    )
-    .bind(status::FAILED)
-    .bind(Utc::now())
-    .bind(error_message)
-    .bind(command_id)
-    .execute(session.as_mut())
+#[instrument(skip(db, error_message), fields(command_id))]
+pub async fn mark_failed<C>(db: &C, command_id: i32, error_message: &str) -> Result<()>
+where
+    C: ConnectionTrait,
+{
+    if get_command(db, command_id).await?.is_none() {
+        return Ok(());
+    }
+
+    outgoing_commands::ActiveModel {
+        id: Set(command_id),
+        status: Set(status::FAILED.to_owned()),
+        processed_at: Set(Some(Utc::now())),
+        error_message: Set(Some(error_message.to_owned())),
+        ..Default::default()
+    }
+    .update(db)
     .await?;
+
     Ok(())
 }
 
-#[instrument(skip(session), fields(command_id))]
-pub async fn mark_timeout(session: &mut DbSession, command_id: i32) -> Result<()> {
-    sqlx::query(
-        "UPDATE outgoing_commands SET status = $1, processed_at = $2, error_message = $3 WHERE id = $4",
-    )
-    .bind(status::TIMEOUT)
-    .bind(Utc::now())
-    .bind("Operation timed out")
-    .bind(command_id)
-    .execute(session.as_mut())
+#[instrument(skip(db), fields(command_id))]
+pub async fn mark_timeout<C>(db: &C, command_id: i32) -> Result<()>
+where
+    C: ConnectionTrait,
+{
+    if get_command(db, command_id).await?.is_none() {
+        return Ok(());
+    }
+
+    outgoing_commands::ActiveModel {
+        id: Set(command_id),
+        status: Set(status::TIMEOUT.to_owned()),
+        processed_at: Set(Some(Utc::now())),
+        error_message: Set(Some("Operation timed out".to_owned())),
+        ..Default::default()
+    }
+    .update(db)
     .await?;
+
     Ok(())
 }
 
-#[instrument(skip(session, error_message), fields(command_id))]
-pub async fn retry_or_fail(
-    session: &mut DbSession,
-    command_id: i32,
-    error_message: &str,
-) -> Result<bool> {
-    let command = match get_command(session, command_id).await? {
+#[instrument(skip(db, error_message), fields(command_id))]
+pub async fn retry_or_fail<C>(db: &C, command_id: i32, error_message: &str) -> Result<bool>
+where
+    C: ConnectionTrait,
+{
+    let command = match get_command(db, command_id).await? {
         Some(c) => c,
         None => return Ok(false),
     };
@@ -215,11 +253,13 @@ pub async fn retry_or_fail(
         is_rate_limited_error(Some(error_message)) && command.event == "message:send";
 
     if is_rate_limited_send && command.max_attempts == STANDARD_MAX_ATTEMPTS {
-        sqlx::query("UPDATE outgoing_commands SET max_attempts = $1 WHERE id = $2")
-            .bind(MESSAGE_SEND_RATE_LIMIT_MAX_ATTEMPTS)
-            .bind(command_id)
-            .execute(session.as_mut())
-            .await?;
+        outgoing_commands::ActiveModel {
+            id: Set(command_id),
+            max_attempts: Set(MESSAGE_SEND_RATE_LIMIT_MAX_ATTEMPTS),
+            ..Default::default()
+        }
+        .update(db)
+        .await?;
     }
 
     let max_attempts = if is_rate_limited_send && command.max_attempts == STANDARD_MAX_ATTEMPTS {
@@ -230,49 +270,50 @@ pub async fn retry_or_fail(
 
     if command.attempt_count >= max_attempts {
         let msg = format!("Max attempts ({}) reached: {}", max_attempts, error_message);
-        sqlx::query(
-            "UPDATE outgoing_commands SET status = $1, processed_at = $2, error_message = $3 WHERE id = $4",
-        )
-        .bind(status::FAILED)
-        .bind(Utc::now())
-        .bind(&msg)
-        .bind(command_id)
-        .execute(session.as_mut())
+        outgoing_commands::ActiveModel {
+            id: Set(command_id),
+            status: Set(status::FAILED.to_owned()),
+            processed_at: Set(Some(Utc::now())),
+            error_message: Set(Some(msg)),
+            ..Default::default()
+        }
+        .update(db)
         .await?;
         Ok(false)
     } else {
-        sqlx::query("UPDATE outgoing_commands SET status = $1, error_message = $2 WHERE id = $3")
-            .bind(status::PENDING)
-            .bind(error_message)
-            .bind(command_id)
-            .execute(session.as_mut())
-            .await?;
+        outgoing_commands::ActiveModel {
+            id: Set(command_id),
+            status: Set(status::PENDING.to_owned()),
+            error_message: Set(Some(error_message.to_owned())),
+            ..Default::default()
+        }
+        .update(db)
+        .await?;
         Ok(true)
     }
 }
 
-#[instrument(skip(session), fields(command_id))]
-pub async fn get_command_result(
-    session: &mut DbSession,
-    command_id: i32,
-) -> Result<Option<OutgoingCommand>> {
-    get_command(session, command_id).await
+#[instrument(skip(db), fields(command_id))]
+pub async fn get_command_result<C>(db: &C, command_id: i32) -> Result<Option<OutgoingCommand>>
+where
+    C: ConnectionTrait,
+{
+    get_command(db, command_id).await
 }
 
-#[instrument(skip(session), fields(cutoff = %cutoff))]
-pub async fn prune_processed_before(
-    session: &mut DbSession,
-    cutoff: chrono::DateTime<Utc>,
-) -> Result<i64> {
-    let result = sqlx::query(
-        "DELETE FROM outgoing_commands WHERE status = ANY($1) AND processed_at IS NOT NULL AND processed_at <= $2",
-    )
-    .bind(status::TERMINAL_STATUSES)
-    .bind(cutoff)
-    .execute(session.as_mut())
-    .await?;
+#[instrument(skip(db), fields(cutoff = %cutoff))]
+pub async fn prune_processed_before<C>(db: &C, cutoff: chrono::DateTime<Utc>) -> Result<i64>
+where
+    C: ConnectionTrait,
+{
+    let result = outgoing_commands::Entity::delete_many()
+        .filter(outgoing_commands::Column::Status.is_in(status::TERMINAL_STATUSES.iter().copied()))
+        .filter(outgoing_commands::Column::ProcessedAt.is_not_null())
+        .filter(outgoing_commands::Column::ProcessedAt.lte(cutoff))
+        .exec(db)
+        .await?;
 
-    Ok(result.rows_affected() as i64)
+    Ok(result.rows_affected as i64)
 }
 
 #[cfg(test)]
@@ -509,9 +550,9 @@ mod tests {
             .await
             .expect("init outgoing command db");
 
-            lilium_database::transaction!(test_db.database(), |session| {
+            lilium_database::transaction!(test_db.database(), |tx| {
                 let cmd = create_command(
-                    session,
+                    tx,
                     "user1",
                     "message:send",
                     serde_json::json!({"room_id": "room1", "text": "hello"}),
@@ -540,9 +581,9 @@ mod tests {
             .await
             .expect("init outgoing command db");
 
-            lilium_database::transaction!(test_db.database(), |session| {
+            lilium_database::transaction!(test_db.database(), |tx| {
                 let cmd = create_command(
-                    session,
+                    tx,
                     "user1",
                     "message:join-room",
                     serde_json::json!({}),
@@ -566,9 +607,9 @@ mod tests {
             .await
             .expect("init outgoing command db");
 
-            lilium_database::transaction!(test_db.database(), |session| {
+            lilium_database::transaction!(test_db.database(), |tx| {
                 let cmd = create_command(
-                    session,
+                    tx,
                     "user1",
                     "test:event",
                     serde_json::json!({}),
@@ -593,17 +634,11 @@ mod tests {
             .await
             .expect("init outgoing command db");
 
-            lilium_database::transaction!(test_db.database(), |session| {
-                let cmd = create_command(
-                    session,
-                    "user1",
-                    "test:event",
-                    serde_json::json!({}),
-                    true,
-                    None,
-                )
-                .await
-                .unwrap();
+            lilium_database::transaction!(test_db.database(), |tx| {
+                let cmd =
+                    create_command(tx, "user1", "test:event", serde_json::json!({}), true, None)
+                        .await
+                        .unwrap();
                 assert!(cmd.id > 0);
                 Ok(())
             })
@@ -619,9 +654,9 @@ mod tests {
             .await
             .expect("init outgoing command db");
 
-            lilium_database::transaction!(test_db.database(), |session| {
+            lilium_database::transaction!(test_db.database(), |tx| {
                 let cmd1 = create_command(
-                    session,
+                    tx,
                     "user1",
                     "event:a",
                     serde_json::json!({"n": 1}),
@@ -631,7 +666,7 @@ mod tests {
                 .await
                 .unwrap();
                 let cmd2 = create_command(
-                    session,
+                    tx,
                     "user1",
                     "event:b",
                     serde_json::json!({"n": 2}),
@@ -641,7 +676,7 @@ mod tests {
                 .await
                 .unwrap();
                 let cmd3 = create_command(
-                    session,
+                    tx,
                     "user1",
                     "event:c",
                     serde_json::json!({"n": 3}),
@@ -670,9 +705,9 @@ mod tests {
             .await
             .expect("init outgoing command db");
 
-            lilium_database::transaction!(test_db.database(), |session| {
+            lilium_database::transaction!(test_db.database(), |tx| {
                 let cmd1 = create_command(
-                    session,
+                    tx,
                     "user1",
                     "event:a",
                     serde_json::json!({"n": 1}),
@@ -682,7 +717,7 @@ mod tests {
                 .await
                 .unwrap();
                 let cmd2 = create_command(
-                    session,
+                    tx,
                     "user1",
                     "event:b",
                     serde_json::json!({"n": 2}),
@@ -692,7 +727,7 @@ mod tests {
                 .await
                 .unwrap();
                 let cmd3 = create_command(
-                    session,
+                    tx,
                     "user1",
                     "event:c",
                     serde_json::json!({"n": 3}),
@@ -701,7 +736,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                let pending = get_pending_commands(session, "user1", 10).await.unwrap();
+                let pending = get_pending_commands(tx, "user1", 10).await.unwrap();
                 assert_eq!(pending.len(), 3);
                 assert_eq!(pending[0].id, cmd1.id);
                 assert_eq!(pending[1].id, cmd2.id);
@@ -720,38 +755,17 @@ mod tests {
             .await
             .expect("init outgoing command db");
 
-            lilium_database::transaction!(test_db.database(), |session| {
-                create_command(
-                    session,
-                    "user1",
-                    "event:a",
-                    serde_json::json!({}),
-                    true,
-                    None,
-                )
-                .await
-                .unwrap();
-                create_command(
-                    session,
-                    "user2",
-                    "event:b",
-                    serde_json::json!({}),
-                    true,
-                    None,
-                )
-                .await
-                .unwrap();
-                create_command(
-                    session,
-                    "user1",
-                    "event:c",
-                    serde_json::json!({}),
-                    true,
-                    None,
-                )
-                .await
-                .unwrap();
-                let pending_user1 = get_pending_commands(session, "user1", 10).await.unwrap();
+            lilium_database::transaction!(test_db.database(), |tx| {
+                create_command(tx, "user1", "event:a", serde_json::json!({}), true, None)
+                    .await
+                    .unwrap();
+                create_command(tx, "user2", "event:b", serde_json::json!({}), true, None)
+                    .await
+                    .unwrap();
+                create_command(tx, "user1", "event:c", serde_json::json!({}), true, None)
+                    .await
+                    .unwrap();
+                let pending_user1 = get_pending_commands(tx, "user1", 10).await.unwrap();
                 assert_eq!(pending_user1.len(), 2);
                 assert!(pending_user1.iter().all(|c| c.account_user_id == "user1"));
                 Ok(())
@@ -768,10 +782,10 @@ mod tests {
             .await
             .expect("init outgoing command db");
 
-            lilium_database::transaction!(test_db.database(), |session| {
+            lilium_database::transaction!(test_db.database(), |tx| {
                 for i in 0..5 {
                     create_command(
-                        session,
+                        tx,
                         "user1",
                         &format!("event:{}", i),
                         serde_json::json!({}),
@@ -781,7 +795,7 @@ mod tests {
                     .await
                     .unwrap();
                 }
-                let pending = get_pending_commands(session, "user1", 3).await.unwrap();
+                let pending = get_pending_commands(tx, "user1", 3).await.unwrap();
                 assert_eq!(pending.len(), 3);
                 Ok(())
             })
@@ -797,8 +811,8 @@ mod tests {
             .await
             .expect("init outgoing command db");
 
-            lilium_database::transaction!(test_db.database(), |session| {
-                let pending = get_pending_commands(session, "user_nonexistent", 10)
+            lilium_database::transaction!(test_db.database(), |tx| {
+                let pending = get_pending_commands(tx, "user_nonexistent", 10)
                     .await
                     .unwrap();
                 assert!(pending.is_empty());
@@ -820,8 +834,8 @@ mod tests {
             .await
             .expect("init outgoing command db");
 
-            lilium_database::transaction!(test_db.database(), |session| {
-                let result = get_command(session, 99999).await.unwrap();
+            lilium_database::transaction!(test_db.database(), |tx| {
+                let result = get_command(tx, 99999).await.unwrap();
                 assert!(result.is_none());
                 Ok(())
             })
@@ -841,8 +855,8 @@ mod tests {
             .await
             .expect("init outgoing command db");
 
-            lilium_database::transaction!(test_db.database(), |session| {
-                mark_processing(session, 99999).await.unwrap();
+            lilium_database::transaction!(test_db.database(), |tx| {
+                mark_processing(tx, 99999).await.unwrap();
                 Ok(())
             })
             .await
@@ -861,8 +875,8 @@ mod tests {
             .await
             .expect("init outgoing command db");
 
-            lilium_database::transaction!(test_db.database(), |session| {
-                mark_success(session, 99999, None).await.unwrap();
+            lilium_database::transaction!(test_db.database(), |tx| {
+                mark_success(tx, 99999, None).await.unwrap();
                 Ok(())
             })
             .await
@@ -881,8 +895,8 @@ mod tests {
             .await
             .expect("init outgoing command db");
 
-            lilium_database::transaction!(test_db.database(), |session| {
-                mark_failed(session, 99999, "some error").await.unwrap();
+            lilium_database::transaction!(test_db.database(), |tx| {
+                mark_failed(tx, 99999, "some error").await.unwrap();
                 Ok(())
             })
             .await
@@ -901,8 +915,8 @@ mod tests {
             .await
             .expect("init outgoing command db");
 
-            lilium_database::transaction!(test_db.database(), |session| {
-                mark_timeout(session, 99999).await.unwrap();
+            lilium_database::transaction!(test_db.database(), |tx| {
+                mark_timeout(tx, 99999).await.unwrap();
                 Ok(())
             })
             .await
@@ -921,8 +935,8 @@ mod tests {
             .await
             .expect("init outgoing command db");
 
-            lilium_database::transaction!(test_db.database(), |session| {
-                let result = retry_or_fail(session, 99999, "some error").await.unwrap();
+            lilium_database::transaction!(test_db.database(), |tx| {
+                let result = retry_or_fail(tx, 99999, "some error").await.unwrap();
                 assert!(!result);
                 Ok(())
             })
@@ -942,8 +956,8 @@ mod tests {
             .await
             .expect("init outgoing command db");
 
-            lilium_database::transaction!(test_db.database(), |session| {
-                let result = get_command_result(session, 99999).await.unwrap();
+            lilium_database::transaction!(test_db.database(), |tx| {
+                let result = get_command_result(tx, 99999).await.unwrap();
                 assert!(result.is_none());
                 Ok(())
             })
@@ -963,8 +977,8 @@ mod tests {
             .await
             .expect("init outgoing command db");
 
-            lilium_database::transaction!(test_db.database(), |session| {
-                let result = prune_processed_before(session, Utc::now()).await.unwrap();
+            lilium_database::transaction!(test_db.database(), |tx| {
+                let result = prune_processed_before(tx, Utc::now()).await.unwrap();
                 assert_eq!(result, 0);
                 Ok(())
             })

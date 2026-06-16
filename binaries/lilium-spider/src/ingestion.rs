@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{info, warn};
 
@@ -161,6 +160,7 @@ pub struct EventIngestor {
     accepted_count: AtomicU64,
     spilled_count: AtomicU64,
     is_accepting: AtomicBool,
+    #[allow(dead_code)]
     max_queue_size: usize,
 }
 
@@ -214,22 +214,27 @@ impl EventIngestor {
         }
     }
 
+    #[allow(dead_code)]
     pub fn stop_accepting(&self) {
         self.is_accepting.store(false, Ordering::Relaxed);
     }
 
+    #[allow(dead_code)]
     pub fn queue_depth(&self) -> usize {
         self.max_queue_size - self.queue.capacity()
     }
 
+    #[allow(dead_code)]
     pub fn accepted_count(&self) -> u64 {
         self.accepted_count.load(Ordering::Relaxed)
     }
 
+    #[allow(dead_code)]
     pub fn spilled_count(&self) -> u64 {
         self.spilled_count.load(Ordering::Relaxed)
     }
 
+    #[allow(dead_code)]
     pub fn is_accepting(&self) -> bool {
         self.is_accepting.load(Ordering::Relaxed)
     }
@@ -263,6 +268,7 @@ impl EventWriter {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn run(&self, stop_event: &Arc<AtomicBool>) {
         loop {
             let inserted = match self.drain_once().await {
@@ -358,15 +364,10 @@ impl EventWriter {
         let mut receiver = self.receiver.lock().await;
         let mut events = Vec::with_capacity(self.batch_size);
 
-        loop {
-            match receiver.try_recv() {
-                Ok(event) => {
-                    events.push(event);
-                    if events.len() >= self.batch_size {
-                        break;
-                    }
-                }
-                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+        while let Ok(event) = receiver.try_recv() {
+            events.push(event);
+            if events.len() >= self.batch_size {
+                break;
             }
         }
 
@@ -380,6 +381,7 @@ impl EventWriter {
         Ok(())
     }
 
+    #[allow(dead_code)]
     async fn spill_memory_queue(&self) -> Result<()> {
         loop {
             let events = self.drain_memory_batch().await?;
@@ -391,6 +393,7 @@ impl EventWriter {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn inserted_count(&self) -> u64 {
         self.inserted_count.load(Ordering::Relaxed)
     }
