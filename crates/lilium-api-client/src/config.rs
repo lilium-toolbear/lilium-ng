@@ -9,11 +9,14 @@ pub struct ApiClientConfig {
     pub reconnect_delay_ms: u64,
 }
 
+pub const DZMM_BASE_URL: &str = "https://www.dzmm.ai";
+pub const DZMM_SOCKETIO_URL: &str = "https://www.dzmm.ai/ws/matching/";
+
 impl Default for ApiClientConfig {
     fn default() -> Self {
         Self {
-            base_url: "https://www.dzmm.ai".to_string(),
-            ws_url: "wss://dzmm.com/ws".to_string(),
+            base_url: DZMM_BASE_URL.to_string(),
+            ws_url: DZMM_SOCKETIO_URL.to_string(),
             request_timeout_secs: 30,
             reconnect_delay_ms: 5000,
         }

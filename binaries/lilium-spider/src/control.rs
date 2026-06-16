@@ -6,11 +6,14 @@ pub fn runtime_path_id(account_user_id: &str) -> String {
 }
 
 pub fn arbiter_socket_path(runtime_dir: &Path) -> PathBuf {
-    runtime_dir.join("arbiter.sock")
+    runtime_dir.join("ws_arbiter.sock")
 }
 
 pub fn worker_socket_path(runtime_dir: &Path, account_user_id: &str) -> PathBuf {
-    runtime_dir.join(format!("worker-{}.sock", runtime_path_id(account_user_id)))
+    runtime_dir.join(format!(
+        "ws_worker_{}.sock",
+        runtime_path_id(account_user_id)
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,7 +123,10 @@ pub fn validate_account_user_id(account_user_id: &str) -> Result<(), String> {
         return Err("account_user_id must be a canonical UUID string".to_string());
     }
     for part in &parts {
-        if !part.chars().all(|c| c.is_ascii_hexdigit()) {
+        if !part
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        {
             return Err("account_user_id must be a canonical UUID string".to_string());
         }
     }
@@ -341,6 +347,25 @@ mod tests {
     #[test]
     fn test_validate_uuid_invalid_hex() {
         assert!(validate_account_user_id("550e8400-e29b-41d4-a716-44665544000g").is_err());
+    }
+
+    #[test]
+    fn test_validate_uuid_rejects_uppercase() {
+        assert!(validate_account_user_id("550E8400-e29b-41d4-a716-446655440000").is_err());
+    }
+
+    #[test]
+    fn test_control_socket_paths_match_python_runtime_names() {
+        let runtime_dir = Path::new("/tmp/lilium-ws");
+
+        assert_eq!(
+            arbiter_socket_path(runtime_dir),
+            PathBuf::from("/tmp/lilium-ws/ws_arbiter.sock")
+        );
+        assert_eq!(
+            worker_socket_path(runtime_dir, "550e8400-e29b-41d4-a716-446655440000"),
+            PathBuf::from("/tmp/lilium-ws/ws_worker_550e8400-e29b-41d4-a716-446655440000.sock")
+        );
     }
 
     #[test]

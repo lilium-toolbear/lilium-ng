@@ -380,6 +380,62 @@ CREATE TRIGGER users_name_tsv_update BEFORE INSERT OR UPDATE ON public.users FOR
 
 
 
+-- Table: public.user_history
+
+
+
+
+
+
+
+CREATE TABLE public.user_history (
+    id integer NOT NULL,
+    user_id character varying NOT NULL,
+    full_name character varying,
+    avatar_url character varying,
+    bio character varying,
+    birthday character varying,
+    birthday_public boolean,
+    quirk character varying,
+    is_bot boolean,
+    gender character varying,
+    metadata jsonb,
+    raw_data jsonb,
+    recorded_at timestamp with time zone NOT NULL,
+    avatar_file character varying
+);
+
+
+
+CREATE SEQUENCE public.user_history_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+
+ALTER SEQUENCE public.user_history_id_seq OWNED BY public.user_history.id;
+
+
+
+ALTER TABLE ONLY public.user_history ALTER COLUMN id SET DEFAULT nextval('public.user_history_id_seq'::regclass);
+
+
+
+ALTER TABLE ONLY public.user_history
+    ADD CONSTRAINT user_history_pkey PRIMARY KEY (id);
+
+
+
+CREATE INDEX ix_user_history_user_id ON public.user_history USING btree (user_id);
+
+
+
+
+
 -- Table: public.rooms
 
 
@@ -775,6 +831,34 @@ CREATE INDEX ix_messages_sticker_id ON ONLY public.messages USING btree (sticker
 
 
 
+-- Table: public.image_gps
+
+
+
+
+
+
+
+CREATE TABLE public.image_gps (
+    message_id character varying NOT NULL,
+    latitude double precision NOT NULL,
+    longitude double precision NOT NULL,
+    altitude double precision,
+    "timestamp" timestamp with time zone,
+    created_at timestamp with time zone NOT NULL
+);
+
+
+
+ALTER TABLE ONLY public.image_gps
+    ADD CONSTRAINT image_gps_pkey PRIMARY KEY (message_id);
+
+
+
+CREATE INDEX idx_image_gps_message_id ON public.image_gps USING btree (message_id);
+
+
+
 CREATE TRIGGER message_inserted_trigger AFTER INSERT ON public.messages FOR EACH ROW EXECUTE FUNCTION public.notify_message_inserted();
 
 
@@ -832,5 +916,4 @@ CREATE INDEX ix_websocket_events_user_id_timestamp_id ON ONLY public.websocket_e
 
 
 CREATE TRIGGER websocket_event_inserted_trigger AFTER INSERT ON public.websocket_events FOR EACH ROW EXECUTE FUNCTION public.notify_websocket_event_inserted();
-
 

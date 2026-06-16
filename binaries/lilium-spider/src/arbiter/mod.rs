@@ -306,7 +306,7 @@ mod tests {
                 batch_size: 10,
                 buffer_dir: PathBuf::from("data/event/buffer"),
                 runtime_dir: PathBuf::from("runtime/spider"),
-                websocket_url: "wss://dzmm.com/ws".to_string(),
+                websocket_url: lilium_api_client::config::DZMM_SOCKETIO_URL.to_string(),
                 reconnect_delay_ms: 5_000,
             },
         };

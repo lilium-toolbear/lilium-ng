@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 lilium-common.workspace = true
 lilium-models.workspace = true
-reqwest = { workspace = true, features = ["cookies", "multipart", "brotli"] }
+reqwest = { workspace = true, features = ["cookies", "multipart", "gzip", "deflate", "brotli"] }
 rand.workspace = true
 tokio.workspace = true
 serde.workspace = true

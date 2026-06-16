@@ -17,6 +17,9 @@ rust_decimal.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
+kamadak-exif.workspace = true
+lofty.workspace = true
+md-5 = "0.10"
 
 [dev-dependencies]
 lilium-test-fixtures.workspace = true

@@ -1,11 +1,16 @@
+use crate::user::AvatarDownload;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
+use exif::{In, Reader as ExifReader, Tag, Value};
 use lilium_database::DbSession;
+use lofty::file::AudioFile;
 use reqwest::{
     Client, Method, Url,
     header::{CONTENT_TYPE, LOCATION},
     redirect::Policy,
 };
+use std::fs::File;
+use std::io::BufReader;
 use std::io::ErrorKind;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -30,6 +35,38 @@ pub struct MediaService {
     client: Client,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaDownload {
+    pub message_id: String,
+    pub sent_at: DateTime<Utc>,
+    pub content_type: String,
+    pub attachment_url: String,
+    pub ext: String,
+    pub sticker_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MediaFileUpdate {
+    pub message_id: String,
+    pub attachment_file: String,
+    pub gps: Option<ImageGpsData>,
+    pub metadata_patch: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageGpsData {
+    pub latitude: f64,
+    pub longitude: f64,
+    pub altitude: Option<f64>,
+    pub timestamp: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AvatarFileUpdate {
+    pub user_id: String,
+    pub avatar_file: String,
+}
+
 impl MediaService {
     pub fn new() -> Self {
         Self::with_data_path(PathBuf::from("./data"))
@@ -47,74 +84,31 @@ impl MediaService {
     ///
     /// The result paths are stored relative to `data_path`, which matches the
     /// Python contract more closely than the old absolute-path behavior.
-    #[instrument(skip(self, session, message_ids), fields(message_count = message_ids.len()))]
+    #[instrument(skip(self, downloads), fields(message_count = downloads.len()))]
     pub async fn download_media_batch(
         &self,
-        session: &mut DbSession,
-        message_ids: &[String],
-    ) -> Result<(i64, i64)> {
-        if message_ids.is_empty() {
-            return Ok((0, 0));
+        downloads: &[MediaDownload],
+    ) -> Result<(Vec<MediaFileUpdate>, i64)> {
+        if downloads.is_empty() {
+            return Ok((Vec::new(), 0));
         }
 
-        info!(count = message_ids.len(), "Downloading media for messages");
-
-        let media_rows = sqlx::query_as::<
-            _,
-            (
-                String,
-                DateTime<Utc>,
-                Option<String>,
-                Option<String>,
-                Option<String>,
-            ),
-        >(
-            r#"SELECT message_id, sent_at, content_type, attachment_url, attachment_file
-               FROM messages WHERE message_id = ANY($1)"#,
-        )
-        .bind(message_ids)
-        .fetch_all(session.as_mut())
-        .await?;
-
-        let mut to_download: Vec<(String, DateTime<Utc>, String, String)> = Vec::new();
-        for (message_id, sent_at, content_type, attachment_url, attachment_file) in media_rows {
-            if attachment_url.is_none() || attachment_file.is_some() {
-                continue;
-            }
-            let ext = content_type_ext(content_type.as_deref().unwrap_or("other"));
-            to_download.push((
-                message_id,
-                sent_at,
-                attachment_url.expect("checked above"),
-                ext.to_string(),
-            ));
-        }
-
-        if to_download.is_empty() {
-            return Ok((0, 0));
-        }
+        info!(count = downloads.len(), "Downloading media for messages");
 
         let semaphore = Arc::new(Semaphore::new(10));
-        let mut success_count: i64 = 0;
         let mut failure_count: i64 = 0;
-        let mut handles: Vec<tokio::task::JoinHandle<(String, Result<String>)>> = Vec::new();
-        let mut downloaded_files: Vec<(String, String)> = Vec::new();
+        let mut handles: Vec<tokio::task::JoinHandle<(String, Result<MediaFileUpdate>)>> =
+            Vec::new();
+        let mut updates = Vec::new();
 
-        for (message_id, sent_at, attachment_url, ext) in to_download {
+        for download in downloads.iter().cloned() {
             let permit = semaphore.clone().acquire_owned().await?;
             let data_path = self.data_path.clone();
             let client = self.client.clone();
 
             let handle = tokio::spawn(async move {
-                let result = download_single_media(
-                    &client,
-                    &message_id,
-                    &attachment_url,
-                    sent_at,
-                    &ext,
-                    &data_path,
-                )
-                .await;
+                let result = download_single_media(&client, &download, &data_path).await;
+                let message_id = download.message_id;
                 drop(permit);
                 (message_id, result)
             });
@@ -124,9 +118,8 @@ impl MediaService {
 
         for handle in handles {
             match handle.await {
-                Ok((message_id, Ok(file_path))) => {
-                    success_count += 1;
-                    downloaded_files.push((message_id, file_path));
+                Ok((_message_id, Ok(update))) => {
+                    updates.push(update);
                 }
                 Ok((message_id, Err(e))) => {
                     failure_count += 1;
@@ -139,32 +132,186 @@ impl MediaService {
             }
         }
 
-        for (message_id, file_path) in downloaded_files {
-            match sqlx::query("UPDATE messages SET attachment_file = $1 WHERE message_id = $2")
-                .bind(&file_path)
-                .bind(&message_id)
-                .execute(session.as_mut())
-                .await
-            {
-                Ok(_) => {
-                    info!(message_id = %message_id, path = %file_path, "Persisted media attachment path");
-                }
-                Err(e) => {
-                    success_count = success_count.saturating_sub(1);
-                    failure_count += 1;
-                    warn!(message_id = %message_id, error = %e, "Failed to persist attachment file path");
-                }
-            }
-        }
-
         info!(
-            success = success_count,
+            success = updates.len(),
             failure = failure_count,
             "Media download complete"
         );
 
-        Ok((success_count, failure_count))
+        Ok((updates, failure_count))
     }
+
+    #[instrument(skip(self, downloads), fields(avatar_count = downloads.len()))]
+    pub async fn download_user_avatars(
+        &self,
+        downloads: &[AvatarDownload],
+    ) -> Result<(Vec<AvatarFileUpdate>, i64)> {
+        if downloads.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+
+        let mut updates = Vec::new();
+        let mut failure_count = 0;
+
+        for download in downloads {
+            match download_user_avatar(&self.data_path, &download.avatar_url, &download.user_id)
+                .await
+            {
+                Ok(Some(avatar_file)) => {
+                    updates.push(AvatarFileUpdate {
+                        user_id: download.user_id.clone(),
+                        avatar_file: avatar_file.clone(),
+                    });
+                    info!(
+                        user_id = %download.user_id,
+                        path = %avatar_file,
+                        "Downloaded user avatar"
+                    );
+                }
+                Ok(None) => {
+                    failure_count += 1;
+                }
+                Err(error) => {
+                    failure_count += 1;
+                    warn!(
+                        user_id = %download.user_id,
+                        error = %error,
+                        "Failed to download user avatar"
+                    );
+                }
+            }
+        }
+
+        Ok((updates, failure_count))
+    }
+}
+
+#[instrument(skip(session, message_ids), fields(message_count = message_ids.len()))]
+pub async fn collect_message_media_downloads(
+    session: &mut DbSession,
+    message_ids: &[String],
+) -> Result<Vec<MediaDownload>> {
+    if message_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let media_rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            DateTime<Utc>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ),
+    >(
+        r#"SELECT message_id, sent_at, content_type, attachment_url, attachment_file, sticker_id
+           FROM messages WHERE message_id = ANY($1)"#,
+    )
+    .bind(message_ids)
+    .fetch_all(session.as_mut())
+    .await?;
+
+    let downloads = media_rows
+        .into_iter()
+        .filter_map(
+            |(message_id, sent_at, content_type, attachment_url, attachment_file, sticker_id)| {
+                if attachment_file.is_some() {
+                    return None;
+                }
+                let attachment_url = attachment_url?;
+                let content_type = content_type.unwrap_or_else(|| "other".to_string());
+                let ext = content_type_ext(&content_type).to_string();
+                Some(MediaDownload {
+                    message_id,
+                    sent_at,
+                    content_type,
+                    attachment_url,
+                    ext,
+                    sticker_id,
+                })
+            },
+        )
+        .collect();
+
+    Ok(downloads)
+}
+
+#[instrument(skip(session, updates), fields(update_count = updates.len()))]
+pub async fn persist_message_media_files(
+    session: &mut DbSession,
+    updates: &[MediaFileUpdate],
+) -> Result<i64> {
+    let mut updated_count = 0;
+    for update in updates {
+        let result = sqlx::query("UPDATE messages SET attachment_file = $1 WHERE message_id = $2")
+            .bind(&update.attachment_file)
+            .bind(&update.message_id)
+            .execute(session.as_mut())
+            .await?;
+        updated_count += result.rows_affected() as i64;
+
+        if let Some(metadata_patch) = &update.metadata_patch {
+            sqlx::query(
+                r#"UPDATE messages
+                   SET metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb
+                   WHERE message_id = $1"#,
+            )
+            .bind(&update.message_id)
+            .bind(metadata_patch)
+            .execute(session.as_mut())
+            .await?;
+        }
+
+        if let Some(gps) = &update.gps {
+            sqlx::query(
+                r#"INSERT INTO image_gps
+                   (message_id, latitude, longitude, altitude, "timestamp", created_at)
+                   VALUES ($1, $2, $3, $4, $5, NOW())
+                   ON CONFLICT (message_id) DO NOTHING"#,
+            )
+            .bind(&update.message_id)
+            .bind(gps.latitude)
+            .bind(gps.longitude)
+            .bind(gps.altitude)
+            .bind(gps.timestamp)
+            .execute(session.as_mut())
+            .await?;
+        }
+        info!(
+            message_id = %update.message_id,
+            path = %update.attachment_file,
+            "Persisted media attachment path"
+        );
+    }
+    Ok(updated_count)
+}
+
+#[instrument(skip(session, updates), fields(update_count = updates.len()))]
+pub async fn persist_user_avatar_files(
+    session: &mut DbSession,
+    updates: &[AvatarFileUpdate],
+) -> Result<i64> {
+    let mut updated_count = 0;
+    for update in updates {
+        let result = sqlx::query(
+            r#"UPDATE users
+               SET avatar_file = $2, updated_at = NOW()
+               WHERE user_id = $1"#,
+        )
+        .bind(&update.user_id)
+        .bind(&update.avatar_file)
+        .execute(session.as_mut())
+        .await?;
+        updated_count += result.rows_affected() as i64;
+        info!(
+            user_id = %update.user_id,
+            path = %update.avatar_file,
+            "Persisted user avatar path"
+        );
+    }
+    Ok(updated_count)
 }
 
 #[instrument(skip(url), fields(input_len = url.len()))]
@@ -283,6 +430,7 @@ pub fn content_type_ext(content_type: &str) -> &'static str {
         "video/quicktime" => "mov",
         "video/webm" => "webm",
         "audio" | "audio/m4a" | "audio/mp4" => "m4a",
+        "voice" => "m4a",
         "audio/mpeg" => "mp3",
         "audio/ogg" => "ogg",
         "audio/wav" => "wav",
@@ -304,6 +452,14 @@ pub fn message_attachment_path(
         .join("messages")
         .join(sent_at.format("%Y/%m/%d").to_string())
         .join(format!("{}.{}", message_id, ext))
+}
+
+#[instrument(fields(data_path = %data_path.display(), sticker_id = %sticker_id, ext = %ext))]
+pub fn sticker_attachment_path(data_path: &Path, sticker_id: &str, ext: &str) -> PathBuf {
+    data_path
+        .join("attachments")
+        .join("stickers")
+        .join(format!("{}.{}", sticker_id, ext))
 }
 
 #[instrument(fields(data_path = %data_path.display(), user_id = %user_id, avatar_id = %avatar_id, ext = %ext))]
@@ -402,21 +558,19 @@ pub async fn download_user_avatar(
 
 async fn download_single_media(
     client: &Client,
-    message_id: &str,
-    attachment_url: &str,
-    sent_at: DateTime<Utc>,
-    default_ext: &str,
+    download: &MediaDownload,
     data_path: &Path,
-) -> Result<String> {
-    let normalized_url = validate_remote_url(attachment_url).await?;
+) -> Result<MediaFileUpdate> {
+    let normalized_url = validate_remote_url(&download.attachment_url).await?;
     let ext = match extension_from_url(normalized_url.as_str()) {
         Some(ext) => ext,
-        None => head_content_type_ext(client, normalized_url.as_str(), default_ext).await?,
+        None => head_content_type_ext(client, normalized_url.as_str(), &download.ext).await?,
     };
 
-    let file_path = message_attachment_path(data_path, message_id, sent_at, &ext);
+    let file_path = media_attachment_path(data_path, download, &ext)?;
+    let attachment_file = relative_data_path(data_path, &file_path)?;
     if file_path.exists() {
-        return relative_data_path(data_path, &file_path);
+        return Ok(media_file_update(download, attachment_file, &file_path));
     }
 
     if let Some(parent) = file_path.parent() {
@@ -426,7 +580,173 @@ async fn download_single_media(
     let bytes = download_bytes(client, normalized_url.as_str()).await?;
     tokio::fs::write(&file_path, bytes).await?;
 
-    relative_data_path(data_path, &file_path)
+    Ok(media_file_update(download, attachment_file, &file_path))
+}
+
+fn media_attachment_path(data_path: &Path, download: &MediaDownload, ext: &str) -> Result<PathBuf> {
+    if download.content_type == "sticker" {
+        let sticker_id = download
+            .sticker_id
+            .as_deref()
+            .context("Sticker media download requires sticker_id")?;
+        return Ok(sticker_attachment_path(data_path, sticker_id, ext));
+    }
+
+    Ok(message_attachment_path(
+        data_path,
+        &download.message_id,
+        download.sent_at,
+        ext,
+    ))
+}
+
+fn media_file_update(
+    download: &MediaDownload,
+    attachment_file: String,
+    file_path: &Path,
+) -> MediaFileUpdate {
+    let gps = if download.content_type == "image" {
+        match extract_image_gps_data(file_path) {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(message_id = %download.message_id, error = %error, "Failed to extract image GPS data");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let metadata_patch = if download.content_type == "voice" {
+        extract_audio_duration(file_path)
+            .map(|duration| serde_json::json!({ "audio_duration": duration }))
+    } else {
+        None
+    };
+
+    MediaFileUpdate {
+        message_id: download.message_id.clone(),
+        attachment_file,
+        gps,
+        metadata_patch,
+    }
+}
+
+fn extract_image_gps_data(file_path: &Path) -> Result<Option<ImageGpsData>> {
+    let file = match File::open(file_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut reader = BufReader::new(file);
+    let exif = match ExifReader::new().read_from_container(&mut reader) {
+        Ok(exif) => exif,
+        Err(_) => return Ok(None),
+    };
+
+    let latitude = gps_coordinate(&exif, Tag::GPSLatitude, Tag::GPSLatitudeRef, "S")?;
+    let longitude = gps_coordinate(&exif, Tag::GPSLongitude, Tag::GPSLongitudeRef, "W")?;
+    let (Some(latitude), Some(longitude)) = (latitude, longitude) else {
+        return Ok(None);
+    };
+    let altitude = exif
+        .get_field(Tag::GPSAltitude, In::PRIMARY)
+        .and_then(|field| rational_value(&field.value, 0));
+    let timestamp = gps_timestamp(&exif);
+
+    Ok(Some(ImageGpsData {
+        latitude,
+        longitude,
+        altitude,
+        timestamp,
+    }))
+}
+
+fn gps_coordinate(
+    exif: &exif::Exif,
+    value_tag: Tag,
+    ref_tag: Tag,
+    negative_ref: &str,
+) -> Result<Option<f64>> {
+    let Some(field) = exif.get_field(value_tag, In::PRIMARY) else {
+        return Ok(None);
+    };
+    let Some(mut value) = rational_triplet_to_degrees(&field.value) else {
+        return Ok(None);
+    };
+    if exif
+        .get_field(ref_tag, In::PRIMARY)
+        .and_then(|field| ascii_value(&field.value))
+        .as_deref()
+        == Some(negative_ref)
+    {
+        value = -value;
+    }
+    Ok(Some(value))
+}
+
+fn rational_triplet_to_degrees(value: &Value) -> Option<f64> {
+    let Value::Rational(values) = value else {
+        return None;
+    };
+    let degrees = values.first()?.to_f64();
+    let minutes = values.get(1)?.to_f64();
+    let seconds = values.get(2)?.to_f64();
+    Some(degrees + minutes / 60.0 + seconds / 3600.0)
+}
+
+fn rational_value(value: &Value, index: usize) -> Option<f64> {
+    match value {
+        Value::Rational(values) => values.get(index).map(|value| value.to_f64()),
+        _ => None,
+    }
+}
+
+fn ascii_value(value: &Value) -> Option<String> {
+    let Value::Ascii(values) = value else {
+        return None;
+    };
+    let bytes = values.first()?;
+    String::from_utf8(bytes.clone()).ok()
+}
+
+fn gps_timestamp(exif: &exif::Exif) -> Option<DateTime<Utc>> {
+    let date = exif
+        .get_field(Tag::GPSDateStamp, In::PRIMARY)
+        .and_then(|field| ascii_value(&field.value))?;
+    let time = exif
+        .get_field(Tag::GPSTimeStamp, In::PRIMARY)
+        .and_then(|field| match &field.value {
+            Value::Rational(values) if values.len() >= 3 => Some((
+                values[0].to_f64() as u32,
+                values[1].to_f64() as u32,
+                values[2].to_f64() as u32,
+            )),
+            _ => None,
+        })?;
+    let mut parts = date.split(':');
+    let year = parts.next()?.parse::<i32>().ok()?;
+    let month = parts.next()?.parse::<u32>().ok()?;
+    let day = parts.next()?.parse::<u32>().ok()?;
+    chrono::NaiveDate::from_ymd_opt(year, month, day)?
+        .and_hms_opt(time.0, time.1, time.2)
+        .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
+}
+
+fn extract_audio_duration(file_path: &Path) -> Option<f64> {
+    let tagged_file = match lofty::read_from_path(file_path) {
+        Ok(file) => file,
+        Err(error) => {
+            warn!(path = %file_path.display(), error = %error, "Failed to extract audio duration");
+            return None;
+        }
+    };
+    let duration = tagged_file.properties().duration();
+    if duration.is_zero() {
+        None
+    } else {
+        Some(duration.as_secs_f64())
+    }
 }
 
 fn build_http_client() -> Client {
@@ -581,6 +901,7 @@ mod tests {
         assert_eq!(content_type_ext("image/jpeg"), "jpg");
         assert_eq!(content_type_ext("video/mp4"), "mp4");
         assert_eq!(content_type_ext("audio/mp4"), "m4a");
+        assert_eq!(content_type_ext("voice"), "m4a");
         assert_eq!(content_type_ext("sticker"), "png");
         assert_eq!(content_type_ext("other"), "bin");
     }
@@ -596,12 +917,261 @@ mod tests {
     }
 
     #[test]
+    fn sticker_attachment_path_uses_global_sticker_identity() {
+        let path = sticker_attachment_path(Path::new("/tmp/data"), "sticker-1", "webp");
+        assert_eq!(
+            path,
+            Path::new("/tmp/data/attachments/stickers/sticker-1.webp")
+        );
+    }
+
+    #[test]
+    fn media_download_path_uses_sticker_identity_for_stickers() {
+        let sent_at = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
+        let download = MediaDownload {
+            message_id: "message-1".into(),
+            sent_at,
+            content_type: "sticker".into(),
+            attachment_url: "https://example.com/sticker.webp".into(),
+            ext: "png".into(),
+            sticker_id: Some("sticker-1".into()),
+        };
+
+        let path = media_attachment_path(Path::new("/tmp/data"), &download, "webp").unwrap();
+        assert_eq!(
+            path,
+            Path::new("/tmp/data/attachments/stickers/sticker-1.webp")
+        );
+    }
+
+    #[test]
+    fn media_download_path_keeps_message_partition_for_images() {
+        let sent_at = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
+        let download = MediaDownload {
+            message_id: "message-1".into(),
+            sent_at,
+            content_type: "image".into(),
+            attachment_url: "https://example.com/image.jpg".into(),
+            ext: "jpg".into(),
+            sticker_id: None,
+        };
+
+        let path = media_attachment_path(Path::new("/tmp/data"), &download, "jpg").unwrap();
+        assert_eq!(
+            path,
+            Path::new("/tmp/data/attachments/messages/2026/01/02/message-1.jpg")
+        );
+    }
+
+    #[test]
     fn avatar_path_keeps_avatar_history_identity() {
         let path = avatar_attachment_path(Path::new("/tmp/data"), "user-1", "avatar-uuid", "png");
         assert_eq!(
             path,
             Path::new("/tmp/data/attachments/avatars/user-1_avatar-uuid.png")
         );
+    }
+
+    #[tokio::test]
+    async fn avatar_download_batch_empty_does_not_require_db_session() {
+        let media_service = MediaService::with_data_path(PathBuf::from("/tmp/data"));
+        let (updates, failure_count) = media_service.download_user_avatars(&[]).await.unwrap();
+        assert!(updates.is_empty());
+        assert_eq!(failure_count, 0);
+    }
+
+    #[tokio::test]
+    async fn media_download_batch_empty_does_not_require_db_session() {
+        let media_service = MediaService::with_data_path(PathBuf::from("/tmp/data"));
+        let (updates, failure_count) = media_service.download_media_batch(&[]).await.unwrap();
+        assert!(updates.is_empty());
+        assert_eq!(failure_count, 0);
+    }
+
+    #[tokio::test]
+    async fn collect_media_downloads_preserves_sticker_identity_from_database() {
+        let test_db =
+            lilium_test_fixtures::TestDb::acquire(lilium_test_fixtures::FixtureProfile::Empty)
+                .await
+                .expect("init media db");
+
+        lilium_database::transaction!(test_db.database(), |session| {
+            let sent_at = Utc.with_ymd_and_hms(2024, 1, 2, 3, 4, 5).unwrap();
+            let message = lilium_models::dzmm::message::Message {
+                message_id: "sticker-message-1".into(),
+                room_id: "room-1".into(),
+                sent_at,
+                sent_by: "user-1".into(),
+                content_type: "sticker".into(),
+                content_text: None,
+                content_tsv: None,
+                attachment_url: Some("https://example.com/sticker.webp".into()),
+                attachment_file: None,
+                sticker_id: Some("sticker-1".into()),
+                alt_text: None,
+                metadata: None,
+                raw_data: serde_json::json!({
+                    "message": {
+                        "content": {
+                            "type": "sticker",
+                            "stickerId": "sticker-1",
+                            "url": "https://example.com/sticker.webp"
+                        }
+                    }
+                }),
+                source: "spider".into(),
+                created_at: Utc::now(),
+                updated_at: None,
+                is_deleted: false,
+                deleted_at: None,
+                deleted_by: None,
+                is_recalled: false,
+                is_edited: false,
+                history: None,
+                reference_message_id: None,
+                reference_data: None,
+            };
+
+            crate::message::create_message_if_missing(session, &message)
+                .await
+                .expect("insert sticker message");
+
+            let downloads = collect_message_media_downloads(session, &[message.message_id.clone()])
+                .await
+                .expect("collect media downloads");
+
+            assert_eq!(downloads.len(), 1);
+            assert_eq!(downloads[0].content_type, "sticker");
+            assert_eq!(downloads[0].sticker_id.as_deref(), Some("sticker-1"));
+
+            Ok(())
+        })
+        .await
+        .expect("collect sticker media download")
+    }
+
+    #[tokio::test]
+    async fn persist_media_files_writes_gps_and_audio_duration_metadata() {
+        let test_db =
+            lilium_test_fixtures::TestDb::acquire(lilium_test_fixtures::FixtureProfile::Empty)
+                .await
+                .expect("init media db");
+
+        lilium_database::transaction!(test_db.database(), |session| {
+            let sent_at = Utc.with_ymd_and_hms(2024, 1, 2, 3, 4, 5).unwrap();
+            for (message_id, content_type) in [
+                ("image-with-gps", "image"),
+                ("voice-with-duration", "voice"),
+            ] {
+                let message = lilium_models::dzmm::message::Message {
+                    message_id: message_id.into(),
+                    room_id: "room-1".into(),
+                    sent_at,
+                    sent_by: "user-1".into(),
+                    content_type: content_type.into(),
+                    content_text: None,
+                    content_tsv: None,
+                    attachment_url: Some(format!("https://example.com/{message_id}")),
+                    attachment_file: None,
+                    sticker_id: None,
+                    alt_text: None,
+                    metadata: None,
+                    raw_data: serde_json::json!({}),
+                    source: "spider".into(),
+                    created_at: Utc::now(),
+                    updated_at: None,
+                    is_deleted: false,
+                    deleted_at: None,
+                    deleted_by: None,
+                    is_recalled: false,
+                    is_edited: false,
+                    history: None,
+                    reference_message_id: None,
+                    reference_data: None,
+                };
+                crate::message::create_message_if_missing(session, &message)
+                    .await
+                    .expect("insert media message");
+            }
+
+            persist_message_media_files(
+                session,
+                &[
+                    MediaFileUpdate {
+                        message_id: "image-with-gps".into(),
+                        attachment_file: "attachments/messages/2024/01/02/image-with-gps.jpg"
+                            .into(),
+                        gps: Some(ImageGpsData {
+                            latitude: 35.0,
+                            longitude: 139.0,
+                            altitude: Some(42.0),
+                            timestamp: Some(sent_at),
+                        }),
+                        metadata_patch: None,
+                    },
+                    MediaFileUpdate {
+                        message_id: "voice-with-duration".into(),
+                        attachment_file: "attachments/messages/2024/01/02/voice-with-duration.m4a"
+                            .into(),
+                        gps: None,
+                        metadata_patch: Some(serde_json::json!({"audio_duration": 12.5})),
+                    },
+                ],
+            )
+            .await
+            .expect("persist media side effects");
+
+            let gps = sqlx::query_as::<_, (f64, f64, Option<f64>, Option<DateTime<Utc>>)>(
+                r#"SELECT latitude, longitude, altitude, "timestamp"
+                   FROM image_gps WHERE message_id = $1"#,
+            )
+            .bind("image-with-gps")
+            .fetch_one(session.as_mut())
+            .await?;
+            assert_eq!(gps, (35.0, 139.0, Some(42.0), Some(sent_at)));
+
+            let metadata: Option<serde_json::Value> =
+                sqlx::query_scalar("SELECT metadata FROM messages WHERE message_id = $1")
+                    .bind("voice-with-duration")
+                    .fetch_one(session.as_mut())
+                    .await?;
+            assert_eq!(metadata, Some(serde_json::json!({"audio_duration": 12.5})));
+
+            Ok(())
+        })
+        .await
+        .expect("persist media files with post processing")
+    }
+
+    #[test]
+    fn extract_audio_duration_reads_wav_properties() {
+        let path = std::env::temp_dir().join(format!(
+            "lilium_voice_duration_{}_{}.wav",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let sample_rate = 8_000u32;
+        let seconds = 1u32;
+        let data_len = sample_rate * seconds * 2;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&sample_rate.to_le_bytes());
+        bytes.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        bytes.resize(bytes.len() + data_len as usize, 0);
+        std::fs::write(&path, bytes).expect("write wav fixture");
+
+        let duration = extract_audio_duration(&path).expect("duration");
+        let _ = std::fs::remove_file(&path);
+        assert!((duration - 1.0).abs() < 0.01);
     }
 
     #[tokio::test]
