@@ -57,7 +57,6 @@ pub struct UserProfile {
 }
 
 impl UpsertUserData {
-    #[allow(clippy::result_large_err)]
     #[instrument(skip(data))]
     pub fn from_api_payload(data: &serde_json::Value) -> crate::Result<Self> {
         let obj = data.as_object().ok_or_else(|| {

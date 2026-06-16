@@ -43,7 +43,6 @@ async fn query_bool<C: ConnectionTrait>(
         .map_err(|error| LiliumError::database(error.to_string()))
 }
 
-#[allow(clippy::result_large_err)]
 async fn query_i64s<C: ConnectionTrait>(
     db: &C,
     sql: impl Into<String>,

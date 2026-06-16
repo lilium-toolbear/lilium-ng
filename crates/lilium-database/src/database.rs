@@ -113,6 +113,11 @@ pub trait NotificationListenerBackend: std::fmt::Debug + Send {
     fn try_recv_payload<'a>(
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = std::result::Result<Option<String>, sqlx::Error>> + Send + 'a>>;
+
+    /// Wait for the next notification payload on this physical listener.
+    fn recv_payload<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = std::result::Result<String, sqlx::Error>> + Send + 'a>>;
 }
 
 impl NotificationListenerBackend for PgListener {
@@ -140,6 +145,12 @@ impl NotificationListenerBackend for PgListener {
                 None => Ok(None),
             }
         })
+    }
+
+    fn recv_payload<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = std::result::Result<String, sqlx::Error>> + Send + 'a>> {
+        Box::pin(async move { Ok(PgListener::recv(self).await?.payload().to_string()) })
     }
 }
 
@@ -191,13 +202,10 @@ where
     /// Use this in a notification worker that owns the listener connection. Do
     /// not call it on a pooled ORM connection.
     pub async fn recv_payload(&mut self) -> Result<String> {
-        loop {
-            if let Some(payload) = self.try_recv_payload().await? {
-                return Ok(payload);
-            }
-
-            tokio::task::yield_now().await;
-        }
+        self.listener
+            .recv_payload()
+            .await
+            .with_context(|| "receive PostgreSQL notification payload")
     }
 }
 
@@ -334,6 +342,18 @@ mod tests {
             Box<dyn Future<Output = std::result::Result<Option<String>, sqlx::Error>> + Send + 'a>,
         > {
             Box::pin(async move { Ok(self.payloads.pop_front()) })
+        }
+
+        fn recv_payload<'a>(
+            &'a mut self,
+        ) -> Pin<Box<dyn Future<Output = std::result::Result<String, sqlx::Error>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                Ok(self
+                    .payloads
+                    .pop_front()
+                    .expect("fake notification payload"))
+            })
         }
     }
 

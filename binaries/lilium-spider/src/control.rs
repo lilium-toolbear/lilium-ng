@@ -1,21 +1,12 @@
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-
-pub fn runtime_path_id(account_user_id: &str) -> String {
-    account_user_id.to_string()
-}
 
 pub fn arbiter_socket_path(runtime_dir: &Path) -> PathBuf {
     runtime_dir.join("ws_arbiter.sock")
 }
 
 pub fn worker_socket_path(runtime_dir: &Path, account_user_id: &str) -> PathBuf {
-    runtime_dir.join(format!(
-        "ws_worker_{}.sock",
-        runtime_path_id(account_user_id)
-    ))
+    runtime_dir.join(format!("ws_worker_{}.sock", account_user_id))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,15 +20,6 @@ pub enum ControlAction {
     Restart,
     Rescan,
 }
-
-pub const ACCOUNT_ACTIONS: &[ControlAction] = &[
-    ControlAction::Reconnect,
-    ControlAction::Reload,
-    ControlAction::Stop,
-    ControlAction::Start,
-    ControlAction::Restart,
-];
-pub const ARBITER_ACTIONS: &[ControlAction] = &[ControlAction::Status, ControlAction::Rescan];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControlCommand {
@@ -55,18 +37,6 @@ fn default_reason() -> String {
 }
 
 impl ControlCommand {
-    pub fn requires_account(&self) -> bool {
-        ACCOUNT_ACTIONS.contains(&self.action)
-    }
-
-    pub fn is_arbiter_action(&self) -> bool {
-        ARBITER_ACTIONS.contains(&self.action)
-    }
-
-    pub fn to_json(&self) -> String {
-        serde_json::to_string(self).unwrap_or_default()
-    }
-
     pub fn from_json(s: &str) -> Result<Self, String> {
         let payload: serde_json::Value =
             serde_json::from_str(s).map_err(|e| format!("Invalid JSON: {}", e))?;
@@ -213,10 +183,6 @@ impl ControlResponse {
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
     }
-
-    pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(s)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -257,82 +223,6 @@ pub async fn read_message(reader: &mut tokio::net::UnixStream) -> Result<String,
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_control_roundtrip() {
-        let cmd = ControlCommand {
-            action: ControlAction::Status,
-            account_user_id: Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
-            reason: "requested".to_string(),
-            data: None,
-        };
-        let json = cmd.to_json();
-        let parsed = ControlCommand::from_json(&json).unwrap();
-        assert_eq!(parsed.action, ControlAction::Status);
-        assert_eq!(
-            parsed.account_user_id.as_deref(),
-            Some("550e8400-e29b-41d4-a716-446655440000")
-        );
-    }
-
-    #[test]
-    fn test_control_response() {
-        let resp = ControlResponse {
-            ok: true,
-            message: "ok".to_string(),
-            data: None,
-        };
-        let json = resp.to_json();
-        let parsed = ControlResponse::from_json(&json).unwrap();
-        assert!(parsed.ok);
-        assert_eq!(parsed.message, "ok");
-    }
-
-    #[test]
-    fn test_requires_account() {
-        assert!(
-            ControlCommand {
-                action: ControlAction::Reload,
-                account_user_id: None,
-                reason: String::new(),
-                data: None,
-            }
-            .requires_account()
-        );
-
-        assert!(
-            !ControlCommand {
-                action: ControlAction::Status,
-                account_user_id: None,
-                reason: String::new(),
-                data: None,
-            }
-            .requires_account()
-        );
-    }
-
-    #[test]
-    fn test_is_arbiter_action() {
-        assert!(
-            ControlCommand {
-                action: ControlAction::Status,
-                account_user_id: None,
-                reason: String::new(),
-                data: None,
-            }
-            .is_arbiter_action()
-        );
-
-        assert!(
-            !ControlCommand {
-                action: ControlAction::Reload,
-                account_user_id: None,
-                reason: String::new(),
-                data: None,
-            }
-            .is_arbiter_action()
-        );
-    }
 
     #[test]
     fn test_validate_uuid_valid() {

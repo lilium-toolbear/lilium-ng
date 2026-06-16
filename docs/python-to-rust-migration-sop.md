@@ -94,12 +94,28 @@ the real source code and runtime fixtures that define those surfaces.
    changed surface crosses crate boundaries. Do not rerun unrelated tests just to
    add noise.
 
-9. Update durable docs only.
+9. Update docs during the scan, not after memory fades.
+
+   Every functionality or logic scan must update the durable project record
+   while the source evidence is still fresh:
+
+   - Add Rust code comments next to migrated logic that name the Python file and
+     commit hash.
+   - Update architecture docs when the scan changes ownership, runtime
+     boundaries, connection lifetimes, config rules, or cross-crate APIs.
+   - Update `docs/python-to-rust-migration-progress.md` with the scanned
+     boundary, Python sources read, Rust files touched, verified scenarios,
+     remaining gaps, and commands run.
+   - Keep progress notes scenario-based. Do not track parity by raw file counts
+     or test counts.
+
+10. Update durable docs only.
 
    Keep stable architecture specs and this SOP current. Delete stale audits,
-   migration trackers, and handoff files after their work has landed. README
-   must describe the current workspace, not maintain a historical document
-   index.
+   handoff files, and one-off investigation notes after their work has landed.
+   Long-lived progress tracking belongs in
+   `docs/python-to-rust-migration-progress.md`. README must describe the current
+   workspace, not maintain a historical document index.
 
 ## Required Evidence
 
@@ -108,6 +124,10 @@ Every completed migration slice must be backed by:
 - Python source files read for the behavior.
 - Python source file paths and commit hashes recorded in Rust comments for the
   migrated slice.
+- The matching entry in `docs/python-to-rust-migration-progress.md` updated in
+  the same change set.
+- Architecture docs updated when the scan changes runtime ownership, config,
+  connection lifetimes, database access, notification behavior, or public APIs.
 - Rust files changed for the implementation.
 - Tests or commands run.
 - The compatibility surface that was verified.

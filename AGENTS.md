@@ -12,6 +12,7 @@ This repository is a Rust workspace for the Lilium NG rewrite. Core code lives u
 - `binaries/lilium-spider` and `binaries/lilium-event-processor`: executable entry points
 - `docs/database-layer-plan.md`: current database layer architecture spec
 - `docs/python-to-rust-migration-sop.md`: required Python-to-Rust parity workflow
+- `docs/python-to-rust-migration-progress.md`: current scenario-based migration progress tracker
 
 Keep tests close to the code they verify. Use `crates/lilium-test-fixtures` for DB-backed integration tests.
 
@@ -47,5 +48,6 @@ Pull requests should explain the change, reference any related issue or audit no
 ## Agent Notes
 Before changing behavior, confirm the root cause with code or runtime evidence. Avoid speculative fixes, avoid noisy reruns, and resolve PR review threads after addressing them.
 For Python parity work, read the real Python source first and treat markdown analysis as index or hints only, not as the source of truth.
+During Python parity scans, update code comments, architecture docs, and `docs/python-to-rust-migration-progress.md` in the same change set as the code.
 Always uses rust 2024 edition
 Do not add test backdoors to production code. Avoid `#[cfg(test)]` / `#[cfg(not(test))]` behavior branches, magic `__test` values, noop implementations, or test-only constructors in production modules. When tests need to isolate network, workers, time, or external services, define an explicit dependency boundary and use a real mock library or fixture in the test module.

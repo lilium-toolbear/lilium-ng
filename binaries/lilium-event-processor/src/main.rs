@@ -28,7 +28,8 @@ async fn main() -> Result<()> {
         "event_processor_main".to_string(),
         config.processor.batch_size,
         config.processor.polling_interval_secs,
-    );
+    )
+    .with_notification_config(config.notification.into());
 
     let shutdown = processor.shutdown_handle();
     tokio::spawn(async move {

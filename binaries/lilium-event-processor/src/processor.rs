@@ -7,7 +7,7 @@ use tokio::time::{Duration, Instant, sleep};
 use tracing::{error, info, warn};
 
 use lilium_common::LiliumError;
-use lilium_database::Database;
+use lilium_database::{Database, NotificationConnection, NotificationDatabaseConfig};
 use lilium_models::ingestion::WebSocketEvent;
 use lilium_services::account;
 use lilium_services::event;
@@ -15,6 +15,9 @@ use lilium_services::media::MediaService;
 use lilium_services::message;
 use lilium_services::{room_member, user};
 use sea_orm::ConnectionTrait;
+
+// Python parity source: dzmm_archive@6a92a9914602d633ff6fa3f5908fa68d00c36fcd spider/ws_runtime.py
+const WEBSOCKET_EVENT_INSERTED_CHANNEL: &str = "websocket_event_inserted";
 
 #[derive(Debug, Default)]
 struct BatchSideEffects {
@@ -32,6 +35,7 @@ pub struct EventProcessor {
     max_retry_delay: Duration,
     retry_backoff_factor: f64,
     shutdown: Arc<Notify>,
+    notification_config: Option<NotificationDatabaseConfig>,
 }
 
 impl EventProcessor {
@@ -51,7 +55,13 @@ impl EventProcessor {
             max_retry_delay: Duration::from_secs(60),
             retry_backoff_factor: 2.0,
             shutdown: Arc::new(Notify::new()),
+            notification_config: None,
         }
+    }
+
+    pub fn with_notification_config(mut self, config: NotificationDatabaseConfig) -> Self {
+        self.notification_config = Some(config);
+        self
     }
 
     pub fn shutdown_handle(&self) -> Arc<Notify> {
@@ -66,6 +76,8 @@ impl EventProcessor {
             "Event processor starting"
         );
 
+        let mut notification = self.connect_notification_listener().await?;
+
         if let Err(error) = self.process_next_batch().await {
             error!(error = %error, "Initial event processor poll failed");
         }
@@ -78,6 +90,26 @@ impl EventProcessor {
                     info!("Shutting down event processor");
                     break;
                 }
+                notification = Self::recv_notification(&mut notification) => {
+                    match notification {
+                        Ok(Some(payload)) => {
+                            info!(
+                                channel = WEBSOCKET_EVENT_INSERTED_CHANNEL,
+                                payload = %payload,
+                                "Event processor woke from PostgreSQL notification"
+                            );
+                            if let Err(error) = self.process_next_batch().await {
+                                error!(error = %error, "Event processor notification poll failed");
+                            }
+                            poll_sleep.as_mut().reset(Instant::now() + self.polling_interval);
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            error!(error = %error, "Event processor notification listener failed");
+                            break;
+                        }
+                    }
+                }
                 _ = &mut poll_sleep => {
                     if let Err(error) = self.process_next_batch().await {
                         error!(error = %error, "Event processor poll failed");
@@ -88,6 +120,29 @@ impl EventProcessor {
         }
 
         Ok(())
+    }
+
+    async fn connect_notification_listener(&self) -> Result<Option<NotificationConnection>> {
+        let Some(config) = self.notification_config.clone() else {
+            return Ok(None);
+        };
+
+        let mut connection = NotificationConnection::connect(config).await?;
+        connection.listen(WEBSOCKET_EVENT_INSERTED_CHANNEL).await?;
+        info!(
+            channel = WEBSOCKET_EVENT_INSERTED_CHANNEL,
+            "Event processor notification listener attached"
+        );
+        Ok(Some(connection))
+    }
+
+    async fn recv_notification(
+        notification: &mut Option<NotificationConnection>,
+    ) -> Result<Option<String>> {
+        match notification {
+            Some(connection) => connection.recv_payload().await.map(Some),
+            None => std::future::pending().await,
+        }
     }
 
     async fn process_next_batch(&self) -> Result<()> {
@@ -453,7 +508,7 @@ impl EventProcessor {
                     )
                 })?;
 
-            let auth = account::create_auth_client(&account)?;
+            let auth = account::create_auth_client(account)?;
             let result =
                 user::batch_fetch_and_update_with_auth(session, &auth, &user_room_pairs, 1).await?;
             total_new += result.new_count;
