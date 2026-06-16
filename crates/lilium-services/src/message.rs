@@ -243,8 +243,15 @@ async fn insert_message_if_missing(session: &mut DbSession, message: &Message) -
     let result = sqlx::query(
         r#"INSERT INTO messages (
                message_id, room_id, sent_at, sent_by, content_type, content_text,
-               raw_data, source, created_at, is_deleted, is_recalled, is_edited, history
-           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+               attachment_url, attachment_file, sticker_id, alt_text, metadata, raw_data, source,
+               created_at, updated_at, is_deleted, deleted_at, deleted_by, is_recalled, is_edited,
+               history, reference_message_id, reference_data
+           ) VALUES (
+               $1, $2, $3, $4, $5, $6,
+               $7, $8, $9, $10, $11, $12, $13,
+               $14, $15, $16, $17, $18, $19, $20,
+               $21, $22, $23
+           )
            ON CONFLICT DO NOTHING"#,
     )
     .bind(&message.message_id)
@@ -253,13 +260,23 @@ async fn insert_message_if_missing(session: &mut DbSession, message: &Message) -
     .bind(&message.sent_by)
     .bind(&message.content_type)
     .bind(&message.content_text)
+    .bind(&message.attachment_url)
+    .bind(&message.attachment_file)
+    .bind(&message.sticker_id)
+    .bind(&message.alt_text)
+    .bind(&message.metadata)
     .bind(&message.raw_data)
     .bind(&message.source)
     .bind(message.created_at)
+    .bind(message.updated_at)
     .bind(message.is_deleted)
+    .bind(message.deleted_at)
+    .bind(&message.deleted_by)
     .bind(message.is_recalled)
     .bind(message.is_edited)
     .bind(&message.history)
+    .bind(&message.reference_message_id)
+    .bind(&message.reference_data)
     .execute(session.as_mut())
     .await?;
     Ok(result.rows_affected() > 0)
@@ -1133,45 +1150,19 @@ pub async fn batch_create_if_missing(
     }
 
     let mut sql = String::from(
-        "INSERT INTO messages (message_id, room_id, sent_at, sent_by, content_type, content_text, raw_data, source, created_at, is_deleted, is_recalled, is_edited, history) VALUES ",
+        "INSERT INTO messages (message_id, room_id, sent_at, sent_by, content_type, content_text, attachment_url, attachment_file, sticker_id, alt_text, metadata, raw_data, source, created_at, updated_at, is_deleted, deleted_at, deleted_by, is_recalled, is_edited, history, reference_message_id, reference_data) VALUES ",
     );
     let mut param_idx = 0u32;
     let mut value_rows: Vec<String> = Vec::new();
+    const COLS_PER_ROW: u32 = 23;
 
     for _i in 0..messages.len() {
         let base = param_idx;
-        let cols = [
-            base + 1,
-            base + 2,
-            base + 3,
-            base + 4,
-            base + 5,
-            base + 6,
-            base + 7,
-            base + 8,
-            base + 9,
-            base + 10,
-            base + 11,
-            base + 12,
-            base + 13,
-        ];
-        value_rows.push(format!(
-            "(${},{},{},{},{},{},{},{},{},{},{},{},{})",
-            cols[0],
-            cols[1],
-            cols[2],
-            cols[3],
-            cols[4],
-            cols[5],
-            cols[6],
-            cols[7],
-            cols[8],
-            cols[9],
-            cols[10],
-            cols[11],
-            cols[12],
-        ));
-        param_idx += 13;
+        let col_nums: Vec<String> = (1..=COLS_PER_ROW)
+            .map(|offset| format!("${}", base + offset))
+            .collect();
+        value_rows.push(format!("({})", col_nums.join(",")));
+        param_idx += COLS_PER_ROW;
     }
 
     sql.push_str(&value_rows.join(", "));
@@ -1186,13 +1177,23 @@ pub async fn batch_create_if_missing(
             .bind(&msg.sent_by)
             .bind(&msg.content_type)
             .bind(&msg.content_text)
+            .bind(&msg.attachment_url)
+            .bind(&msg.attachment_file)
+            .bind(&msg.sticker_id)
+            .bind(&msg.alt_text)
+            .bind(&msg.metadata)
             .bind(&msg.raw_data)
             .bind(&msg.source)
             .bind(msg.created_at)
+            .bind(msg.updated_at)
             .bind(msg.is_deleted)
+            .bind(msg.deleted_at)
+            .bind(&msg.deleted_by)
             .bind(msg.is_recalled)
             .bind(msg.is_edited)
-            .bind(&msg.history);
+            .bind(&msg.history)
+            .bind(&msg.reference_message_id)
+            .bind(&msg.reference_data);
     }
 
     let rows = q.fetch_all(session.as_mut()).await?;
@@ -2691,5 +2692,47 @@ mod tests {
             assert!(!second);
             Ok(())
         });
+
+        message_db_test!(
+            create_message_if_missing_persists_attachment_and_reference_fields,
+            session,
+            {
+                let mut msg = test_message();
+                msg.message_id = "attachment_msg".into();
+                msg.content_type = "image".into();
+                msg.attachment_url = Some("https://example.com/image.png".into());
+                msg.sticker_id = Some("sticker_1".into());
+                msg.alt_text = Some("image alt".into());
+                msg.metadata = Some(serde_json::json!({"video": {"width": 640}}));
+                msg.reference_message_id = Some("referenced_msg".into());
+                msg.reference_data =
+                    Some(serde_json::json!({"id": "referenced_msg", "text": "quoted"}));
+                msg.history = Some(serde_json::json!([{"content": "old"}]));
+
+                let created = create_message_if_missing(session, &msg)
+                    .await
+                    .expect("create");
+                assert!(created);
+
+                let saved = get_by_id(session, "attachment_msg", false)
+                    .await
+                    .expect("load")
+                    .expect("message exists");
+                assert_eq!(
+                    saved.attachment_url.as_deref(),
+                    Some("https://example.com/image.png")
+                );
+                assert_eq!(saved.sticker_id.as_deref(), Some("sticker_1"));
+                assert_eq!(saved.alt_text.as_deref(), Some("image alt"));
+                assert_eq!(saved.metadata, msg.metadata);
+                assert_eq!(
+                    saved.reference_message_id.as_deref(),
+                    Some("referenced_msg")
+                );
+                assert_eq!(saved.reference_data, msg.reference_data);
+                assert_eq!(saved.history, msg.history);
+                Ok(())
+            }
+        );
     }
 }

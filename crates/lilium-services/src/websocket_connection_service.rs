@@ -1,8 +1,7 @@
-use std::hash::{Hash, Hasher};
-
 use crate::Result;
 use chrono::{Duration, Utc};
 use lilium_database::DbSession;
+use md5::{Digest, Md5};
 
 use lilium_common::error::LiliumError;
 use lilium_models::dzmm::websocket_connection::WebsocketConnection;
@@ -10,10 +9,11 @@ use tracing::instrument;
 
 #[instrument(fields(account_user_id = %account_user_id))]
 pub fn calculate_lock_id(account_user_id: &str) -> i64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    account_user_id.hash(&mut hasher);
-    let hash = hasher.finish();
-    (hash & 0x7FFFFFFFFFFFFFFF) as i64
+    let hash = Md5::digest(account_user_id.as_bytes());
+    let mut first_eight = [0u8; 8];
+    first_eight.copy_from_slice(&hash[..8]);
+    let lock_id = u64::from_be_bytes(first_eight) & 0x7FFFFFFFFFFFFFFF;
+    lock_id as i64
 }
 
 #[instrument(skip(session), fields(user_id = %user_id))]
@@ -271,6 +271,12 @@ mod tests {
         let id1 = calculate_lock_id("user_test_deterministic");
         let id2 = calculate_lock_id("user_test_deterministic");
         assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn test_calculate_lock_id_matches_python_md5_algorithm() {
+        let id = calculate_lock_id("f9791c4c-6103-4fbb-8910-c11ae47772b3");
+        assert_eq!(id, 1746043848041696062);
     }
 
     #[test]

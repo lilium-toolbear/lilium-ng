@@ -34,6 +34,19 @@ pub struct UpsertUserData {
     pub last_seen: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AvatarDownload {
+    pub user_id: String,
+    pub avatar_url: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BatchFetchUsersResult {
+    pub new_count: i64,
+    pub updated_count: i64,
+    pub avatar_downloads: Vec<AvatarDownload>,
+}
+
 #[derive(Debug, Clone)]
 pub struct UserProfile {
     pub user_id: String,
@@ -144,6 +157,23 @@ pub fn avatar_url_changed(existing: Option<&str>, candidate: Option<&str>) -> bo
     match candidate {
         Some(candidate_url) => existing != Some(candidate_url),
         None => false,
+    }
+}
+
+#[instrument(skip(user, existing), fields(user_id = %user.user_id, existing = existing.is_some()))]
+pub fn apply_avatar_sync_plan(user: &mut User, existing: Option<&User>) -> Option<AvatarDownload> {
+    match existing {
+        Some(existing_user) if user.avatar_url == existing_user.avatar_url => {
+            user.avatar_file = existing_user.avatar_file.clone();
+            None
+        }
+        _ => user.avatar_url.clone().map(|avatar_url| {
+            user.avatar_file = None;
+            AvatarDownload {
+                user_id: user.user_id.clone(),
+                avatar_url,
+            }
+        }),
     }
 }
 
@@ -259,6 +289,16 @@ pub async fn search_users(
 #[instrument(skip(session, data), fields(user_id = %data.user_id, has_full_name = data.full_name.is_some(), has_avatar_url = data.avatar_url.is_some(), has_raw_data = data.raw_data.is_some()))]
 pub async fn upsert_user(session: &mut DbSession, data: &UpsertUserData) -> Result<User> {
     let now = Utc::now();
+    let existing = get_by_ids_raw(session, std::slice::from_ref(&data.user_id))
+        .await?
+        .into_iter()
+        .next();
+    if let Some(existing_user) = existing.as_ref() {
+        if has_profile_changed(existing_user, data) {
+            save_user_history(session, existing_user).await?;
+        }
+    }
+
     let user = sqlx::query_as::<_, User>(
         r#"INSERT INTO users (
                 user_id, full_name, avatar_url, avatar_file, bio, birthday,
@@ -274,7 +314,12 @@ pub async fn upsert_user(session: &mut DbSession, data: &UpsertUserData) -> Resu
             ON CONFLICT (user_id) DO UPDATE SET
                 full_name = COALESCE(EXCLUDED.full_name, users.full_name),
                 avatar_url = COALESCE(EXCLUDED.avatar_url, users.avatar_url),
-                avatar_file = COALESCE(EXCLUDED.avatar_file, users.avatar_file),
+                avatar_file = CASE
+                    WHEN EXCLUDED.avatar_url IS NOT NULL
+                         AND EXCLUDED.avatar_url IS DISTINCT FROM users.avatar_url
+                    THEN EXCLUDED.avatar_file
+                    ELSE COALESCE(EXCLUDED.avatar_file, users.avatar_file)
+                END,
                 bio = COALESCE(EXCLUDED.bio, users.bio),
                 birthday = COALESCE(EXCLUDED.birthday, users.birthday),
                 birthday_public = COALESCE(EXCLUDED.birthday_public, users.birthday_public),
@@ -310,6 +355,61 @@ pub async fn upsert_user(session: &mut DbSession, data: &UpsertUserData) -> Resu
 
     info!(user_id = %data.user_id, "Upserted user");
     Ok(user)
+}
+
+fn has_profile_changed(existing: &User, data: &UpsertUserData) -> bool {
+    data.full_name
+        .as_ref()
+        .is_some_and(|value| existing.full_name.as_ref() != Some(value))
+        || data
+            .avatar_url
+            .as_ref()
+            .is_some_and(|value| existing.avatar_url.as_ref() != Some(value))
+        || data
+            .bio
+            .as_ref()
+            .is_some_and(|value| existing.bio.as_ref() != Some(value))
+        || data
+            .birthday
+            .as_ref()
+            .is_some_and(|value| existing.birthday.as_ref() != Some(value))
+        || data
+            .quirk
+            .as_ref()
+            .is_some_and(|value| existing.quirk.as_ref() != Some(value))
+        || data
+            .gender
+            .as_ref()
+            .is_some_and(|value| existing.gender.as_ref() != Some(value))
+}
+
+async fn save_user_history(session: &mut DbSession, user: &User) -> Result<()> {
+    sqlx::query(
+        r#"INSERT INTO user_history (
+               user_id, full_name, avatar_url, bio, birthday, birthday_public,
+               quirk, is_bot, gender, metadata, raw_data, recorded_at, avatar_file
+           ) VALUES (
+               $1, $2, $3, $4, $5, $6,
+               $7, $8, $9, $10, $11, NOW(), $12
+           )"#,
+    )
+    .bind(&user.user_id)
+    .bind(&user.full_name)
+    .bind(&user.avatar_url)
+    .bind(&user.bio)
+    .bind(&user.birthday)
+    .bind(user.birthday_public)
+    .bind(&user.quirk)
+    .bind(user.is_bot)
+    .bind(&user.gender)
+    .bind(&user.metadata)
+    .bind(&user.raw_data)
+    .bind(&user.avatar_file)
+    .execute(session.as_mut())
+    .await
+    .context("Failed to save user history")?;
+
+    Ok(())
 }
 
 #[instrument(skip(session), fields(user_id = %user_id))]
@@ -432,7 +532,7 @@ pub async fn batch_fetch_and_update_with_auth(
     auth: &DzmmApi,
     user_room_pairs: &[(String, String)],
     cache_hours: i64,
-) -> Result<(i64, i64)> {
+) -> Result<BatchFetchUsersResult> {
     let mut seen = HashSet::new();
     let mut unique_user_ids = Vec::new();
     let mut user_to_room = HashMap::new();
@@ -446,7 +546,7 @@ pub async fn batch_fetch_and_update_with_auth(
     }
 
     if unique_user_ids.is_empty() {
-        return Ok((0, 0));
+        return Ok(BatchFetchUsersResult::default());
     }
 
     let mut existing_users = Vec::new();
@@ -471,11 +571,12 @@ pub async fn batch_fetch_and_update_with_auth(
         .collect::<Vec<_>>();
 
     if users_to_fetch.is_empty() {
-        return Ok((0, 0));
+        return Ok(BatchFetchUsersResult::default());
     }
 
     let mut new_count = 0;
     let mut updated_count = 0;
+    let mut avatar_downloads = Vec::new();
 
     for chunk in users_to_fetch.chunks(30) {
         let pairs_to_fetch = chunk
@@ -494,10 +595,9 @@ pub async fn batch_fetch_and_update_with_auth(
                 continue;
             };
 
-            if let Some(existing_user) = existing_users.get(&user_id) {
-                if user.avatar_url == existing_user.avatar_url {
-                    user.avatar_file = existing_user.avatar_file.clone();
-                }
+            if let Some(download) = apply_avatar_sync_plan(&mut user, existing_users.get(&user_id))
+            {
+                avatar_downloads.push(download);
             }
 
             let data = UpsertUserData {
@@ -529,11 +629,16 @@ pub async fn batch_fetch_and_update_with_auth(
     info!(
         new = new_count,
         updated = updated_count,
+        avatars = avatar_downloads.len(),
         total = user_room_pairs.len(),
         "Batch fetched users via auth client"
     );
 
-    Ok((new_count, updated_count))
+    Ok(BatchFetchUsersResult {
+        new_count,
+        updated_count,
+        avatar_downloads,
+    })
 }
 
 #[instrument(skip(db), fields(user_id = %user_id))]
@@ -829,6 +934,106 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn upsert_changed_avatar_url_clears_stale_avatar_file() {
+            let test_db =
+                lilium_test_fixtures::TestDb::acquire(lilium_test_fixtures::FixtureProfile::User)
+                    .await
+                    .expect("init user db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                let initial = UpsertUserData {
+                    user_id: "avatar_change_user".into(),
+                    avatar_url: Some("https://example.com/old.png".into()),
+                    avatar_file: Some("attachments/avatars/avatar_change_user_old.png".into()),
+                    ..Default::default()
+                };
+                upsert_user(session, &initial)
+                    .await
+                    .expect("insert initial");
+
+                let changed = UpsertUserData {
+                    user_id: "avatar_change_user".into(),
+                    avatar_url: Some("https://example.com/new.png".into()),
+                    avatar_file: None,
+                    ..Default::default()
+                };
+                let user = upsert_user(session, &changed)
+                    .await
+                    .expect("upsert changed");
+
+                assert_eq!(
+                    user.avatar_url.as_deref(),
+                    Some("https://example.com/new.png")
+                );
+                assert!(user.avatar_file.is_none());
+                Ok(())
+            })
+            .await
+            .expect("upsert clears stale avatar file");
+        }
+
+        #[tokio::test]
+        async fn upsert_existing_profile_change_saves_previous_snapshot_to_history() {
+            let test_db =
+                lilium_test_fixtures::TestDb::acquire(lilium_test_fixtures::FixtureProfile::User)
+                    .await
+                    .expect("init user db");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                let initial = UpsertUserData {
+                    user_id: "history_user".into(),
+                    full_name: Some("Old Name".into()),
+                    avatar_url: Some("https://example.com/old.png".into()),
+                    bio: Some("old bio".into()),
+                    ..Default::default()
+                };
+                upsert_user(session, &initial)
+                    .await
+                    .expect("insert initial");
+
+                let initial_history_count: i64 =
+                    sqlx::query_scalar("SELECT COUNT(*) FROM user_history WHERE user_id = $1")
+                        .bind("history_user")
+                        .fetch_one(session.as_mut())
+                        .await?;
+                assert_eq!(initial_history_count, 0);
+
+                let changed = UpsertUserData {
+                    user_id: "history_user".into(),
+                    avatar_url: Some("https://example.com/new.png".into()),
+                    bio: Some("new bio".into()),
+                    ..Default::default()
+                };
+                upsert_user(session, &changed)
+                    .await
+                    .expect("upsert changed");
+
+                let snapshot =
+                    sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>)>(
+                        r#"SELECT user_id, full_name, avatar_url, bio
+                       FROM user_history WHERE user_id = $1"#,
+                    )
+                    .bind("history_user")
+                    .fetch_one(session.as_mut())
+                    .await?;
+
+                assert_eq!(
+                    snapshot,
+                    (
+                        "history_user".to_string(),
+                        Some("Old Name".to_string()),
+                        Some("https://example.com/old.png".to_string()),
+                        Some("old bio".to_string()),
+                    )
+                );
+
+                Ok(())
+            })
+            .await
+            .expect("upsert saves user history");
+        }
+
+        #[tokio::test]
         async fn increment_message_count() {
             let test_db =
                 lilium_test_fixtures::TestDb::acquire(lilium_test_fixtures::FixtureProfile::User)
@@ -1030,6 +1235,89 @@ mod tests {
                 Some("https://example.com/a.png")
             ));
             assert!(avatar_url_changed(None, Some("https://example.com/a.png")));
+        }
+
+        fn test_user(user_id: &str) -> User {
+            User {
+                user_id: user_id.into(),
+                full_name: None,
+                avatar_url: None,
+                avatar_file: None,
+                bio: None,
+                birthday: None,
+                birthday_public: None,
+                quirk: None,
+                is_bot: None,
+                gender: None,
+                metadata: None,
+                raw_data: None,
+                last_seen: None,
+                message_count: 0,
+                deleted_count: 0,
+                recalled_count: 0,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            }
+        }
+
+        #[test]
+        fn avatar_sync_plan_matches_python_update_semantics() {
+            let existing_same = User {
+                user_id: "u1".into(),
+                avatar_url: Some("https://example.com/a.png".into()),
+                avatar_file: Some("attachments/avatars/u1_old.png".into()),
+                ..test_user("u1")
+            };
+            let mut fetched_same = User {
+                user_id: "u1".into(),
+                avatar_url: Some("https://example.com/a.png".into()),
+                avatar_file: None,
+                ..test_user("u1")
+            };
+            let unchanged_plan = apply_avatar_sync_plan(&mut fetched_same, Some(&existing_same));
+            assert!(unchanged_plan.is_none());
+            assert_eq!(
+                fetched_same.avatar_file.as_deref(),
+                Some("attachments/avatars/u1_old.png")
+            );
+
+            let existing_changed = User {
+                user_id: "u2".into(),
+                avatar_url: Some("https://example.com/old.png".into()),
+                avatar_file: Some("attachments/avatars/u2_old.png".into()),
+                ..test_user("u2")
+            };
+            let mut fetched_changed = User {
+                user_id: "u2".into(),
+                avatar_url: Some("https://example.com/new.png".into()),
+                avatar_file: None,
+                ..test_user("u2")
+            };
+            let changed_plan =
+                apply_avatar_sync_plan(&mut fetched_changed, Some(&existing_changed));
+            assert_eq!(
+                changed_plan,
+                Some(AvatarDownload {
+                    user_id: "u2".into(),
+                    avatar_url: "https://example.com/new.png".into()
+                })
+            );
+            assert!(fetched_changed.avatar_file.is_none());
+
+            let mut fetched_new = User {
+                user_id: "u3".into(),
+                avatar_url: Some("https://example.com/new-user.png".into()),
+                avatar_file: None,
+                ..test_user("u3")
+            };
+            let new_plan = apply_avatar_sync_plan(&mut fetched_new, None);
+            assert_eq!(
+                new_plan,
+                Some(AvatarDownload {
+                    user_id: "u3".into(),
+                    avatar_url: "https://example.com/new-user.png".into()
+                })
+            );
         }
     }
 }

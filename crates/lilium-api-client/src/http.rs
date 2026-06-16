@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::{ApiClientConfig, dzmm_local_address_from_env};
 use anyhow::{Context, Result, bail};
@@ -10,8 +10,10 @@ use base64::Engine;
 use rand::RngExt;
 use reqwest::{
     Client, Method, StatusCode,
+    cookie::{CookieStore, Jar},
     header::{ACCEPT, CONTENT_TYPE, COOKIE, HeaderMap, HeaderValue, ORIGIN, REFERER, SET_COOKIE},
     multipart::{Form, Part},
+    redirect::Policy,
 };
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -395,6 +397,27 @@ fn extract_response_cookies(headers: &HeaderMap) -> HashMap<String, String> {
     cookies
 }
 
+fn parse_cookie_header(cookie_header: &str) -> HashMap<String, String> {
+    cookie_header
+        .split(';')
+        .filter_map(|part| extract_cookie_kv(part.trim()))
+        .collect()
+}
+
+fn sanitize_logged_url(url: &Url) -> String {
+    let path = url.path();
+    if path.starts_with("/api/auth/sign-in-code/")
+        && path != "/api/auth/sign-in-code/scan"
+        && path.len() > "/api/auth/sign-in-code/".len()
+    {
+        let mut sanitized = url.clone();
+        sanitized.set_path("/api/auth/sign-in-code/<redacted>");
+        sanitized.set_query(None);
+        return sanitized.to_string();
+    }
+    url.to_string()
+}
+
 fn guess_content_type(suffix: &str) -> &str {
     match suffix.to_lowercase().as_str() {
         ".jpg" | ".jpeg" => "image/jpeg",
@@ -487,7 +510,7 @@ impl RateLimiter {
     }
 }
 
-type CookieRefreshCallback =
+pub type CookieRefreshCallback =
     Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 pub struct DzmmApi {
@@ -504,6 +527,8 @@ pub struct DzmmApi {
     rate_limiter: Arc<Mutex<RateLimiter>>,
     refresh_lock: Arc<Mutex<()>>,
     cookie_map: Arc<Mutex<HashMap<String, String>>>,
+    cookie_jar: Arc<Jar>,
+    cookie_url: Url,
 }
 
 impl DzmmApi {
@@ -568,26 +593,22 @@ impl DzmmApi {
         auto_refresh: bool,
         on_cookies_refreshed: Option<CookieRefreshCallback>,
     ) -> Result<Self> {
+        let base_url = normalize_base_url(&config.base_url)?;
+        let cookie_url = Url::parse(&base_url).context("Invalid API base URL")?;
         let cookie_map = if let Some(ref c) = cookies {
-            let map: HashMap<String, String> = c
-                .split(';')
-                .filter_map(|p| {
-                    let p = p.trim();
-                    if let Some((k, v)) = p.split_once('=') {
-                        Some((k.trim().to_string(), v.trim().to_string()))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            map
+            parse_cookie_header(c)
         } else {
             HashMap::new()
         };
+        let cookie_jar = Arc::new(Jar::default());
+        for (name, value) in &cookie_map {
+            cookie_jar.add_cookie_str(&format!("{name}={value}"), &cookie_url);
+        }
 
         let mut client_builder = Client::builder()
             .timeout(Duration::from_secs(config.request_timeout_secs))
-            .cookie_store(true);
+            .redirect(Policy::none())
+            .cookie_provider(cookie_jar.clone());
         if let Some(local_address) = dzmm_local_address_from_env()? {
             client_builder = client_builder.local_address(local_address);
         }
@@ -609,6 +630,8 @@ impl DzmmApi {
             rate_limiter: Arc::new(Mutex::new(RateLimiter::new(None, None, None, None))),
             refresh_lock: Arc::new(Mutex::new(())),
             cookie_map: Arc::new(Mutex::new(cookie_map)),
+            cookie_jar,
+            cookie_url,
         })
     }
 
@@ -618,10 +641,38 @@ impl DzmmApi {
 
     #[instrument(skip(self))]
     pub async fn get_cookie_string(&self) -> String {
-        let map = self.cookie_map.lock().await;
+        let map = self.combined_cookie_map().await;
         let mut pairs: Vec<String> = map.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
         pairs.sort();
         pairs.join("; ")
+    }
+
+    async fn combined_cookie_map(&self) -> HashMap<String, String> {
+        let mut map = self.cookie_map.lock().await.clone();
+        if let Some(header) = self.cookie_jar.cookies(&self.cookie_url) {
+            if let Ok(cookie_header) = header.to_str() {
+                map.extend(parse_cookie_header(cookie_header));
+            }
+        }
+        map
+    }
+
+    async fn sync_cookie_jar_to_map(&self) {
+        if let Some(header) = self.cookie_jar.cookies(&self.cookie_url)
+            && let Ok(cookie_header) = header.to_str()
+        {
+            let jar_cookies = parse_cookie_header(cookie_header);
+            if !jar_cookies.is_empty() {
+                self.cookie_map.lock().await.extend(jar_cookies);
+            }
+        }
+    }
+
+    async fn has_auth_cookie(&self) -> bool {
+        self.combined_cookie_map()
+            .await
+            .keys()
+            .any(|k| k.starts_with("sb-rls-auth-token"))
     }
 
     async fn merge_response_cookies(&self, headers: &HeaderMap) {
@@ -629,12 +680,18 @@ impl DzmmApi {
         if !new_cookies.is_empty() {
             let mut map = self.cookie_map.lock().await;
             for (k, v) in new_cookies {
+                self.cookie_jar
+                    .add_cookie_str(&format!("{k}={v}"), &self.cookie_url);
                 map.insert(k, v);
             }
         }
     }
 
     async fn clear_cookies(&self) {
+        for name in self.combined_cookie_map().await.keys() {
+            self.cookie_jar
+                .add_cookie_str(&format!("{name}=; Max-Age=0; Path=/"), &self.cookie_url);
+        }
         self.cookie_map.lock().await.clear();
     }
 
@@ -659,10 +716,11 @@ impl DzmmApi {
 
         let token_url = format!("{}/api/auth/token", self.base_url());
         match self
-            .client
-            .get(&token_url)
-            .headers(self.build_headers(None))
-            .send()
+            .send_request(
+                self.client
+                    .get(&token_url)
+                    .headers(self.build_headers(None)),
+            )
             .await
         {
             Ok(response) => {
@@ -725,11 +783,12 @@ impl DzmmApi {
         let body = json!({"email": email, "password": password});
 
         let sign_in_response = self
-            .client
-            .post(&sign_in_url)
-            .headers(self.build_headers(Some(&[("Content-Type", "application/json")])))
-            .json(&body)
-            .send()
+            .send_request(
+                self.client
+                    .post(&sign_in_url)
+                    .headers(self.build_headers(Some(&[("Content-Type", "application/json")])))
+                    .json(&body),
+            )
             .await
             .context("Sign-in request failed")?;
 
@@ -745,10 +804,11 @@ impl DzmmApi {
 
         let token_url = format!("{}/api/auth/token", self.base_url());
         let token_response = self
-            .client
-            .get(&token_url)
-            .headers(self.build_headers(None))
-            .send()
+            .send_request(
+                self.client
+                    .get(&token_url)
+                    .headers(self.build_headers(None)),
+            )
             .await
             .context("Token request failed")?;
 
@@ -788,21 +848,14 @@ impl DzmmApi {
             encrypted_token
         );
         let response = self
-            .client
-            .get(&url)
-            .headers(self.build_headers(None))
-            .send()
+            .send_request(self.client.get(&url).headers(self.build_headers(None)))
             .await
             .context("QR code login request failed")?;
 
         self.merge_response_cookies(response.headers()).await;
 
-        let has_auth_cookie = self
-            .cookie_map
-            .lock()
-            .await
-            .keys()
-            .any(|k| k.starts_with("sb-rls-auth-token"));
+        self.sync_cookie_jar_to_map().await;
+        let has_auth_cookie = self.has_auth_cookie().await;
 
         if has_auth_cookie {
             info!("QR code login successful!");
@@ -844,11 +897,12 @@ impl DzmmApi {
 
         let url = format!("{}/api/auth/sign-in-code/scan", self.base_url());
         let response = self
-            .client
-            .post(&url)
-            .headers(self.build_headers(None))
-            .multipart(form)
-            .send()
+            .send_request(
+                self.client
+                    .post(&url)
+                    .headers(self.build_headers(None))
+                    .multipart(form),
+            )
             .await
             .context("QR image login request failed")?;
 
@@ -865,12 +919,8 @@ impl DzmmApi {
             return Ok(false);
         }
 
-        let has_auth_cookie = self
-            .cookie_map
-            .lock()
-            .await
-            .keys()
-            .any(|k| k.starts_with("sb-rls-auth-token"));
+        self.sync_cookie_jar_to_map().await;
+        let has_auth_cookie = self.has_auth_cookie().await;
 
         if has_auth_cookie {
             info!("QR image login successful!");
@@ -920,12 +970,46 @@ impl DzmmApi {
     }
 
     async fn build_cookie_header_value(&self) -> Option<String> {
-        let map = self.cookie_map.lock().await;
-        if map.is_empty() {
+        let cookie_str = self.get_cookie_string().await;
+        if cookie_str.is_empty() {
             return None;
         }
-        let pairs: Vec<String> = map.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
-        Some(pairs.join("; "))
+        Some(cookie_str)
+    }
+
+    async fn send_request(&self, builder: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+        let request = builder.build().context("Failed to build HTTP request")?;
+        let method = request.method().clone();
+        let url = request.url().clone();
+        let logged_url = sanitize_logged_url(&url);
+        let started_at = Instant::now();
+
+        match self.client.execute(request).await {
+            Ok(response) => {
+                let status = response.status();
+                let version = response.version();
+                info!(
+                    method = %method,
+                    url = %logged_url,
+                    status = status.as_u16(),
+                    status_text = status.canonical_reason().unwrap_or(""),
+                    version = ?version,
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    "HTTP Request"
+                );
+                Ok(response)
+            }
+            Err(error) => {
+                warn!(
+                    method = %method,
+                    url = %logged_url,
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    error = %error,
+                    "HTTP Request failed"
+                );
+                Err(error).context("HTTP request failed")
+            }
+        }
     }
 
     #[instrument(
@@ -967,7 +1051,7 @@ impl DzmmApi {
             builder = builder.timeout(t);
         }
 
-        let response = builder.send().await.context("HTTP request failed")?;
+        let response = self.send_request(builder).await?;
         let status = response.status();
         let resp_headers = response.headers().clone();
         let body_bytes = response
@@ -1439,11 +1523,12 @@ impl DzmmApi {
 
         let url = format!("{}/api/group-chat/{}/avatar", self.base_url(), chatroom_id);
         let response = self
-            .client
-            .put(&url)
-            .headers(self.build_headers(None))
-            .multipart(form)
-            .send()
+            .send_request(
+                self.client
+                    .put(&url)
+                    .headers(self.build_headers(None))
+                    .multipart(form),
+            )
             .await
             .context("Failed to update room avatar")?;
 
@@ -2252,9 +2337,7 @@ impl DzmmApi {
                 info!("Downloading image from: {}", temp_image_url);
 
                 let download_response = self
-                    .client
-                    .get(&temp_image_url)
-                    .send()
+                    .send_request(self.client.get(&temp_image_url))
                     .await
                     .context("Failed to download generated image")?;
 
@@ -2483,9 +2566,7 @@ impl DzmmApi {
                 info!("Downloading edited image from: {}", temp_image_url);
 
                 let download_response = self
-                    .client
-                    .get(&temp_image_url)
-                    .send()
+                    .send_request(self.client.get(&temp_image_url))
                     .await
                     .context("Failed to download edited image")?;
 
@@ -2620,6 +2701,17 @@ mod tests {
         stream.write_all(response.as_bytes()).await.unwrap();
     }
 
+    async fn write_redirect_with_cookie(
+        stream: &mut tokio::net::TcpStream,
+        location: &str,
+        cookie: &str,
+    ) {
+        let response = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nSet-Cookie: {cookie}; Path=/; HttpOnly\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    }
+
     async fn write_image_response(stream: &mut tokio::net::TcpStream, body: &[u8]) {
         let header = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -2627,6 +2719,19 @@ mod tests {
         );
         stream.write_all(header.as_bytes()).await.unwrap();
         stream.write_all(body).await.unwrap();
+    }
+
+    async fn write_gzip_json_response(stream: &mut tokio::net::TcpStream) {
+        let body = [
+            31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 171, 86, 202, 207, 86, 178, 42, 41, 42, 77, 173, 5,
+            0, 144, 95, 212, 167, 11, 0, 0, 0,
+        ];
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(header.as_bytes()).await.unwrap();
+        stream.write_all(&body).await.unwrap();
     }
 
     async fn spawn_gamefy_server(
@@ -2694,6 +2799,51 @@ mod tests {
             recorded
         });
         (base_url, handle)
+    }
+
+    #[tokio::test]
+    async fn request_inner_decodes_gzip_json_response() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            write_gzip_json_response(&mut stream).await;
+            request
+        });
+
+        let api = test_api(base_url);
+        let (status, body, _) = api
+            ._request_inner(Method::GET, "/compressed", None, None, None, None, None)
+            .await
+            .expect("request succeeds");
+
+        let request = handle.await.expect("server task completes");
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.target, "/compressed");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, br#"{"ok":true}"#);
+    }
+
+    #[tokio::test]
+    async fn qr_code_login_accepts_auth_cookie_from_redirect_response() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            write_redirect_with_cookie(&mut stream, "/", "sb-rls-auth-token=redirect-auth").await;
+            request
+        });
+
+        let api = test_api(base_url);
+        let ok = api.login_with_qr_code("encrypted-token").await.unwrap();
+        let request = handle.await.unwrap();
+        let cookie_string = api.get_cookie_string().await;
+
+        assert!(ok);
+        assert_eq!(request.target, "/api/auth/sign-in-code/encrypted-token");
+        assert!(cookie_string.contains("sb-rls-auth-token=redirect-auth"));
     }
 
     #[test]

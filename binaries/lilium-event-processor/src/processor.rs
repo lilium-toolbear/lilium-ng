@@ -18,6 +18,12 @@ use lilium_services::media::MediaService;
 use lilium_services::message;
 use lilium_services::{room_member, user};
 
+#[derive(Debug, Default)]
+struct BatchSideEffects {
+    media_message_ids: Vec<String>,
+    avatar_downloads: Vec<user::AvatarDownload>,
+}
+
 pub struct EventProcessor {
     processor_id: String,
     database: Database,
@@ -28,7 +34,6 @@ pub struct EventProcessor {
     max_retry_delay: Duration,
     retry_backoff_factor: f64,
     shutdown: Arc<Notify>,
-    wakeup: Arc<Notify>,
 }
 
 impl EventProcessor {
@@ -48,16 +53,11 @@ impl EventProcessor {
             max_retry_delay: Duration::from_secs(60),
             retry_backoff_factor: 2.0,
             shutdown: Arc::new(Notify::new()),
-            wakeup: Arc::new(Notify::new()),
         }
     }
 
     pub fn shutdown_handle(&self) -> Arc<Notify> {
         Arc::clone(&self.shutdown)
-    }
-
-    pub fn wake(&self) {
-        self.wakeup.notify_one();
     }
 
     pub async fn run(&self) -> Result<()> {
@@ -80,12 +80,6 @@ impl EventProcessor {
                     info!("Shutting down event processor");
                     break;
                 }
-                _ = self.wakeup.notified() => {
-                    if let Err(error) = self.process_next_batch().await {
-                        error!(error = %error, "Event processor wakeup failed");
-                    }
-                    poll_sleep.as_mut().reset(Instant::now() + self.polling_interval);
-                }
                 _ = &mut poll_sleep => {
                     if let Err(error) = self.process_next_batch().await {
                         error!(error = %error, "Event processor poll failed");
@@ -105,8 +99,12 @@ impl EventProcessor {
         }
 
         info!(count = events.len(), "Processing batch");
-        self.process_batch_with_retry(&events, cursor_id, cursor_timestamp)
-            .await
+        let side_effects = self
+            .process_batch_with_retry(&events, cursor_id, cursor_timestamp)
+            .await?;
+        self.spawn_media_download(side_effects.media_message_ids);
+        self.spawn_avatar_download(side_effects.avatar_downloads);
+        Ok(())
     }
 
     async fn fetch_batch(&self) -> Result<(Vec<WebSocketEvent>, i64, Option<DateTime<Utc>>)> {
@@ -123,15 +121,15 @@ impl EventProcessor {
         events: &[WebSocketEvent],
         cursor_id: i64,
         cursor_timestamp: Option<DateTime<Utc>>,
-    ) -> Result<()> {
+    ) -> Result<BatchSideEffects> {
         let mut attempt = 0;
         loop {
             match self
                 .process_batch(events, cursor_id, cursor_timestamp)
                 .await
             {
-                Ok(()) => {
-                    return Ok(());
+                Ok(side_effects) => {
+                    return Ok(side_effects);
                 }
                 Err(e) => {
                     attempt += 1;
@@ -141,9 +139,9 @@ impl EventProcessor {
                             error = %e,
                             "Max retries exceeded, falling back to per-event processing"
                         );
-                        self.process_batch_individually(events, cursor_id, cursor_timestamp)
-                            .await?;
-                        return Ok(());
+                        return self
+                            .process_batch_individually(events, cursor_id, cursor_timestamp)
+                            .await;
                     }
 
                     let delay = self.calculate_retry_delay(attempt);
@@ -165,39 +163,115 @@ impl EventProcessor {
         events: &[WebSocketEvent],
         cursor_id: i64,
         cursor_timestamp: Option<DateTime<Utc>>,
-    ) -> Result<()> {
+    ) -> Result<BatchSideEffects> {
+        let mut side_effects = BatchSideEffects::default();
+
         for event in events {
             let event_slice = std::slice::from_ref(event);
             let event_cursor_id = event.id.unwrap_or(cursor_id);
             let event_cursor_timestamp = Some(event.timestamp).or(cursor_timestamp);
 
-            if let Err(error) = self
-                .process_batch(event_slice, event_cursor_id, event_cursor_timestamp)
+            match self
+                .process_single_event_fallback(event, event_cursor_id, event_cursor_timestamp)
                 .await
             {
-                error!(
-                    event_id = event_cursor_id,
-                    error = %error,
-                    "Skipping poison event during per-event fallback"
-                );
-                #[cfg(test)]
-                eprintln!(
-                    "process_batch_individually: event {event_cursor_id} failed, entering skip_batch"
-                );
-                if let Err(skip_error) = self
-                    .skip_batch(event_slice, event_cursor_id, event_cursor_timestamp)
-                    .await
-                {
+                Ok(event_side_effects) => {
+                    side_effects
+                        .media_message_ids
+                        .extend(event_side_effects.media_message_ids);
+                    side_effects
+                        .avatar_downloads
+                        .extend(event_side_effects.avatar_downloads);
+                }
+                Err(error) => {
                     error!(
-                            event_id = event_cursor_id,
-                        error = %skip_error,
-                        "Failed to advance cursor past poison event"
+                        event_id = event_cursor_id,
+                        error = %error,
+                        "Skipping poison event during per-event fallback"
                     );
+                    #[cfg(test)]
+                    eprintln!(
+                        "process_batch_individually: event {event_cursor_id} failed, entering skip_batch"
+                    );
+                    if let Err(skip_error) = self
+                        .skip_batch(event_slice, event_cursor_id, event_cursor_timestamp)
+                        .await
+                    {
+                        error!(
+                            event_id = event_cursor_id,
+                            error = %skip_error,
+                            "Failed to advance cursor past poison event"
+                        );
+                    }
                 }
             }
         }
 
-        Ok(())
+        Ok(side_effects)
+    }
+
+    async fn process_single_event_fallback(
+        &self,
+        event: &WebSocketEvent,
+        cursor_id: i64,
+        cursor_timestamp: Option<DateTime<Utc>>,
+    ) -> Result<BatchSideEffects> {
+        let processor_id = self.processor_id.clone();
+        let event = event.clone();
+        let event_id = event.id.unwrap_or(cursor_id);
+        let (user_fetch_collector, media_message_ids) =
+            lilium_database::transaction!(self.database, |session| {
+                let event = event.clone();
+                let processor_id = processor_id.clone();
+                async move {
+                    let mut user_fetch_collector = Vec::new();
+                    let mut media_message_ids = Vec::new();
+                    if let Some(msg_id) =
+                        Self::process_event(session, &event, &mut user_fetch_collector).await?
+                    {
+                        media_message_ids.push(msg_id);
+                    }
+
+                    event::update_offset(
+                        session,
+                        &processor_id,
+                        event_id,
+                        Some(event.timestamp).or(cursor_timestamp),
+                        Some(Utc::now()),
+                    )
+                    .await?;
+
+                    Ok::<_, anyhow::Error>((user_fetch_collector, media_message_ids))
+                }
+                .await
+            })
+            .await?;
+
+        let avatar_downloads = if user_fetch_collector.is_empty() {
+            Vec::new()
+        } else {
+            match lilium_database::transaction!(self.database, |session| {
+                let user_fetch_collector = user_fetch_collector.clone();
+                Self::sync_users(session, &user_fetch_collector).await
+            })
+            .await
+            {
+                Ok(downloads) => downloads,
+                Err(error) => {
+                    warn!(
+                        event_id = event_id,
+                        error = %error,
+                        "User sync failed after single-event fallback commit"
+                    );
+                    Vec::new()
+                }
+            }
+        };
+
+        Ok(BatchSideEffects {
+            media_message_ids,
+            avatar_downloads,
+        })
     }
 
     fn calculate_retry_delay(&self, attempt: u32) -> Duration {
@@ -214,7 +288,7 @@ impl EventProcessor {
         events: &[WebSocketEvent],
         start_cursor_id: i64,
         start_cursor_timestamp: Option<DateTime<Utc>>,
-    ) -> Result<()> {
+    ) -> Result<BatchSideEffects> {
         let processor_id = self.processor_id.clone();
         let events = events.to_vec();
         lilium_database::transaction!(self.database, |session| {
@@ -268,7 +342,7 @@ impl EventProcessor {
         processor_id: String,
         start_cursor_id: i64,
         start_cursor_timestamp: Option<DateTime<Utc>>,
-    ) -> Result<()> {
+    ) -> Result<BatchSideEffects> {
         let (user_fetch_collector, media_message_ids) =
             { Self::collect_updates_from_events(session, &events).await? };
 
@@ -279,8 +353,7 @@ impl EventProcessor {
             batch_cursor_id
         };
         let last_timestamp = batch_cursor_timestamp.or(start_cursor_timestamp);
-        Self::sync_users(session, &user_fetch_collector).await?;
-        Self::sync_media(session, &media_message_ids).await?;
+        let avatar_downloads = Self::sync_users(session, &user_fetch_collector).await?;
 
         event::update_offset(
             session,
@@ -291,7 +364,10 @@ impl EventProcessor {
         )
         .await?;
 
-        Ok(())
+        Ok(BatchSideEffects {
+            media_message_ids,
+            avatar_downloads,
+        })
     }
 
     async fn skip_batch_inner(
@@ -353,20 +429,26 @@ impl EventProcessor {
     async fn sync_users(
         session: &mut DbSession,
         user_fetch_collector: &[(String, String, String)],
-    ) -> Result<()> {
+    ) -> Result<Vec<user::AvatarDownload>> {
         if user_fetch_collector.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         #[cfg(test)]
         {
+            if user_fetch_collector
+                .iter()
+                .any(|(_, user_id, _)| user_id == "__test:user-sync-fail")
+            {
+                anyhow::bail!("test-only user sync failure");
+            }
+
             let user_room_pairs: Vec<(String, String)> = user_fetch_collector
                 .iter()
                 .map(|(_, user_id, room_id)| (user_id.clone(), room_id.clone()))
                 .collect();
-            return user::batch_fetch_and_update(session, &user_room_pairs)
-                .await
-                .map(|_| ());
+            user::batch_fetch_and_update(session, &user_room_pairs).await?;
+            return Ok(Vec::new());
         }
 
         #[cfg(not(test))]
@@ -382,6 +464,7 @@ impl EventProcessor {
             let mut total_new = 0;
             let mut total_updated = 0;
             let account_count = grouped.len();
+            let mut avatar_downloads = Vec::new();
 
             for (source_account_user_id, user_room_pairs) in grouped {
                 let account = { account::get_account(session, &source_account_user_id).await? }
@@ -396,11 +479,12 @@ impl EventProcessor {
                     })?;
 
                 let auth = account::create_auth_client(&account)?;
-                let (new_count, updated_count) =
+                let result =
                     user::batch_fetch_and_update_with_auth(session, &auth, &user_room_pairs, 1)
                         .await?;
-                total_new += new_count;
-                total_updated += updated_count;
+                total_new += result.new_count;
+                total_updated += result.updated_count;
+                avatar_downloads.extend(result.avatar_downloads);
             }
 
             info!(
@@ -410,20 +494,126 @@ impl EventProcessor {
                 "Batch fetched users via auth clients"
             );
 
-            Ok(())
+            Ok(avatar_downloads)
         }
     }
 
-    async fn sync_media(session: &mut DbSession, media_message_ids: &[String]) -> Result<()> {
+    fn spawn_media_download(&self, media_message_ids: Vec<String>) {
         if media_message_ids.is_empty() {
-            return Ok(());
+            return;
         }
 
-        let media_service = MediaService::new();
-        media_service
-            .download_media_batch(session, media_message_ids)
+        let database = self.database.clone();
+        tokio::spawn(async move {
+            let media_count = media_message_ids.len();
+            let downloads = match lilium_database::transaction!(database, |session| {
+                let media_message_ids = media_message_ids.clone();
+                lilium_services::media::collect_message_media_downloads(session, &media_message_ids)
+                    .await
+            })
             .await
-            .map(|_| ())
+            {
+                Ok(downloads) => downloads,
+                Err(error) => {
+                    warn!(
+                        count = media_count,
+                        error = %error,
+                        "Background media download lookup failed"
+                    );
+                    return;
+                }
+            };
+
+            let media_service = MediaService::new();
+            let (updates, failure_count) =
+                match media_service.download_media_batch(&downloads).await {
+                    Ok(result) => result,
+                    Err(error) => {
+                        warn!(
+                            count = media_count,
+                            error = %error,
+                            "Background media download batch failed"
+                        );
+                        return;
+                    }
+                };
+
+            if !updates.is_empty() {
+                let result: Result<()> = lilium_database::transaction!(database, |session| {
+                    let updates = updates.clone();
+                    lilium_services::media::persist_message_media_files(session, &updates)
+                        .await
+                        .map(|_| ())
+                })
+                .await;
+
+                if let Err(error) = result {
+                    warn!(
+                        count = media_count,
+                        error = %error,
+                        "Background media file persistence failed"
+                    );
+                }
+            }
+
+            if failure_count > 0 {
+                warn!(
+                    count = media_count,
+                    failures = failure_count,
+                    "Background media download batch completed with failures"
+                );
+            }
+        });
+    }
+
+    fn spawn_avatar_download(&self, avatar_downloads: Vec<user::AvatarDownload>) {
+        if avatar_downloads.is_empty() {
+            return;
+        }
+
+        let database = self.database.clone();
+        tokio::spawn(async move {
+            let avatar_count = avatar_downloads.len();
+            let media_service = MediaService::new();
+            let (updates, failure_count) =
+                match media_service.download_user_avatars(&avatar_downloads).await {
+                    Ok(result) => result,
+                    Err(error) => {
+                        warn!(
+                            count = avatar_count,
+                            error = %error,
+                            "Background avatar download batch failed"
+                        );
+                        return;
+                    }
+                };
+
+            if !updates.is_empty() {
+                let result: Result<()> = lilium_database::transaction!(database, |session| {
+                    let updates = updates.clone();
+                    lilium_services::media::persist_user_avatar_files(session, &updates)
+                        .await
+                        .map(|_| ())
+                })
+                .await;
+
+                if let Err(error) = result {
+                    warn!(
+                        count = avatar_count,
+                        error = %error,
+                        "Background avatar file persistence failed"
+                    );
+                }
+            }
+
+            if failure_count > 0 {
+                warn!(
+                    count = avatar_count,
+                    failures = failure_count,
+                    "Background avatar download batch completed with failures"
+                );
+            }
+        });
     }
 
     fn last_cursor_from_events(events: &[WebSocketEvent]) -> (i64, Option<DateTime<Utc>>) {
@@ -538,7 +728,7 @@ impl EventProcessor {
             }
             "presence:user-online" => {
                 if let Some(user_id) = event.data.get("userId").and_then(|v| v.as_str()) {
-                    if let Some(room_id) = event.data.get("roomId").and_then(|v| v.as_str()) {
+                    if let Some(room_id) = event.data.get("chatroomId").and_then(|v| v.as_str()) {
                         user_fetch_collector.push((
                             event.user_id.clone(),
                             user_id.to_string(),
@@ -748,6 +938,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn presence_user_online_collects_chatroom_user() {
+        let test_db = TestDb::acquire(FixtureProfile::Shared)
+            .await
+            .expect("init shared db");
+
+        lilium_database::transaction!(test_db.database(), |session| {
+            let event = websocket_event(
+                14,
+                "presence:user-online",
+                "account_1",
+                "2026-06-02T12:45:00Z",
+                serde_json::json!({
+                    "chatroomId": "room_1",
+                    "userId": "user_online"
+                }),
+            );
+
+            let mut user_fetch_collector = Vec::new();
+            EventProcessor::process_event(session, &event, &mut user_fetch_collector)
+                .await
+                .expect("process event");
+
+            assert_eq!(
+                user_fetch_collector,
+                vec![(
+                    "account_1".to_string(),
+                    "user_online".to_string(),
+                    "room_1".to_string()
+                )]
+            );
+
+            Ok(())
+        })
+        .await
+        .expect("presence_user_online_collects_chatroom_user");
+    }
+
+    #[tokio::test]
     async fn message_deleted_uses_deleted_by() {
         let test_db = TestDb::acquire(FixtureProfile::Shared)
             .await
@@ -861,5 +1089,62 @@ mod tests {
             .await
             .expect("fetch offset");
         assert_eq!(offset, 22);
+    }
+
+    #[tokio::test]
+    async fn per_event_fallback_keeps_message_when_user_sync_fails() {
+        let test_db = TestDb::acquire(FixtureProfile::Shared)
+            .await
+            .expect("init shared db");
+
+        let mut processor = EventProcessor::new(
+            test_db.database().clone(),
+            "test_processor".to_string(),
+            10,
+            60,
+        );
+        processor.max_retries = 0;
+
+        let event = websocket_event(
+            31,
+            "message:new",
+            "account_1",
+            "2026-06-03T00:00:00Z",
+            serde_json::json!({
+                "chatroomId": "room_1",
+                "message": {
+                    "message_id": "msg_user_sync_fail",
+                    "chatroom_id": "room_1",
+                    "sent_by": "__test:user-sync-fail",
+                    "sent_at": "2026-06-03T00:00:00Z",
+                    "content": {
+                        "type": "text",
+                        "text": "message survives user sync failure"
+                    }
+                }
+            }),
+        );
+
+        processor
+            .process_batch_with_retry(&[event], 0, None)
+            .await
+            .expect("fallback processing");
+
+        test_db
+            .database()
+            .transaction(|session| {
+                Box::pin(async move {
+                    let message = message::get_by_id(session, "msg_user_sync_fail", false)
+                        .await?
+                        .expect("message should be committed before user sync skip");
+                    assert_eq!(message.sent_by, "__test:user-sync-fail");
+
+                    let offset = event::get_offset(session, "test_processor").await?;
+                    assert_eq!(offset, 31);
+                    Ok::<_, anyhow::Error>(())
+                })
+            })
+            .await
+            .expect("verify committed message and offset");
     }
 }

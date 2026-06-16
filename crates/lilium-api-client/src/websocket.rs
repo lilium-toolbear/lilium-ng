@@ -236,7 +236,7 @@ impl WsClient {
             let disconnect_notify = disconnect_notify_error.clone();
             let disconnect_state = disconnect_state_error.clone();
             async move {
-                let payload_value = socketio_payload_to_value(payload);
+                let payload_value = socketio_connect_error_payload(payload);
                 error!(account = %account_id, error = %payload_value, "Socket.IO connection error");
                 disconnect_state.store(true, Ordering::Relaxed);
                 emit_envelope(
@@ -244,7 +244,7 @@ impl WsClient {
                     EventEnvelope {
                         account_user_id: account_id,
                         event_type: "sio:connect_error".to_string(),
-                        payload: serde_json::json!({ "error": payload_value }),
+                        payload: payload_value,
                         received_at: Utc::now(),
                         source: "socket".to_string(),
                     },
@@ -262,21 +262,7 @@ impl WsClient {
             async move {
                 let event_name: String = event.into();
                 let payload_value = socketio_payload_to_value(payload);
-                let (classified_type, is_room_message) =
-                    WebSocketEventDecoder::classify_event(&payload_value);
-
-                let (event_type, payload) = if is_room_message {
-                    if let Some(message) = WebSocketEventDecoder::decode_message(&payload_value) {
-                        (
-                            classified_type,
-                            serde_json::to_value(message).unwrap_or(serde_json::Value::Null),
-                        )
-                    } else {
-                        (event_name, payload_value)
-                    }
-                } else {
-                    (event_name, payload_value)
-                };
+                let (event_type, payload) = socketio_event_parts(&event_name, payload_value);
 
                 emit_envelope(
                     on_event,
@@ -296,7 +282,7 @@ impl WsClient {
         Ok(builder)
     }
 
-    #[instrument(skip(self, on_event, shutdown, shutdown_notify, reconnect_notify), fields(account_id = %self.account_id, url = %self.url))]
+    #[instrument(skip(self, on_event, shutdown, shutdown_notify, reconnect_notify), fields(account_id = %self.account_id))]
     pub async fn run<F>(
         &mut self,
         on_event: F,
@@ -307,7 +293,7 @@ impl WsClient {
     where
         F: FnMut(EventEnvelope) -> BoxFuture<'static, ()> + Send + 'static,
     {
-        info!(account = %self.account_id, url = %self.url, "Connecting to WebSocket");
+        info!("Connecting to WebSocket");
 
         if shutdown.load(Ordering::Relaxed) {
             info!(account = %self.account_id, "Shutdown requested before connect");
@@ -327,7 +313,14 @@ impl WsClient {
             let request = builder
                 .websocket_request()
                 .context("Failed to build Socket.IO websocket request")?;
-            let stream = connect_websocket_request(request, dzmm_local_address_from_env()?).await?;
+            let request_uri = request.uri().to_string();
+            let local_address = dzmm_local_address_from_env()?;
+            info!(
+                request_uri = %request_uri,
+                local_address = ?local_address,
+                "Opening Socket.IO websocket handshake"
+            );
+            let stream = connect_websocket_request(request, local_address).await?;
             builder
                 .connect_with_websocket_stream(stream)
                 .await
@@ -460,29 +453,61 @@ fn ip_family_name(address: IpAddr) -> &'static str {
 fn socketio_payload_to_value(payload: rust_socketio::Payload) -> serde_json::Value {
     match payload {
         rust_socketio::Payload::Text(values) => match values.as_slice() {
-            [single] => decode_value(single),
-            [] => serde_json::Value::Null,
-            _ => serde_json::Value::Array(
-                values
-                    .into_iter()
-                    .map(|value| decode_value(&value))
-                    .collect(),
-            ),
+            [single] => python_event_payload(decode_value(single)),
+            [] => serde_json::json!({"raw": null}),
+            [first, ..] => python_event_payload(decode_value(first)),
         },
         rust_socketio::Payload::Binary(bytes) => match String::from_utf8(bytes.to_vec()) {
-            Ok(text) => serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text)),
-            Err(_) => serde_json::Value::Array(
-                bytes
-                    .into_iter()
-                    .map(|byte| serde_json::Value::from(byte))
-                    .collect(),
+            Ok(text) => python_event_payload(
+                serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text)),
             ),
+            Err(_) => python_event_payload(serde_json::Value::Array(
+                bytes.into_iter().map(serde_json::Value::from).collect(),
+            )),
         },
         #[allow(deprecated)]
-        rust_socketio::Payload::String(text) => {
-            serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text))
-        }
+        rust_socketio::Payload::String(text) => python_event_payload(
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text)),
+        ),
     }
+}
+
+fn python_event_payload(value: serde_json::Value) -> serde_json::Value {
+    if value.is_object() {
+        value
+    } else {
+        serde_json::json!({ "raw": value })
+    }
+}
+
+fn socketio_event_parts(
+    event_name: &str,
+    payload: serde_json::Value,
+) -> (String, serde_json::Value) {
+    let (classified_type, is_room_message) = WebSocketEventDecoder::classify_event(&payload);
+    let event_type = if is_room_message {
+        classified_type
+    } else {
+        event_name.to_string()
+    };
+    (event_type, payload)
+}
+
+fn socketio_connect_error_payload(payload: rust_socketio::Payload) -> serde_json::Value {
+    let value = socketio_payload_to_value(payload);
+    let error = match value {
+        serde_json::Value::Object(mut object)
+            if object.len() == 1 && object.contains_key("raw") =>
+        {
+            match object.remove("raw").unwrap_or(serde_json::Value::Null) {
+                serde_json::Value::String(text) => text,
+                other => other.to_string(),
+            }
+        }
+        serde_json::Value::String(text) => text,
+        other => other.to_string(),
+    };
+    serde_json::json!({ "error": error })
 }
 
 fn decode_value(value: &serde_json::Value) -> serde_json::Value {
@@ -505,10 +530,108 @@ mod tests {
     use super::*;
 
     #[test]
+    fn websocket_builder_matches_python_socketio_endpoint() {
+        let client = WsClient::new(
+            "account-1".to_string(),
+            crate::config::DZMM_SOCKETIO_URL.to_string(),
+            Some("session=abc".to_string()),
+        );
+        let on_event = Arc::new(tokio::sync::Mutex::new(
+            |_: EventEnvelope| -> BoxFuture<'static, ()> { Box::pin(async {}) },
+        ));
+        let builder = client
+            .build_socketio_client(
+                on_event,
+                Arc::new(Notify::new()),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect("build socket.io client");
+
+        let request = builder
+            .websocket_request()
+            .expect("build websocket request");
+        let uri = request.uri();
+
+        assert_eq!(uri.scheme_str(), Some("wss"));
+        assert_eq!(uri.host(), Some("www.dzmm.ai"));
+        assert_eq!(uri.path(), "/ws/matching/");
+        assert!(
+            uri.query()
+                .expect("query")
+                .split('&')
+                .any(|pair| pair == "EIO=4")
+        );
+        assert!(
+            uri.query()
+                .expect("query")
+                .split('&')
+                .any(|pair| pair == "transport=websocket")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("Origin")
+                .and_then(|value| value.to_str().ok()),
+            Some(crate::config::DZMM_BASE_URL)
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("Referer")
+                .and_then(|value| value.to_str().ok()),
+            Some("https://www.dzmm.ai/chat")
+        );
+    }
+
+    #[test]
     fn test_decode_data_string() {
         let data = serde_json::json!("\"hello\"");
         let result = WebSocketEventDecoder::decode_data(&data);
         assert_eq!(result, Some(serde_json::json!("hello")));
+    }
+
+    #[test]
+    fn socketio_non_object_payload_matches_python_raw_envelope() {
+        let payload =
+            socketio_payload_to_value(rust_socketio::Payload::Text(vec![serde_json::json!(
+                "message:joined"
+            )]));
+
+        assert_eq!(payload, serde_json::json!({"raw": "message:joined"}));
+    }
+
+    #[test]
+    fn socketio_connect_error_matches_python_error_string_shape() {
+        let payload =
+            socketio_connect_error_payload(rust_socketio::Payload::Text(vec![serde_json::json!(
+                "transport error"
+            )]));
+
+        assert_eq!(payload, serde_json::json!({"error": "transport error"}));
+    }
+
+    #[test]
+    fn socketio_room_message_payload_stays_raw_python_shape() {
+        let payload = serde_json::json!({
+            "event": "message:new",
+            "chatroomId": "room123",
+            "message": {
+                "messageId": "msg456",
+                "sentBy": "user789",
+                "sentAt": "2026-01-01T00:00:00Z",
+                "content": {
+                    "type": "text",
+                    "text": "hello"
+                }
+            }
+        });
+
+        let (event_type, stored_payload) = socketio_event_parts("message:new", payload.clone());
+
+        assert_eq!(event_type, "message:new");
+        assert_eq!(stored_payload, payload);
+        assert!(stored_payload.get("message_id").is_none());
+        assert!(stored_payload.get("raw_data").is_none());
     }
 
     #[test]

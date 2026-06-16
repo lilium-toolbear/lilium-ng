@@ -1,4 +1,5 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
+use lilium_api_client::http::{CookieRefreshCallback, DzmmApi};
 use lilium_api_client::websocket::WsClient;
 use lilium_database::Database;
 use lilium_services::account_service;
@@ -86,7 +87,15 @@ impl Worker {
                 stop_event.store(true, Ordering::Relaxed);
                 match ws_result {
                     Ok(()) => info!(account = %self.account_id, "WebSocket task completed"),
-                    Err(e) => error!(account = %self.account_id, error = %e, "WebSocket task failed"),
+                    Err(e) => {
+                        let error_chain = format_error_chain(&e);
+                        error!(
+                            account = %self.account_id,
+                            error = %e,
+                            error_chain = %error_chain,
+                            "WebSocket task failed"
+                        );
+                    }
                 }
             }
             _ = writer_fut => {
@@ -100,13 +109,56 @@ impl Worker {
         Ok(())
     }
 
-    async fn load_cookie_header(database: &Database, account_id: &str) -> Result<Option<String>> {
+    async fn build_auth_client(database: &Database, account_id: &str) -> Result<DzmmApi> {
         let account_id = account_id.to_string();
-        lilium_database::transaction!(database, |session| {
-            let account = account_service::get_account(session, &account_id).await?;
-            Ok(account.and_then(|a| a.cookies))
+        let lookup_account_id = account_id.clone();
+        let account = lilium_database::transaction!(database, |session| {
+            let account = account_service::get_account(session, &lookup_account_id).await?;
+            Ok(account)
         })
-        .await
+        .await?
+        .with_context(|| format!("Account '{}' not found", account_id))?;
+
+        let database_for_callback = database.clone();
+        let account_id_for_callback = account_id.clone();
+        let on_cookies_refreshed: CookieRefreshCallback = Arc::new(move |cookies| {
+            let database = database_for_callback.clone();
+            let account_id = account_id_for_callback.clone();
+            Box::pin(async move {
+                let update_account_id = account_id.clone();
+                let result = lilium_database::transaction!(database, |session| {
+                    account_service::update_cookies(session, &update_account_id, &cookies).await?;
+                    Ok(())
+                })
+                .await;
+
+                match result {
+                    Ok(()) => {
+                        info!(account = %account_id, "Persisted refreshed DZMM cookies");
+                    }
+                    Err(error) => {
+                        warn!(
+                            account = %account_id,
+                            error = %error,
+                            "Failed to persist refreshed DZMM cookies"
+                        );
+                    }
+                }
+            })
+        });
+
+        DzmmApi::new(
+            account.email,
+            account.password,
+            account.signin_code,
+            account.signin_code_image,
+            account.signin_code_image_mime,
+            account.cookies,
+            Some(account.user_id),
+            true,
+            Some(on_cookies_refreshed),
+        )
+        .context("Failed to build DZMM auth client")
     }
 
     async fn run_websocket(
@@ -119,36 +171,44 @@ impl Worker {
         shutdown: Arc<Notify>,
     ) -> Result<()> {
         info!(account = %account_id, "WebSocket connection starting");
-        let cookie_header = Self::load_cookie_header(&database, &account_id).await?;
 
         loop {
             if stop_event.load(Ordering::Relaxed) {
                 break;
             }
 
-            let mut client = WsClient::new(
-                account_id.clone(),
-                websocket_url.clone(),
-                cookie_header.clone(),
-            );
-            let ingest = ingestor.clone();
-            let ws_stop = stop_event.clone();
-            let ws_shutdown = shutdown.clone();
-            let reconnect_notify = Arc::new(Notify::new());
+            let result = async {
+                let auth = Self::build_auth_client(&database, &account_id).await?;
+                auth.authenticate()
+                    .await
+                    .context("DZMM authentication failed")?;
+                let cookie_header = auth.get_cookie_string().await;
 
-            let result = client
-                .run(
-                    move |event| {
-                        let ingest = ingest.clone();
-                        Box::pin(async move {
-                            let _accepted = ingest.accept_event(event).await;
-                        })
-                    },
-                    ws_stop,
-                    ws_shutdown,
-                    reconnect_notify,
-                )
-                .await;
+                let mut client = WsClient::new(
+                    account_id.clone(),
+                    websocket_url.clone(),
+                    Some(cookie_header),
+                );
+                let ingest = ingestor.clone();
+                let ws_stop = stop_event.clone();
+                let ws_shutdown = shutdown.clone();
+                let reconnect_notify = Arc::new(Notify::new());
+
+                client
+                    .run(
+                        move |event| {
+                            let ingest = ingest.clone();
+                            Box::pin(async move {
+                                let _accepted = ingest.accept_event(event).await;
+                            })
+                        },
+                        ws_stop,
+                        ws_shutdown,
+                        reconnect_notify,
+                    )
+                    .await
+            }
+            .await;
 
             if stop_event.load(Ordering::Relaxed) {
                 break;
@@ -162,7 +222,13 @@ impl Worker {
                     );
                 }
                 Err(e) => {
-                    warn!(account = %account_id, error = %e, "WebSocket error, reconnecting");
+                    let error_chain = format_error_chain(&e);
+                    warn!(
+                        account = %account_id,
+                        error = %e,
+                        error_chain = %error_chain,
+                        "WebSocket error, reconnecting"
+                    );
                 }
             }
 
@@ -171,5 +237,31 @@ impl Worker {
 
         info!(account = %account_id, "WebSocket loop stopped");
         Ok(())
+    }
+}
+
+fn format_error_chain(error: &anyhow::Error) -> String {
+    error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" | caused by: ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Context;
+
+    #[test]
+    fn error_chain_includes_root_cause() {
+        let error = std::fs::read_to_string("/definitely/not/a/lilium/file")
+            .context("outer websocket failure")
+            .expect_err("missing file should fail");
+
+        let chain = format_error_chain(&error);
+
+        assert!(chain.contains("outer websocket failure"));
+        assert!(chain.contains("No such file") || chain.contains("os error"));
     }
 }
