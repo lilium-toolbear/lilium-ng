@@ -80,7 +80,6 @@ impl MediaService {
         Self::with_data_path(PathBuf::from("./data"))
     }
 
-    #[instrument(fields(data_path = %data_path.display()))]
     pub fn with_data_path(data_path: PathBuf) -> Self {
         Self {
             data_path,
@@ -92,7 +91,7 @@ impl MediaService {
     ///
     /// The result paths are stored relative to `data_path`, which matches the
     /// Python contract more closely than the old absolute-path behavior.
-    #[instrument(skip(self, downloads), fields(message_count = downloads.len()))]
+    #[instrument(level = "debug" skip(self, downloads), fields(message_count = downloads.len()))]
     pub async fn download_media_batch(
         &self,
         downloads: &[MediaDownload],
@@ -149,7 +148,7 @@ impl MediaService {
         Ok((updates, failure_count))
     }
 
-    #[instrument(skip(self, downloads), fields(avatar_count = downloads.len()))]
+    #[instrument(level = "debug" skip(self, downloads), fields(avatar_count = downloads.len()))]
     pub async fn download_user_avatars(
         &self,
         downloads: &[AvatarDownload],
@@ -194,7 +193,7 @@ impl MediaService {
     }
 }
 
-#[instrument(skip(db, message_ids), fields(message_count = message_ids.len()))]
+#[instrument(level = "debug" skip(db, message_ids), fields(message_count = message_ids.len()))]
 pub async fn collect_message_media_downloads<C>(
     db: &C,
     message_ids: &[String],
@@ -232,7 +231,7 @@ where
     Ok(downloads)
 }
 
-#[instrument(skip(db, updates), fields(update_count = updates.len()))]
+#[instrument(level = "debug" skip(db, updates), fields(update_count = updates.len()))]
 pub async fn persist_message_media_files<C>(db: &C, updates: &[MediaFileUpdate]) -> Result<i64>
 where
     C: ConnectionTrait,
@@ -283,7 +282,7 @@ where
     Ok(updated_count)
 }
 
-#[instrument(skip(db, updates), fields(update_count = updates.len()))]
+#[instrument(level = "debug" skip(db, updates), fields(update_count = updates.len()))]
 pub async fn persist_user_avatar_files<C>(db: &C, updates: &[AvatarFileUpdate]) -> Result<i64>
 where
     C: ConnectionTrait,
@@ -309,7 +308,6 @@ where
     Ok(updated_count)
 }
 
-#[instrument(skip(url), fields(input_len = url.len()))]
 pub fn normalize_url(url: &str) -> String {
     let mut sanitized = url.trim().to_string();
     for hidden_char in ['\u{200b}', '\u{200c}', '\u{200d}', '\u{feff}'] {
@@ -318,7 +316,6 @@ pub fn normalize_url(url: &str) -> String {
     sanitized.trim().to_string()
 }
 
-#[instrument(fields(ip = %ip))]
 pub fn is_public_ip_address(ip: &str) -> bool {
     match ip.parse::<IpAddr>() {
         Ok(addr) => is_public_ip_addr(addr),
@@ -366,7 +363,6 @@ fn is_public_ip_addr(addr: IpAddr) -> bool {
     }
 }
 
-#[instrument(skip(url), fields(input_len = url.len()))]
 pub async fn validate_remote_url(url: &str) -> Result<Url> {
     let normalized_url = normalize_url(url);
     let parsed = Url::parse(&normalized_url)
@@ -406,7 +402,6 @@ pub async fn validate_remote_url(url: &str) -> Result<Url> {
     Ok(parsed)
 }
 
-#[instrument(fields(content_type = %content_type))]
 pub fn content_type_ext(content_type: &str) -> &'static str {
     let normalized = content_type
         .split(';')
@@ -435,7 +430,6 @@ pub fn content_type_ext(content_type: &str) -> &'static str {
     }
 }
 
-#[instrument(fields(data_path = %data_path.display(), message_id = %message_id, sent_at = %sent_at, ext = %ext))]
 pub fn message_attachment_path(
     data_path: &Path,
     message_id: &str,
@@ -449,7 +443,6 @@ pub fn message_attachment_path(
         .join(format!("{}.{}", message_id, ext))
 }
 
-#[instrument(fields(data_path = %data_path.display(), sticker_id = %sticker_id, ext = %ext))]
 pub fn sticker_attachment_path(data_path: &Path, sticker_id: &str, ext: &str) -> PathBuf {
     data_path
         .join("attachments")
@@ -457,7 +450,6 @@ pub fn sticker_attachment_path(data_path: &Path, sticker_id: &str, ext: &str) ->
         .join(format!("{}.{}", sticker_id, ext))
 }
 
-#[instrument(fields(data_path = %data_path.display(), user_id = %user_id, avatar_id = %avatar_id, ext = %ext))]
 pub fn avatar_attachment_path(
     data_path: &Path,
     user_id: &str,
@@ -470,7 +462,6 @@ pub fn avatar_attachment_path(
         .join(format!("{}_{}.{}", user_id, avatar_id, ext))
 }
 
-#[instrument(skip(url), fields(input_len = url.len()))]
 pub fn transform_avatar_url(url: &str) -> Option<String> {
     let normalized = normalize_url(url);
     let parsed = Url::parse(&normalized).ok()?;
@@ -491,7 +482,6 @@ pub fn transform_avatar_url(url: &str) -> Option<String> {
     Some(transformed.to_string())
 }
 
-#[instrument(skip(url), fields(input_len = url.len()))]
 pub fn extract_avatar_id(url: &str) -> Option<String> {
     let parsed = Url::parse(&normalize_url(url)).ok()?;
     let filename = parsed.path_segments()?.next_back()?.to_string();
@@ -504,6 +494,7 @@ pub fn extract_avatar_id(url: &str) -> Option<String> {
     )
 }
 
+#[instrument(level = "debug" skip(data_path, url), fields(user_id = %user_id, input_len = url.len()))]
 pub async fn download_user_avatar(
     data_path: &Path,
     url: &str,
@@ -763,7 +754,7 @@ fn extension_from_url(url: &str) -> Option<String> {
     }
 }
 
-#[instrument(skip(client, url), fields(method = ?method, max_attempts))]
+#[instrument(level = "debug" skip(client, url), fields(method = ?method, max_attempts))]
 async fn request_with_retry(
     client: &Client,
     method: Method,
@@ -786,7 +777,7 @@ async fn request_with_retry(
     bail!("request retry loop exited unexpectedly")
 }
 
-#[instrument(skip(client, url), fields(method = ?method))]
+#[instrument(level = "debug" skip(client, url), fields(method = ?method))]
 async fn send_follow_redirects(
     client: &Client,
     method: Method,
@@ -848,14 +839,14 @@ fn is_retryable_request_error(error: &anyhow::Error) -> bool {
     })
 }
 
-#[instrument(skip(client, url), fields(url_len = url.len()))]
+#[instrument(level = "debug" skip(client, url), fields(url_len = url.len()))]
 async fn download_bytes(client: &Client, url: &str) -> Result<Vec<u8>> {
     let response = request_with_retry(client, Method::GET, url, 3).await?;
     let response = response.error_for_status()?;
     Ok(response.bytes().await?.to_vec())
 }
 
-#[instrument(skip(client, url), fields(url_len = url.len(), default_ext = %default_ext))]
+#[instrument(level = "debug" skip(client, url), fields(url_len = url.len(), default_ext = %default_ext))]
 async fn head_content_type_ext(client: &Client, url: &str, default_ext: &str) -> Result<String> {
     let response = request_with_retry(client, Method::HEAD, url, 3).await?;
     let response = response.error_for_status()?;

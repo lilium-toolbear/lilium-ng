@@ -21,7 +21,7 @@ pub struct WebSocketEventInsert {
     pub timestamp: DateTime<Utc>,
 }
 
-#[instrument(skip(db, data), fields(user_id = %user_id, event = %event, timestamp = %timestamp))]
+#[instrument(level = "debug" skip(db, data), fields(user_id = %user_id, event = %event, timestamp = %timestamp))]
 pub async fn insert_event(
     db: &impl ConnectionTrait,
     user_id: &str,
@@ -41,7 +41,7 @@ pub async fn insert_event(
     Ok(record)
 }
 
-#[instrument(skip(db, events), fields(event_count = events.len()))]
+#[instrument(level = "debug" skip(db, events), fields(event_count = events.len()))]
 pub async fn insert_events(
     db: &impl ConnectionTrait,
     events: &[WebSocketEventInsert],
@@ -65,7 +65,7 @@ pub async fn insert_events(
     Ok(inserted.len() as i64)
 }
 
-#[instrument(skip(db), fields(limit, user_id = ?user_id, event_type = ?event_type))]
+#[instrument(level = "debug" skip(db), fields(limit, user_id = ?user_id, event_type = ?event_type))]
 pub async fn get_pending_events(
     db: &impl ConnectionTrait,
     limit: i64,
@@ -91,7 +91,7 @@ pub async fn get_pending_events(
         .collect())
 }
 
-#[instrument(skip(db), fields(last_processed_id, last_processed_timestamp = ?last_processed_timestamp, limit, user_id = ?user_id, event_type = ?event_type))]
+#[instrument(level = "debug" skip(db), fields(last_processed_id, last_processed_timestamp = ?last_processed_timestamp, limit, user_id = ?user_id, event_type = ?event_type))]
 pub async fn get_events_after_offset(
     db: &impl ConnectionTrait,
     last_processed_id: i64,
@@ -136,7 +136,7 @@ pub async fn get_events_after_offset(
         .collect())
 }
 
-#[instrument(skip(db), fields(event_id))]
+#[instrument(level = "debug" skip(db), fields(event_id))]
 pub async fn delete_event(db: &impl ConnectionTrait, event_id: i64) -> Result<()> {
     websocket_events::Entity::delete_many()
         .filter(websocket_events::Column::Id.eq(event_id))
@@ -145,7 +145,7 @@ pub async fn delete_event(db: &impl ConnectionTrait, event_id: i64) -> Result<()
     Ok(())
 }
 
-#[instrument(skip(db))]
+#[instrument(level = "debug" skip(db))]
 pub async fn get_queue_depth(db: &impl ConnectionTrait) -> Result<i64> {
     let count = websocket_events::Entity::find()
         .select_only()
@@ -158,7 +158,7 @@ pub async fn get_queue_depth(db: &impl ConnectionTrait) -> Result<i64> {
     Ok(count)
 }
 
-#[instrument(skip(db))]
+#[instrument(level = "debug" skip(db))]
 pub async fn get_oldest_event_age(
     db: &impl ConnectionTrait,
 ) -> Result<Option<std::time::Duration>> {
@@ -174,7 +174,7 @@ pub async fn get_oldest_event_age(
     Ok(oldest.and_then(|ts| Utc::now().signed_duration_since(ts).to_std().ok()))
 }
 
-#[instrument(skip(db))]
+#[instrument(level = "debug" skip(db))]
 pub async fn get_max_event_id(db: &impl ConnectionTrait) -> Result<Option<i64>> {
     let max_id = websocket_events::Entity::find()
         .select_only()
@@ -186,7 +186,7 @@ pub async fn get_max_event_id(db: &impl ConnectionTrait) -> Result<Option<i64>> 
     Ok(max_id)
 }
 
-#[instrument(skip(db))]
+#[instrument(level = "debug" skip(db))]
 pub async fn get_latest_event_cursor(
     db: &impl ConnectionTrait,
 ) -> Result<(Option<DateTime<Utc>>, i64)> {
@@ -204,7 +204,7 @@ pub async fn get_latest_event_cursor(
         .unwrap_or((None, 0)))
 }
 
-#[instrument(skip(db), fields(user_id = ?user_id, event_type = ?event_type))]
+#[instrument(level = "debug" skip(db), fields(user_id = ?user_id, event_type = ?event_type))]
 pub async fn get_latest_event(
     db: &impl ConnectionTrait,
     user_id: Option<&str>,
@@ -229,7 +229,7 @@ pub async fn get_latest_event(
         .next())
 }
 
-#[instrument(skip(db), fields(event_id))]
+#[instrument(level = "debug" skip(db), fields(event_id))]
 pub async fn get_latest_timestamp_for_id(
     db: &impl ConnectionTrait,
     event_id: i64,
@@ -246,7 +246,7 @@ pub async fn get_latest_timestamp_for_id(
     Ok(ts)
 }
 
-#[instrument(skip(db), fields(last_timestamp = ?last_timestamp, last_id, limit))]
+#[instrument(level = "debug" skip(db), fields(last_timestamp = ?last_timestamp, last_id, limit))]
 pub async fn poll_events(
     db: &impl ConnectionTrait,
     last_timestamp: Option<DateTime<Utc>>,
@@ -260,7 +260,7 @@ pub async fn poll_events(
     }
 }
 
-#[instrument(skip(db), fields(processor_id = %processor_id))]
+#[instrument(level = "debug" skip(db), fields(processor_id = %processor_id))]
 pub async fn get_cursor(
     db: &impl ConnectionTrait,
     processor_id: &str,
@@ -271,7 +271,7 @@ pub async fn get_cursor(
     Ok(offset)
 }
 
-#[instrument(skip(db), fields(processor_id = %processor_id))]
+#[instrument(level = "debug" skip(db), fields(processor_id = %processor_id))]
 pub async fn get_offset(db: &impl ConnectionTrait, processor_id: &str) -> Result<i64> {
     let offset = event_processor_offsets::Entity::find_by_id(processor_id.to_owned())
         .one(db)
@@ -281,7 +281,7 @@ pub async fn get_offset(db: &impl ConnectionTrait, processor_id: &str) -> Result
     Ok(offset)
 }
 
-#[instrument(skip(db), fields(processor_id = %processor_id, last_processed_id, has_last_processed_timestamp = last_processed_timestamp.is_some(), has_last_processed_at = last_processed_at.is_some()))]
+#[instrument(level = "debug" skip(db), fields(processor_id = %processor_id, last_processed_id, has_last_processed_timestamp = last_processed_timestamp.is_some(), has_last_processed_at = last_processed_at.is_some()))]
 pub async fn update_offset(
     db: &impl ConnectionTrait,
     processor_id: &str,
@@ -321,7 +321,7 @@ pub async fn update_offset(
     Ok(record)
 }
 
-#[instrument(skip(db), fields(processor_id = %processor_id))]
+#[instrument(level = "debug" skip(db), fields(processor_id = %processor_id))]
 pub async fn delete_offset(db: &impl ConnectionTrait, processor_id: &str) -> Result<()> {
     event_processor_offsets::Entity::delete_by_id(processor_id.to_owned())
         .exec(db)

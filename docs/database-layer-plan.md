@@ -24,6 +24,7 @@ Production API:
 pub struct Database;
 pub struct RawDbConnection;
 pub struct NotificationConnection;
+pub struct DedicatedDbConnection;
 
 #[derive(Debug, Clone)]
 pub struct DatabaseConfig {
@@ -36,6 +37,11 @@ pub struct NotificationDatabaseConfig {
     pub url: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct DedicatedDatabaseConfig {
+    pub url: String,
+}
+
 impl Database {
     pub async fn create(config: DatabaseConfig) -> Result<Self>;
     pub fn orm(&self) -> &sea_orm::DatabaseConnection;
@@ -45,6 +51,10 @@ impl Database {
 
 impl NotificationConnection {
     pub async fn connect(config: NotificationDatabaseConfig) -> Result<Self>;
+}
+
+impl DedicatedDbConnection {
+    pub async fn connect(config: DedicatedDatabaseConfig) -> Result<Self>;
 }
 ```
 
@@ -147,9 +157,11 @@ boundary or PostgreSQL-specific SQL.
 
 Spider and event-processor notification consumers now use
 `NotificationConnection` with `DATABASE_NOTIFICATION_URL`. Spider websocket
-advisory-lock ownership is still an open runtime gap and must be implemented
-with a dedicated lock-owning connection before the Python heartbeat/lock loop is
-considered migrated.
+advisory-lock ownership now uses `DedicatedDbConnection` created from
+`DATABASE_URL`, held for the worker lifecycle, and released during worker
+shutdown. The heartbeat loop updates `websocket_connections.last_heartbeat`
+through the same dedicated connection that owns the session-level advisory
+lock.
 
 ## Verification Commands
 

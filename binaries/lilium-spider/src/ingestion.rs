@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, mpsc};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, instrument, warn};
 
 use lilium_common::LiliumError;
 use lilium_database::Database;
@@ -190,6 +190,7 @@ impl EventIngestor {
         (ingestor, rx)
     }
 
+    #[instrument(level = "debug" skip(self, event))]
     pub async fn accept_event(&self, event: EventEnvelope) -> bool {
         if event.account_user_id != self.account_user_id {
             self.spilled_count.fetch_add(1, Ordering::Relaxed);

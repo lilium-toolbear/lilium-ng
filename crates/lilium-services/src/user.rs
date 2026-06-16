@@ -57,7 +57,6 @@ pub struct UserProfile {
 }
 
 impl UpsertUserData {
-    #[instrument(skip(data))]
     pub fn from_api_payload(data: &serde_json::Value) -> crate::Result<Self> {
         let obj = data.as_object().ok_or_else(|| {
             LiliumError::service(
@@ -139,7 +138,6 @@ impl UpsertUserData {
     }
 }
 
-#[instrument(fields(has_updated_at = updated_at.is_some(), cache_hours, now))]
 pub fn is_user_cache_fresh(
     updated_at: Option<DateTime<Utc>>,
     cache_hours: i64,
@@ -154,7 +152,6 @@ pub fn is_user_cache_fresh(
         .unwrap_or(false)
 }
 
-#[instrument(fields(existing_set = existing.is_some(), candidate_set = candidate.is_some()))]
 pub fn avatar_url_changed(existing: Option<&str>, candidate: Option<&str>) -> bool {
     match candidate {
         Some(candidate_url) => existing != Some(candidate_url),
@@ -162,7 +159,6 @@ pub fn avatar_url_changed(existing: Option<&str>, candidate: Option<&str>) -> bo
     }
 }
 
-#[instrument(skip(user, existing), fields(user_id = %user.user_id, existing = existing.is_some()))]
 pub fn apply_avatar_sync_plan(
     user: &mut ApiUser,
     existing: Option<&User>,
@@ -182,7 +178,7 @@ pub fn apply_avatar_sync_plan(
     }
 }
 
-#[instrument(skip(db), fields(user_id = %user_id))]
+#[instrument(level = "debug" skip(db), fields(user_id = %user_id))]
 pub async fn get_by_id<C>(db: &C, user_id: &str) -> Result<Option<User>>
 where
     C: ConnectionTrait,
@@ -193,7 +189,7 @@ where
     Ok(user)
 }
 
-#[instrument(skip(db, user_ids), fields(user_count = user_ids.len()))]
+#[instrument(level = "debug" skip(db, user_ids), fields(user_count = user_ids.len()))]
 pub async fn get_by_ids<C>(db: &C, user_ids: &[String]) -> Result<Vec<User>>
 where
     C: ConnectionTrait,
@@ -211,7 +207,7 @@ where
     Ok(users)
 }
 
-#[instrument(skip(db, params), fields(has_query = params.query.is_some(), limit = params.limit, offset = params.offset))]
+#[instrument(level = "debug" skip(db, params), fields(has_query = params.query.is_some(), limit = params.limit, offset = params.offset))]
 pub async fn search_users<C>(db: &C, params: &SearchUsersParams) -> Result<Vec<User>>
 where
     C: ConnectionTrait,
@@ -253,7 +249,7 @@ where
     Ok(users)
 }
 
-#[instrument(skip(db, data), fields(user_id = %data.user_id, has_full_name = data.full_name.is_some(), has_avatar_url = data.avatar_url.is_some(), has_raw_data = data.raw_data.is_some()))]
+#[instrument(level = "debug" skip(db, data), fields(user_id = %data.user_id, has_full_name = data.full_name.is_some(), has_avatar_url = data.avatar_url.is_some(), has_raw_data = data.raw_data.is_some()))]
 pub async fn upsert_user<C>(db: &C, data: &UpsertUserData) -> Result<User>
 where
     C: ConnectionTrait,
@@ -409,7 +405,7 @@ where
     Ok(())
 }
 
-#[instrument(skip(db), fields(user_id = %user_id))]
+#[instrument(level = "debug" skip(db), fields(user_id = %user_id))]
 pub async fn increment_message_count<C>(db: &C, user_id: &str) -> Result<()>
 where
     C: ConnectionTrait,
@@ -420,7 +416,7 @@ where
     Ok(())
 }
 
-#[instrument(skip(db), fields(user_id = %user_id))]
+#[instrument(level = "debug" skip(db), fields(user_id = %user_id))]
 pub async fn increment_deleted_count<C>(db: &C, user_id: &str) -> Result<()>
 where
     C: ConnectionTrait,
@@ -431,7 +427,7 @@ where
     Ok(())
 }
 
-#[instrument(skip(db), fields(user_id = %user_id))]
+#[instrument(level = "debug" skip(db), fields(user_id = %user_id))]
 pub async fn increment_recalled_count<C>(db: &C, user_id: &str) -> Result<()>
 where
     C: ConnectionTrait,
@@ -491,7 +487,7 @@ where
     Ok(())
 }
 
-#[instrument(skip(db, user_room_pairs), fields(pair_count = user_room_pairs.len()))]
+#[instrument(level = "debug" skip(db, user_room_pairs), fields(pair_count = user_room_pairs.len()))]
 pub async fn batch_fetch_and_update<C>(
     db: &C,
     user_room_pairs: &[(String, String)],
@@ -567,7 +563,7 @@ where
     Ok((new_count, updated_count))
 }
 
-#[instrument(skip(db, auth, user_room_pairs), fields(pair_count = user_room_pairs.len(), cache_hours))]
+#[instrument(level = "debug" skip(db, auth, user_room_pairs), fields(pair_count = user_room_pairs.len(), cache_hours))]
 pub async fn batch_fetch_and_update_with_auth<C>(
     db: &C,
     auth: &DzmmApi,
@@ -685,7 +681,7 @@ where
     })
 }
 
-#[instrument(skip(db), fields(user_id = %user_id))]
+#[instrument(level = "debug" skip(db), fields(user_id = %user_id))]
 pub async fn fetch_user_profile<C>(db: &C, user_id: &str) -> Result<Option<UserProfile>>
 where
     C: ConnectionTrait,

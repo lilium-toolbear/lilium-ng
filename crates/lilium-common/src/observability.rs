@@ -4,6 +4,9 @@ use std::borrow::Cow;
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use sentry::integrations::tracing::EventFilter;
 
 fn env_float(name: &str, default: f32) -> f32 {
     env::var(name)
@@ -18,6 +21,34 @@ fn env_string(name: &str) -> Option<String> {
 
 fn get_backend_sentry_dsn() -> Option<String> {
     env_string("SENTRY_BACKEND_DSN").or_else(|| env_string("SENTRY_DSN"))
+}
+
+fn backend_sentry_release() -> Option<Cow<'static, str>> {
+    env_string("SENTRY_RELEASE")
+        .map(Cow::Owned)
+        .or_else(|| option_env!("LILIUM_GIT_COMMIT_HASH").map(Cow::Borrowed))
+}
+
+fn init_backend_tracing_subscriber() {
+    let sentry_layer =
+        sentry::integrations::tracing::layer().event_filter(|md| match *md.level() {
+            // Capture error and warn level events as both logs and events in Sentry
+            tracing::Level::ERROR => EventFilter::Event | EventFilter::Log,
+            // Capture everything else as both a breadcrumb and a log
+            _ => EventFilter::Breadcrumb | EventFilter::Log,
+        });
+    let _ = tracing_subscriber::registry()
+        .with(sentry_layer)
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_level(true) // don't include levels in formatted output
+                .with_target(false)
+                .compact(),
+        )
+        .try_init();
 }
 
 fn event_text(event: &Event<'_>) -> String {
@@ -139,6 +170,7 @@ fn apply_backend_service_scope(service_name: &str) {
 
 pub fn init_backend_sentry(service_name: &str) -> Option<ClientInitGuard> {
     if env::var_os("PYTEST_CURRENT_TEST").is_some() {
+        init_backend_tracing_subscriber();
         tracing::info!("Sentry disabled for pytest context");
         return None;
     }
@@ -146,6 +178,7 @@ pub fn init_backend_sentry(service_name: &str) -> Option<ClientInitGuard> {
     let dsn = match get_backend_sentry_dsn() {
         Some(dsn) => dsn,
         None => {
+            init_backend_tracing_subscriber();
             tracing::info!("Sentry disabled: no SENTRY_BACKEND_DSN or SENTRY_DSN configured");
             return None;
         }
@@ -164,11 +197,10 @@ pub fn init_backend_sentry(service_name: &str) -> Option<ClientInitGuard> {
         ..Default::default()
     };
 
-    if let Some(release) = env_string("SENTRY_RELEASE") {
-        options.release = Some(release.into());
-    }
+    options.release = backend_sentry_release();
 
     let guard = sentry::init(options);
+    init_backend_tracing_subscriber();
     apply_backend_service_scope(service_name);
     tracing::info!("Sentry initialized for {}", service_name);
     Some(guard)

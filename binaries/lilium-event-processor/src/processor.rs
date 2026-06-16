@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tokio::time::{Duration, Instant, sleep};
-use tracing::{error, info, warn};
+use tracing::{Instrument, error, info, warn};
 
 use lilium_common::LiliumError;
 use lilium_database::{Database, NotificationConnection, NotificationDatabaseConfig};
@@ -146,18 +146,30 @@ impl EventProcessor {
     }
 
     async fn process_next_batch(&self) -> Result<()> {
-        let (events, cursor_id, cursor_timestamp) = self.fetch_batch().await?;
-        if events.is_empty() {
-            return Ok(());
-        }
+        let batch_span = tracing::info_span!(
+            "lilium-event-processor.batch",
+            sentry.name = "event_processor batch",
+            sentry.op = "queue.process",
+            processor.id = %self.processor_id,
+            configured.batch_size = self.batch_size,
+        );
 
-        info!(count = events.len(), "Processing batch");
-        let side_effects = self
-            .process_batch_with_retry(&events, cursor_id, cursor_timestamp)
-            .await?;
-        self.spawn_media_download(side_effects.media_message_ids);
-        self.spawn_avatar_download(side_effects.avatar_downloads);
-        Ok(())
+        async {
+            let (events, cursor_id, cursor_timestamp) = self.fetch_batch().await?;
+            if events.is_empty() {
+                return Ok(());
+            }
+
+            info!(count = events.len(), "Processing batch");
+            let side_effects = self
+                .process_batch_with_retry(&events, cursor_id, cursor_timestamp)
+                .await?;
+            self.spawn_media_download(side_effects.media_message_ids);
+            self.spawn_avatar_download(side_effects.avatar_downloads);
+            Ok(())
+        }
+        .instrument(batch_span)
+        .await
     }
 
     async fn fetch_batch(&self) -> Result<(Vec<WebSocketEvent>, i64, Option<DateTime<Utc>>)> {

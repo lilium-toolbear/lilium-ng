@@ -40,6 +40,15 @@ Write tests that verify behavior, not constants or placeholder assertions. Prefe
 
 Observability should be treated as day-0 infrastructure for migrated binaries. Keep tracing in place, and carry over the Python-side Sentry/telemetry surface when a feature depends on runtime diagnostics.
 
+## Observability Guidelines
+Instrument service-layer boundaries that perform external I/O or orchestrate external I/O: database calls, dedicated PostgreSQL sessions, API/network requests, filesystem reads or writes, notification listeners, and long-running polling loops.
+
+Do not instrument pure helpers, constructors, deterministic mappers, parsers, normalizers, path builders, cache predicates, retry classifiers, hash/id calculators, or other functions that only transform in-memory values. These create noisy spans without improving runtime diagnosis.
+
+When adding `#[instrument]`, skip large or sensitive values such as database handles, API clients, request bodies, credentials, cookies, raw payloads, URLs, file contents, and callback closures. Record compact fields such as IDs, counts, booleans, operation names, and durations. Keep SQL visibility in the database observability layer instead of duplicating SQL-like spans in services.
+
+Sentry queries made during debugging should default to `statsPeriod=1h`; only expand the window when explicitly requested.
+
 ## Commit & Pull Request Guidelines
 Commit history uses conventional prefixes such as `feat:`, `fix:`, `docs:`, `refactor:`, and `chore:`. Keep commit messages short and imperative.
 

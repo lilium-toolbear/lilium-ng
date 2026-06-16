@@ -12,7 +12,7 @@ use tracing::instrument;
 
 type RoomMember = room_members::Model;
 
-#[instrument(skip(db), fields(room_id = %room_id, user_id = %user_id))]
+#[instrument(level = "debug" skip(db), fields(room_id = %room_id, user_id = %user_id))]
 pub async fn get_member_info(
     db: &impl ConnectionTrait,
     room_id: &str,
@@ -24,7 +24,7 @@ pub async fn get_member_info(
     Ok(member)
 }
 
-#[instrument(skip(db), fields(room_id = %room_id, user_id = %user_id))]
+#[instrument(level = "debug" skip(db), fields(room_id = %room_id, user_id = %user_id))]
 pub async fn is_member(db: &impl ConnectionTrait, room_id: &str, user_id: &str) -> Result<bool> {
     let member = room_members::Entity::find()
         .filter(room_members::Column::RoomId.eq(room_id))
@@ -35,7 +35,7 @@ pub async fn is_member(db: &impl ConnectionTrait, room_id: &str, user_id: &str) 
     Ok(member.is_some())
 }
 
-#[instrument(skip(db, user_ids), fields(room_id = %room_id, user_count = user_ids.len(), has_account_user_id = _account_user_id.is_some()))]
+#[instrument(level = "debug" skip(db, user_ids), fields(room_id = %room_id, user_count = user_ids.len(), has_account_user_id = _account_user_id.is_some()))]
 pub async fn get_active_members_by_ids(
     db: &impl ConnectionTrait,
     room_id: &str,
@@ -60,7 +60,7 @@ pub async fn get_active_members_by_ids(
     Ok(map)
 }
 
-#[instrument(skip(db), fields(room_id = %room_id, user_id = %user_id, role = %role, has_joined_at = joined_at.is_some()))]
+#[instrument(level = "debug" skip(db), fields(room_id = %room_id, user_id = %user_id, role = %role, has_joined_at = joined_at.is_some()))]
 pub async fn upsert_member(
     db: &impl ConnectionTrait,
     room_id: &str,
@@ -94,7 +94,7 @@ pub async fn upsert_member(
     Ok(())
 }
 
-#[instrument(skip(db), fields(room_id = %room_id, user_id = %user_id, role = %role, has_joined_at = joined_at.is_some()))]
+#[instrument(level = "debug" skip(db), fields(room_id = %room_id, user_id = %user_id, role = %role, has_joined_at = joined_at.is_some()))]
 pub async fn upsert_member_simple(
     db: &impl ConnectionTrait,
     room_id: &str,
@@ -105,7 +105,7 @@ pub async fn upsert_member_simple(
     upsert_member(db, room_id, user_id, role, joined_at).await
 }
 
-#[instrument(skip(db), fields(room_id = %room_id, user_id = %user_id, has_left_at = left_at.is_some()))]
+#[instrument(level = "debug" skip(db), fields(room_id = %room_id, user_id = %user_id, has_left_at = left_at.is_some()))]
 pub async fn mark_member_left(
     db: &impl ConnectionTrait,
     room_id: &str,
@@ -126,7 +126,7 @@ pub async fn mark_member_left(
     }
 }
 
-#[instrument(skip(db), fields(room_id = %room_id))]
+#[instrument(level = "debug" skip(db), fields(room_id = %room_id))]
 pub async fn get_member_count(db: &impl ConnectionTrait, room_id: &str) -> Result<i64> {
     let count = room_members::Entity::find()
         .select_only()
@@ -141,7 +141,7 @@ pub async fn get_member_count(db: &impl ConnectionTrait, room_id: &str) -> Resul
     Ok(count)
 }
 
-#[instrument(skip(db), fields(room_id = %room_id, limit, offset))]
+#[instrument(level = "debug" skip(db), fields(room_id = %room_id, limit, offset))]
 pub async fn get_room_members(
     db: &impl ConnectionTrait,
     room_id: &str,

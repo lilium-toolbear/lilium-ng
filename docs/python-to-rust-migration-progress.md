@@ -39,6 +39,9 @@ Rust files updated:
 - `binaries/lilium-event-processor/src/main.rs`
 - `binaries/lilium-event-processor/src/processor.rs`
 - `crates/lilium-database/src/database.rs`
+- `crates/lilium-services/src/websocket_connection.rs`
+- `crates/lilium-test-fixtures/src/database.rs`
+- `crates/lilium-test-fixtures/src/profile.rs`
 
 Verified scenarios:
 
@@ -65,24 +68,29 @@ Verified scenarios:
   `{"status": "failed"}`.
 - Worker control socket uses `ws_worker_<account_user_id>.sock` and supports
   `status`, `reconnect`, and `stop`.
+- Worker acquires a PostgreSQL advisory lock on one dedicated physical
+  connection before running websocket tasks.
+- Worker releases the same advisory lock and deletes the
+  `websocket_connections` row during shutdown, including the control-socket
+  bind failure path after lock acquisition.
+- Worker emits Socket.IO `heartbeat` periodically while the socket is connected,
+  verifies the dedicated connection still owns the advisory lock, and updates
+  `websocket_connections.last_heartbeat` on the same connection.
+- Programmatic reconnect performs a hot-swap: connect a new Socket.IO client,
+  switch the command executor to the new client, then disconnect the old client.
+  If the new connection fails, the old socket remains active.
 
 Remaining gaps:
 
-- Python `SocketRuntime` holds a PostgreSQL advisory lock for each active
-  websocket connection and releases it during graceful shutdown. Rust service
-  functions exist, but the worker still needs a dedicated lock-owning
-  connection before this can be safely wired.
-- Python emits Socket.IO `heartbeat` periodically and updates the
-  `websocket_connections.last_heartbeat` row while holding the advisory lock.
-  Rust websocket runtime does not yet emit this heartbeat loop.
-- Python `hot_swap_connection` connects a new socket before closing the old
-  socket. Rust currently reconnects by ending the current `WsClient::run` loop
-  and then establishing the next connection.
+- No remaining gap is currently recorded for the spider worker
+  advisory-lock, heartbeat, outgoing-command, or worker-control slice. Future
+  scans must open a new entry when they identify another Python behavior
+  boundary.
 
 Verification commands:
 
 ```bash
 cargo fmt --all --check
-cargo clippy -p lilium-api-client -p lilium-spider -p lilium-event-processor -p lilium-database --all-targets --all-features
-cargo test -p lilium-api-client -p lilium-spider -p lilium-database -p lilium-event-processor --all-targets -- --include-ignored
+cargo clippy -p lilium-database -p lilium-test-fixtures -p lilium-services -p lilium-api-client -p lilium-spider --all-targets --all-features
+cargo test -p lilium-database -p lilium-test-fixtures -p lilium-services -p lilium-api-client -p lilium-spider --all-targets -- --include-ignored
 ```

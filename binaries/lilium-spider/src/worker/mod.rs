@@ -1,16 +1,19 @@
 use anyhow::{Context, Result};
 use lilium_api_client::http::{CookieRefreshCallback, DzmmApi, DzmmApiAuth};
 use lilium_api_client::websocket::{SocketCommandError, SocketCommandExecutor, WsClient};
-use lilium_database::{Database, NotificationConnection, NotificationDatabaseConfig};
+use lilium_database::{
+    Database, DedicatedDatabaseConfig, DedicatedDbConnection, NotificationConnection,
+    NotificationDatabaseConfig,
+};
 use lilium_models::dzmm::outgoing_command::{self as outgoing_commands, status};
-use lilium_services::{account, outgoing_command};
+use lilium_services::{account, outgoing_command, websocket_connection};
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::net::UnixListener;
 use tokio::sync::Notify;
-use tracing::{error, info, warn};
+use tracing::{error, info, instrument, warn};
 
 use crate::control::{
     self, ControlAction, ControlCommand, ControlResponse, read_message, write_message,
@@ -25,6 +28,7 @@ pub struct Worker {
 
 pub struct WorkerRuntimeConfig {
     pub notification_config: NotificationDatabaseConfig,
+    pub lock_config: DedicatedDatabaseConfig,
     pub queue_size: usize,
     pub batch_size: usize,
     pub buffer_dir: std::path::PathBuf,
@@ -53,28 +57,6 @@ struct WorkerControlContext {
     reconnect_notify: Arc<Notify>,
     stop_event: Arc<AtomicBool>,
     shutdown: Arc<Notify>,
-}
-
-impl WorkerRuntimeConfig {
-    pub fn new(
-        notification_config: NotificationDatabaseConfig,
-        queue_size: usize,
-        batch_size: usize,
-        buffer_dir: std::path::PathBuf,
-        runtime_dir: std::path::PathBuf,
-        websocket_url: String,
-        reconnect_delay_ms: u64,
-    ) -> Self {
-        Self {
-            notification_config,
-            queue_size,
-            batch_size,
-            buffer_dir,
-            runtime_dir,
-            websocket_url,
-            reconnect_delay_ms,
-        }
-    }
 }
 
 impl Worker {
@@ -118,6 +100,16 @@ impl Worker {
 
         let reconnect_notify = Arc::new(Notify::new());
         let socket_executor = SocketCommandExecutor::new();
+        let mut lock_connection = DedicatedDbConnection::connect(self.runtime.lock_config.clone())
+            .await
+            .context("connect websocket advisory-lock session")?;
+        let lock_id = websocket_connection::acquire_dedicated_connection_lock(
+            &mut lock_connection,
+            &self.account_id,
+        )
+        .await
+        .context("acquire websocket advisory lock")?;
+        let lock_connection = Arc::new(tokio::sync::Mutex::new(lock_connection));
         let ws_fut = Self::run_websocket(WebsocketRunContext {
             account_id: self.account_id.clone(),
             database: self.database.clone(),
@@ -142,10 +134,30 @@ impl Worker {
 
         let control_socket =
             control::worker_socket_path(&self.runtime.runtime_dir, &self.account_id);
-        let (control_listener, control_socket_identity) =
-            control::bind_unix_control_socket(&control_socket)
+        let (control_listener, control_socket_identity) = match control::bind_unix_control_socket(
+            &control_socket,
+        )
+        .await
+        {
+            Ok(bound) => bound,
+            Err(error) => {
+                let mut connection = lock_connection.lock().await;
+                if let Err(release_error) = websocket_connection::release_dedicated_connection_lock(
+                    &mut connection,
+                    lock_id,
+                )
                 .await
-                .context("bind worker control socket")?;
+                {
+                    warn!(
+                        account = %self.account_id,
+                        lock_id,
+                        error = %release_error,
+                        "Failed to release websocket advisory lock after control socket bind failure"
+                    );
+                }
+                return Err(error).context("bind worker control socket");
+            }
+        };
         let control_fut = Self::run_control_server(
             control_listener,
             WorkerControlContext {
@@ -157,6 +169,15 @@ impl Worker {
                 stop_event: stop_event.clone(),
                 shutdown: shutdown.clone(),
             },
+        );
+
+        let heartbeat_fut = Self::run_heartbeat_loop(
+            self.account_id.clone(),
+            lock_id,
+            lock_connection.clone(),
+            socket_executor.clone(),
+            stop_event.clone(),
+            shutdown.clone(),
         );
 
         tokio::select! {
@@ -202,10 +223,29 @@ impl Worker {
                     Err(e) => error!(account = %self.account_id, error = %e, "Worker control server failed"),
                 }
             }
+            heartbeat_result = heartbeat_fut => {
+                ingestor.stop_accepting();
+                stop_event.store(true, Ordering::Relaxed);
+                match heartbeat_result {
+                    Ok(()) => info!(account = %self.account_id, "WebSocket heartbeat loop completed"),
+                    Err(e) => error!(account = %self.account_id, error = %e, "WebSocket heartbeat loop failed"),
+                }
+            }
         }
 
         stop_event.store(true, Ordering::Relaxed);
         control::unlink_bound_unix_socket(&control_socket, control_socket_identity);
+        let mut connection = lock_connection.lock().await;
+        if let Err(error) =
+            websocket_connection::release_dedicated_connection_lock(&mut connection, lock_id).await
+        {
+            warn!(
+                account = %self.account_id,
+                lock_id,
+                error = %error,
+                "Failed to release websocket advisory lock"
+            );
+        }
         info!(account = %self.account_id, "Worker shutting down");
         Ok(())
     }
@@ -262,6 +302,7 @@ impl Worker {
         .context("Failed to build DZMM auth client")
     }
 
+    #[instrument(level = "debug" skip(context))]
     async fn run_websocket(context: WebsocketRunContext) -> Result<()> {
         let WebsocketRunContext {
             account_id,
@@ -343,6 +384,7 @@ impl Worker {
         Ok(())
     }
 
+    #[instrument(level = "debug" skip_all)]
     async fn run_outgoing_command_listener(
         account_id: String,
         database: Database,
@@ -438,6 +480,61 @@ impl Worker {
                 }
             }
         }
+        Ok(())
+    }
+
+    async fn run_heartbeat_loop(
+        account_id: String,
+        lock_id: i64,
+        lock_connection: Arc<tokio::sync::Mutex<DedicatedDbConnection>>,
+        socket_executor: SocketCommandExecutor,
+        stop_event: Arc<AtomicBool>,
+        shutdown: Arc<Notify>,
+    ) -> Result<()> {
+        // Python parity source: dzmm_archive@6a92a9914602d633ff6fa3f5908fa68d00c36fcd spider/ws_runtime.py
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            tokio::select! {
+                _ = shutdown.notified() => break,
+                _ = heartbeat.tick() => {
+                    if stop_event.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if !socket_executor.is_connected().await {
+                        continue;
+                    }
+
+                    let timestamp = chrono::Utc::now().timestamp_millis();
+                    match socket_executor
+                        .execute("heartbeat", serde_json::json!({ "timestamp": timestamp }), false)
+                        .await
+                    {
+                        Ok(_) => {
+                            let mut connection = lock_connection.lock().await;
+                            websocket_connection::ensure_dedicated_connection_lock(
+                                &mut connection,
+                                &account_id,
+                                Some(lock_id),
+                            )
+                            .await
+                            .context("ensure websocket advisory lock during heartbeat")?;
+                            websocket_connection::update_dedicated_heartbeat(
+                                &mut connection,
+                                lock_id,
+                            )
+                            .await
+                            .context("update websocket heartbeat")?;
+                        }
+                        Err(SocketCommandError::NotConnected) => {}
+                        Err(error) => {
+                            return Err(anyhow::anyhow!(error))
+                                .context("emit websocket heartbeat");
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 

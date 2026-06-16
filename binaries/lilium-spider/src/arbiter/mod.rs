@@ -30,6 +30,7 @@ struct WorkerSpec {
     account: String,
     database: Database,
     notification_config: lilium_database::NotificationDatabaseConfig,
+    lock_config: lilium_database::DedicatedDatabaseConfig,
     queue_size: usize,
     batch_size: usize,
     buffer_dir: PathBuf,
@@ -54,6 +55,7 @@ impl WorkerSpawner for TokioWorkerSpawner {
                 account,
                 database,
                 notification_config,
+                lock_config,
                 queue_size,
                 batch_size,
                 buffer_dir,
@@ -63,15 +65,16 @@ impl WorkerSpawner for TokioWorkerSpawner {
             } = spec;
 
             info!(account = %account, "Worker starting");
-            let runtime = super::worker::WorkerRuntimeConfig::new(
+            let runtime = super::worker::WorkerRuntimeConfig {
                 notification_config,
+                lock_config,
                 queue_size,
                 batch_size,
                 buffer_dir,
                 runtime_dir,
                 websocket_url,
                 reconnect_delay_ms,
-            );
+            };
             let worker = super::worker::Worker::new(account.clone(), database, runtime);
             if let Err(e) = worker.run(worker_shutdown).await {
                 error!(account = %account, error = %e, "Worker failed");
@@ -171,6 +174,7 @@ impl Arbiter {
             account,
             database: self.database.clone(),
             notification_config: self.config.notification.clone().into(),
+            lock_config: self.config.database.clone().into(),
             queue_size: self.config.worker.queue_size,
             batch_size: self.config.worker.batch_size,
             buffer_dir: self.config.worker.buffer_dir.clone(),

@@ -1,17 +1,18 @@
 use crate::DbTransaction;
+use crate::observability::install_sea_orm_query_metrics;
 use crate::pool::DbPool;
 use crate::pool::normalize_database_url;
 use crate::transaction::TransactionFuture;
 use anyhow::{Context, Result};
 use sea_orm::{DatabaseConnection, SqlxPostgresConnector, TransactionError, TransactionTrait};
-use sqlx::postgres::PgListener;
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{Postgres, pool::PoolConnection};
+use sqlx::postgres::{PgConnection, PgListener};
+use sqlx::{Connection, Postgres, pool::PoolConnection};
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::time::Duration;
-use tracing::instrument;
+use tracing::{Instrument, instrument};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Configuration for the pooled application database connection.
@@ -53,6 +54,29 @@ pub struct NotificationDatabaseConfig {
     pub url: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Configuration for one dedicated PostgreSQL connection.
+///
+/// Use this when a runtime component must own PostgreSQL session state for its
+/// full lifecycle, such as advisory locks. This is separate from
+/// [`DatabaseConfig`] because a pool cannot model session ownership.
+pub struct DedicatedDatabaseConfig {
+    /// PostgreSQL connection URL for the dedicated session.
+    pub url: String,
+}
+
+impl DedicatedDatabaseConfig {
+    /// Build a dedicated-connection configuration from a PostgreSQL URL.
+    pub fn from_url(url: impl Into<String>) -> Self {
+        Self { url: url.into() }
+    }
+
+    /// Return the URL form accepted by SQLx direct connections.
+    pub fn normalized_url(&self) -> String {
+        normalize_database_url(&self.url)
+    }
+}
+
 impl NotificationDatabaseConfig {
     /// Build a notification-listener configuration from a PostgreSQL URL.
     pub fn from_url(url: impl Into<String>) -> Self {
@@ -86,6 +110,16 @@ pub struct Database {
 /// lifetime does not model those long-lived connection states.
 pub struct RawDbConnection {
     inner: PoolConnection<Postgres>,
+}
+
+#[derive(Debug)]
+/// Dedicated physical PostgreSQL connection for session-stateful runtime work.
+///
+/// Use this for session-level advisory locks and similar primitives whose
+/// correctness depends on keeping one PostgreSQL backend session alive. Do not
+/// use this for ordinary CRUD; use [`Database`] and SeaORM for normal queries.
+pub struct DedicatedDbConnection {
+    inner: PgConnection,
 }
 
 /// Backend abstraction for PostgreSQL notification listeners.
@@ -220,6 +254,22 @@ impl NotificationConnection<PgListener> {
     }
 }
 
+impl DedicatedDbConnection {
+    /// Open one physical PostgreSQL connection outside the ordinary pool.
+    pub async fn connect(config: DedicatedDatabaseConfig) -> Result<Self> {
+        let normalized_url = config.normalized_url();
+        let inner = PgConnection::connect(&normalized_url)
+            .await
+            .with_context(|| "connect dedicated PostgreSQL connection")?;
+        Ok(Self { inner })
+    }
+
+    /// Borrow the owned SQLx connection for session-stateful SQL.
+    pub fn as_mut_pg_connection(&mut self) -> &mut PgConnection {
+        &mut self.inner
+    }
+}
+
 impl Deref for RawDbConnection {
     type Target = PoolConnection<Postgres>;
 
@@ -239,7 +289,7 @@ impl Database {
     ///
     /// This constructs one SQLx Postgres pool and wraps it as SeaORM's
     /// [`DatabaseConnection`] for normal service calls.
-    #[instrument(skip(config), fields(max_connections = config.max_connections))]
+    #[instrument(level = "debug" skip(config), fields(max_connections = config.max_connections))]
     pub async fn create(config: DatabaseConfig) -> Result<Self> {
         let normalized_url = config.normalized_url();
         let pool = PgPoolOptions::new()
@@ -248,7 +298,8 @@ impl Database {
             .connect(&normalized_url)
             .await
             .with_context(|| "connect database pool")?;
-        let orm = SqlxPostgresConnector::from_sqlx_postgres_pool(pool.clone());
+        let mut orm = SqlxPostgresConnector::from_sqlx_postgres_pool(pool.clone());
+        install_sea_orm_query_metrics(&mut orm, database_namespace_from_url(&normalized_url));
         let raw_pool = DbPool::from_pg_pool(pool);
 
         Ok(Self { orm, raw_pool })
@@ -267,19 +318,31 @@ impl Database {
     /// Use this when multiple service calls need one commit/rollback boundary.
     /// Service functions should accept `&impl ConnectionTrait` so they can be
     /// called both inside and outside this transaction helper.
-    #[instrument(skip(self, f))]
     pub async fn transaction<T, F>(&self, f: F) -> Result<T>
     where
         T: Send,
         F: for<'a> FnOnce(&'a DbTransaction) -> TransactionFuture<'a, T> + Send,
     {
-        self.orm
-            .transaction(|tx| f(tx))
-            .await
-            .map_err(|error| match error {
-                TransactionError::Connection(error) => anyhow::Error::new(error),
-                TransactionError::Transaction(error) => error,
-            })
+        let span = tracing::info_span!(
+            "lilium-database.transaction",
+            sentry.name = "db transaction",
+            sentry.op = "db.transaction",
+            db.system = "postgresql",
+            db.system.name = "postgresql",
+            db.orm = "sea-orm",
+        );
+
+        async move {
+            self.orm
+                .transaction(|tx| f(tx))
+                .await
+                .map_err(|error| match error {
+                    TransactionError::Connection(error) => anyhow::Error::new(error),
+                    TransactionError::Transaction(error) => error,
+                })
+        }
+        .instrument(span)
+        .await
     }
 
     /// Acquire a short-lived raw SQLx connection from the normal query pool.
@@ -287,7 +350,7 @@ impl Database {
     /// This is for narrow infrastructure escape hatches. It is not a substitute
     /// for [`NotificationConnection`] and should not be used for long-lived
     /// connection-stateful primitives.
-    #[instrument(skip(self))]
+    #[instrument(level = "debug" skip(self))]
     pub async fn raw_connection(&self) -> Result<RawDbConnection> {
         let conn = self
             .raw_pool
@@ -297,6 +360,18 @@ impl Database {
             .with_context(|| "acquire raw SQL connection")?;
         Ok(RawDbConnection { inner: conn })
     }
+}
+
+fn database_namespace_from_url(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://")?.1;
+    let path = after_scheme.split_once('/')?.1;
+    let database = path
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim_matches('/');
+
+    (!database.is_empty()).then(|| database.to_string())
 }
 
 #[cfg(test)]
@@ -377,6 +452,13 @@ mod tests {
         let config = NotificationDatabaseConfig::from_url("  postgresql://localhost/notify  ");
 
         assert_eq!(config.normalized_url(), "postgres://localhost/notify");
+    }
+
+    #[test]
+    fn dedicated_config_uses_same_url_normalization() {
+        let config = DedicatedDatabaseConfig::from_url("  postgresql://localhost/lock  ");
+
+        assert_eq!(config.normalized_url(), "postgres://localhost/lock");
     }
 
     #[tokio::test]

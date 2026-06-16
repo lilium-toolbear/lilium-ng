@@ -641,7 +641,7 @@ fn encode_cursor_three(
     )
 }
 
-#[instrument(skip(db, filters, pagination), fields(enriched))]
+#[instrument(level = "debug" skip(db, filters, pagination), fields(enriched))]
 pub async fn get_messages<C: ConnectionTrait>(
     db: &C,
     filters: &MessageFilters,
@@ -751,7 +751,7 @@ pub async fn get_messages<C: ConnectionTrait>(
     })
 }
 
-#[instrument(skip(db), fields(message_id = %message_id, enriched))]
+#[instrument(level = "debug" skip(db), fields(message_id = %message_id, enriched))]
 pub async fn get_by_id<C: ConnectionTrait>(
     db: &C,
     message_id: &str,
@@ -767,7 +767,7 @@ pub async fn get_by_id<C: ConnectionTrait>(
         .map_err(db_error)
 }
 
-#[instrument(skip(db), fields(message_id = %message_id, sent_at = %sent_at, enriched))]
+#[instrument(level = "debug" skip(db), fields(message_id = %message_id, sent_at = %sent_at, enriched))]
 pub async fn get_by_id_at<C: ConnectionTrait>(
     db: &C,
     message_id: &str,
@@ -783,7 +783,7 @@ pub async fn get_by_id_at<C: ConnectionTrait>(
         .map_err(db_error)
 }
 
-#[instrument(skip(db), fields(message_id = %message_id, before_count, after_count))]
+#[instrument(level = "debug" skip(db), fields(message_id = %message_id, before_count, after_count))]
 pub async fn get_context<C: ConnectionTrait>(
     db: &C,
     message_id: &str,
@@ -840,7 +840,7 @@ pub async fn get_context<C: ConnectionTrait>(
     }))
 }
 
-#[instrument(skip(db), fields(message_id = %message_id, count))]
+#[instrument(level = "debug" skip(db), fields(message_id = %message_id, count))]
 pub async fn get_before<C: ConnectionTrait>(
     db: &C,
     message_id: &str,
@@ -869,7 +869,7 @@ pub async fn get_before<C: ConnectionTrait>(
     Ok(messages)
 }
 
-#[instrument(skip(db), fields(message_id = %message_id, count))]
+#[instrument(level = "debug" skip(db), fields(message_id = %message_id, count))]
 pub async fn get_after<C: ConnectionTrait>(
     db: &C,
     message_id: &str,
@@ -895,7 +895,7 @@ pub async fn get_after<C: ConnectionTrait>(
         .map_err(db_error)
 }
 
-#[instrument(skip(db, messages), fields(message_count = messages.len()))]
+#[instrument(level = "debug" skip(db, messages), fields(message_count = messages.len()))]
 pub async fn enrich_batch<C: ConnectionTrait>(
     db: &C,
     messages: &[Message],
@@ -936,7 +936,7 @@ pub async fn enrich_batch<C: ConnectionTrait>(
     Ok(enriched)
 }
 
-#[instrument(skip(db), fields(room_id = ?room_id, limit))]
+#[instrument(level = "debug" skip(db), fields(room_id = ?room_id, limit))]
 pub async fn get_deleted_messages<C: ConnectionTrait>(
     db: &C,
     room_id: Option<&str>,
@@ -961,7 +961,7 @@ pub async fn get_deleted_messages<C: ConnectionTrait>(
     Ok(messages.into_iter().collect())
 }
 
-#[instrument(skip(db), fields(room_id = %room_id))]
+#[instrument(level = "debug" skip(db), fields(room_id = %room_id))]
 pub async fn get_room_stats<C: ConnectionTrait>(
     db: &C,
     room_id: &str,
@@ -1023,7 +1023,7 @@ pub async fn get_room_stats<C: ConnectionTrait>(
     })
 }
 
-#[instrument(skip(db), fields(user_id = %user_id))]
+#[instrument(level = "debug" skip(db), fields(user_id = %user_id))]
 pub async fn get_user_stats<C: ConnectionTrait>(
     db: &C,
     user_id: &str,
@@ -1103,7 +1103,7 @@ pub async fn get_user_stats<C: ConnectionTrait>(
     })
 }
 
-#[instrument(skip(db), fields(message_id = %message_id))]
+#[instrument(level = "debug" skip(db), fields(message_id = %message_id))]
 pub async fn message_exists<C: ConnectionTrait>(db: &C, message_id: &str) -> crate::Result<bool> {
     let exists = messages::Entity::find()
         .select_only()
@@ -1117,7 +1117,7 @@ pub async fn message_exists<C: ConnectionTrait>(db: &C, message_id: &str) -> cra
     Ok(exists)
 }
 
-#[instrument(skip(db, message), fields(message_id = %message.message_id))]
+#[instrument(level = "debug" skip(db, message), fields(message_id = %message.message_id))]
 pub async fn create_message<C: ConnectionTrait>(db: &C, message: &Message) -> crate::Result<()> {
     messages::Entity::insert(message_active_model(message))
         .exec(db)
@@ -1126,7 +1126,7 @@ pub async fn create_message<C: ConnectionTrait>(db: &C, message: &Message) -> cr
     Ok(())
 }
 
-#[instrument(skip(db, message), fields(message_id = %message.message_id))]
+#[instrument(level = "debug" skip(db, message), fields(message_id = %message.message_id))]
 pub async fn create_message_if_missing<C: ConnectionTrait>(
     db: &C,
     message: &Message,
@@ -1134,7 +1134,7 @@ pub async fn create_message_if_missing<C: ConnectionTrait>(
     insert_message_if_missing(db, message).await
 }
 
-#[instrument(skip(db, items), fields(message_count = items.len()))]
+#[instrument(level = "debug" skip(db, items), fields(message_count = items.len()))]
 pub async fn batch_create_if_missing<C: ConnectionTrait>(
     db: &C,
     items: &[Message],
@@ -1158,7 +1158,7 @@ pub async fn batch_create_if_missing<C: ConnectionTrait>(
         .collect())
 }
 
-#[instrument(skip(db, message), fields(message_id = %message.message_id))]
+#[instrument(level = "debug" skip(db, message), fields(message_id = %message.message_id))]
 pub async fn update_message<C: ConnectionTrait>(db: &C, message: &Message) -> crate::Result<()> {
     messages::Entity::update_many()
         .set(messages::ActiveModel {
@@ -1182,7 +1182,7 @@ pub async fn update_message<C: ConnectionTrait>(db: &C, message: &Message) -> cr
     Ok(())
 }
 
-#[instrument(skip(db, payload), fields(message_id = %message_id))]
+#[instrument(level = "debug" skip(db, payload), fields(message_id = %message_id))]
 pub async fn update_message_from_payload<C: ConnectionTrait>(
     db: &C,
     message_id: &str,
@@ -1218,7 +1218,7 @@ pub async fn update_message_from_payload<C: ConnectionTrait>(
     }
 }
 
-#[instrument(skip(db), fields(message_id = %message_id, has_deleted_by = deleted_by.is_some()))]
+#[instrument(level = "debug" skip(db), fields(message_id = %message_id, has_deleted_by = deleted_by.is_some()))]
 pub async fn mark_deleted<C: ConnectionTrait>(
     db: &C,
     message_id: &str,
@@ -1241,7 +1241,7 @@ pub async fn mark_deleted<C: ConnectionTrait>(
     Ok(())
 }
 
-#[instrument(skip(db, message_ids), fields(message_count = message_ids.len(), has_deleted_by = deleted_by.is_some()))]
+#[instrument(level = "debug" skip(db, message_ids), fields(message_count = message_ids.len(), has_deleted_by = deleted_by.is_some()))]
 pub async fn mark_deleted_batch<C: ConnectionTrait>(
     db: &C,
     message_ids: &[String],
@@ -1267,7 +1267,7 @@ pub async fn mark_deleted_batch<C: ConnectionTrait>(
     Ok(result.rows_affected as i64)
 }
 
-#[instrument(skip(db), fields(message_id = %message_id))]
+#[instrument(level = "debug" skip(db), fields(message_id = %message_id))]
 pub async fn mark_recalled<C: ConnectionTrait>(db: &C, message_id: &str) -> crate::Result<()> {
     let now = Utc::now();
     let active = messages::ActiveModel {
@@ -1284,7 +1284,7 @@ pub async fn mark_recalled<C: ConnectionTrait>(db: &C, message_id: &str) -> crat
     Ok(())
 }
 
-#[instrument(skip(db, message_ids), fields(message_count = message_ids.len()))]
+#[instrument(level = "debug" skip(db, message_ids), fields(message_count = message_ids.len()))]
 pub async fn mark_recalled_batch<C: ConnectionTrait>(
     db: &C,
     message_ids: &[String],
@@ -1307,7 +1307,7 @@ pub async fn mark_recalled_batch<C: ConnectionTrait>(
     Ok(result.rows_affected as i64)
 }
 
-#[instrument(skip(db, items), fields(message_count = items.len()))]
+#[instrument(level = "debug" skip(db, items), fields(message_count = items.len()))]
 pub async fn batch_create<C: ConnectionTrait>(db: &C, items: &[Message]) -> crate::Result<i64> {
     if items.is_empty() {
         return Ok(0);
@@ -1320,7 +1320,7 @@ pub async fn batch_create<C: ConnectionTrait>(db: &C, items: &[Message]) -> crat
     Ok(rows_affected as i64)
 }
 
-#[instrument(skip(db), fields(room_id = %room_id))]
+#[instrument(level = "debug" skip(db), fields(room_id = %room_id))]
 pub async fn get_latest_message_time<C: ConnectionTrait>(
     db: &C,
     room_id: &str,
@@ -1336,7 +1336,7 @@ pub async fn get_latest_message_time<C: ConnectionTrait>(
         .map_err(db_error)
 }
 
-#[instrument(skip(db), fields(room_id = %room_id))]
+#[instrument(level = "debug" skip(db), fields(room_id = %room_id))]
 pub async fn get_earliest_message_time<C: ConnectionTrait>(
     db: &C,
     room_id: &str,
@@ -1352,7 +1352,7 @@ pub async fn get_earliest_message_time<C: ConnectionTrait>(
         .map_err(db_error)
 }
 
-#[instrument(skip(db, filters), fields(has_gps_only = filters.gps_only.unwrap_or(false)))]
+#[instrument(level = "debug" skip(db, filters), fields(has_gps_only = filters.gps_only.unwrap_or(false)))]
 pub async fn count_messages<C: ConnectionTrait>(
     db: &C,
     filters: &MessageFilters,

@@ -44,6 +44,10 @@ impl TestDb {
     pub fn database(&self) -> &lilium_database::Database {
         &self.database
     }
+
+    pub fn dedicated_database_config(&self) -> lilium_database::DedicatedDatabaseConfig {
+        self._connection.dedicated_database_config()
+    }
 }
 
 pub async fn prepare_database<C: ConnectionTrait>(db: &C, profile: FixtureProfile) -> Result<()> {
