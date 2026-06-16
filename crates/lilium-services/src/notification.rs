@@ -33,6 +33,7 @@ impl NotificationService {
         }
     }
 
+    #[instrument(level = "debug" skip(self, config))]
     pub async fn attach_listener(&mut self, config: NotificationDatabaseConfig) -> Result<()> {
         let listener = NotificationConnection::connect(config)
             .await
@@ -41,6 +42,7 @@ impl NotificationService {
         Ok(())
     }
 
+    #[instrument(level = "debug" skip(self), fields(channel = %channel))]
     pub async fn listen_channel(&mut self, channel: &str) -> Result<()> {
         let listener = self.listener.as_mut().ok_or_else(|| {
             lilium_common::LiliumError::config("notification listener is not attached")
@@ -52,6 +54,7 @@ impl NotificationService {
         Ok(())
     }
 
+    #[instrument(level = "debug" skip(self))]
     pub async fn receive_payload(&mut self) -> Result<Option<String>> {
         let listener = self.listener.as_mut().ok_or_else(|| {
             lilium_common::LiliumError::config("notification listener is not attached")
@@ -62,7 +65,6 @@ impl NotificationService {
             .map_err(|error| lilium_common::LiliumError::database(error.to_string()))
     }
 
-    #[instrument(skip(self), fields(channel = %channel))]
     pub async fn subscribe(
         &mut self,
         channel: &str,
@@ -84,14 +86,12 @@ impl NotificationService {
         Ok((id, receiver))
     }
 
-    #[instrument(skip(self), fields(id))]
     pub async fn unsubscribe(&mut self, id: usize) -> Result<()> {
         let mut subs = self.subscribers.write().await;
         subs.retain(|s| s.id != id);
         Ok(())
     }
 
-    #[instrument(skip(self), fields(channel = %channel, has_timeout = timeout_duration.is_some()))]
     pub async fn wait_for_notification(
         &mut self,
         channel: &str,
@@ -113,7 +113,6 @@ impl NotificationService {
         }
     }
 
-    #[instrument(skip(self), fields(channel_count = channels.len(), has_timeout = timeout_duration.is_some()))]
     pub async fn wait_for_multiple(
         &mut self,
         channels: &[&str],
@@ -166,7 +165,7 @@ impl NotificationService {
         Ok(result)
     }
 
-    #[instrument(skip(self, state, poll_callback, stop_signal), fields(channel = %channel, polling_ms = polling_interval.as_millis()))]
+    #[instrument(level = "debug" skip(self, state, poll_callback, stop_signal), fields(channel = %channel, polling_ms = polling_interval.as_millis()))]
     pub async fn stream_with_polling<F, Fut, T, S>(
         &mut self,
         channel: &str,

@@ -1,5 +1,6 @@
 use crate::Result;
 use chrono::{Duration, Utc};
+use lilium_database::DedicatedDbConnection;
 use lilium_models::dzmm::websocket_connection as websocket_connections;
 use md5::{Digest, Md5};
 use sea_orm::sea_query::Expr;
@@ -13,7 +14,6 @@ use tracing::instrument;
 
 type WebsocketConnection = websocket_connections::Model;
 
-#[instrument(fields(account_user_id = %account_user_id))]
 pub fn calculate_lock_id(account_user_id: &str) -> i64 {
     let hash = Md5::digest(account_user_id.as_bytes());
     let mut first_eight = [0u8; 8];
@@ -57,13 +57,161 @@ async fn query_i64s<C: ConnectionTrait>(
         .collect()
 }
 
-#[instrument(skip(db), fields(user_id = %user_id))]
+async fn dedicated_query_bool(
+    conn: &mut DedicatedDbConnection,
+    sql: &str,
+    value: i64,
+) -> Result<bool> {
+    let result = sqlx::query_scalar::<_, bool>(sql)
+        .bind(value)
+        .fetch_one(conn.as_mut_pg_connection())
+        .await?;
+    Ok(result)
+}
+
+#[instrument(level = "debug" skip(conn), fields(user_id = %user_id))]
+pub async fn acquire_dedicated_connection_lock(
+    conn: &mut DedicatedDbConnection,
+    user_id: &str,
+) -> Result<i64> {
+    let lock_id = calculate_lock_id(user_id);
+    acquire_dedicated_connection_lock_inner(conn, lock_id, user_id).await
+}
+
+#[instrument(level = "debug" skip(conn), fields(lock_id, user_id = %user_id))]
+async fn acquire_dedicated_connection_lock_inner(
+    conn: &mut DedicatedDbConnection,
+    lock_id: i64,
+    user_id: &str,
+) -> Result<i64> {
+    let lock_acquired =
+        dedicated_query_bool(conn, "SELECT pg_try_advisory_lock($1) AS value", lock_id).await?;
+
+    if !lock_acquired {
+        return Err(LiliumError::connection_conflict(
+            format!("Account {} is already in use by another client", user_id),
+            Some(lock_id),
+        ));
+    }
+
+    replace_dedicated_connection_record(conn, lock_id, user_id).await?;
+    Ok(lock_id)
+}
+
+#[instrument(level = "debug" skip(conn), fields(user_id = %user_id, has_expected_lock_id = expected_lock_id.is_some()))]
+pub async fn ensure_dedicated_connection_lock(
+    conn: &mut DedicatedDbConnection,
+    user_id: &str,
+    expected_lock_id: Option<i64>,
+) -> Result<i64> {
+    let lock_id = calculate_lock_id(user_id);
+
+    if let Some(expected) = expected_lock_id
+        && expected != lock_id
+    {
+        return Err(LiliumError::domain_service_with_code(
+            "WEBSOCKET_CONNECTION_INVALID_REQUEST",
+            format!(
+                "Expected lock_id {} does not match user_id {}",
+                expected, user_id
+            ),
+        ));
+    }
+
+    if current_dedicated_connection_holds_lock(conn, lock_id).await? {
+        return Ok(lock_id);
+    }
+
+    acquire_dedicated_connection_lock_inner(conn, lock_id, user_id).await
+}
+
+#[instrument(level = "debug" skip(conn), fields(lock_id))]
+async fn current_dedicated_connection_holds_lock(
+    conn: &mut DedicatedDbConnection,
+    lock_id: i64,
+) -> Result<bool> {
+    let (classid, objid) = split_advisory_lock_id(lock_id);
+
+    let result = sqlx::query_scalar::<_, bool>(
+        r#"SELECT EXISTS(
+                SELECT 1
+                FROM pg_locks
+                WHERE pid = pg_backend_pid()
+                  AND classid = $1
+                  AND objid = $2
+                  AND locktype = 'advisory'
+                  AND granted = true
+            ) AS value"#,
+    )
+    .bind(classid)
+    .bind(objid)
+    .fetch_one(conn.as_mut_pg_connection())
+    .await?;
+    Ok(result)
+}
+
+#[instrument(level = "debug" skip(conn), fields(lock_id, user_id = %user_id))]
+async fn replace_dedicated_connection_record(
+    conn: &mut DedicatedDbConnection,
+    lock_id: i64,
+    user_id: &str,
+) -> Result<()> {
+    sqlx::query("DELETE FROM websocket_connections WHERE lock_id = $1")
+        .bind(lock_id)
+        .execute(conn.as_mut_pg_connection())
+        .await?;
+
+    let now = Utc::now();
+    sqlx::query(
+        r#"INSERT INTO websocket_connections (
+               lock_id, account_user_id, connected_at, last_heartbeat
+           ) VALUES ($1, $2, $3, $4)"#,
+    )
+    .bind(lock_id)
+    .bind(user_id)
+    .bind(now)
+    .bind(now)
+    .execute(conn.as_mut_pg_connection())
+    .await?;
+
+    Ok(())
+}
+
+#[instrument(level = "debug" skip(conn), fields(lock_id))]
+pub async fn release_dedicated_connection_lock(
+    conn: &mut DedicatedDbConnection,
+    lock_id: i64,
+) -> Result<()> {
+    sqlx::query("DELETE FROM websocket_connections WHERE lock_id = $1")
+        .bind(lock_id)
+        .execute(conn.as_mut_pg_connection())
+        .await?;
+
+    let _ = dedicated_query_bool(conn, "SELECT pg_advisory_unlock($1) AS value", lock_id).await;
+    Ok(())
+}
+
+#[instrument(level = "debug" skip(conn), fields(lock_id))]
+pub async fn update_dedicated_heartbeat(
+    conn: &mut DedicatedDbConnection,
+    lock_id: i64,
+) -> Result<()> {
+    let now = Utc::now();
+    sqlx::query("UPDATE websocket_connections SET last_heartbeat = $1 WHERE lock_id = $2")
+        .bind(now)
+        .bind(lock_id)
+        .execute(conn.as_mut_pg_connection())
+        .await?;
+    Ok(())
+}
+
+#[instrument(level = "debug" skip(db), fields(user_id = %user_id))]
 pub async fn acquire_connection_lock(db: &impl ConnectionTrait, user_id: &str) -> Result<i64> {
     let lock_id = calculate_lock_id(user_id);
     acquire_connection_lock_inner(db, lock_id, user_id).await
 }
 
-#[instrument(skip(db), fields(lock_id, user_id = %user_id))]
+#[instrument(level = "debug" skip(db), fields(lock_id, user_id = %user_id))]
 async fn acquire_connection_lock_inner(
     db: &impl ConnectionTrait,
     lock_id: i64,
@@ -88,7 +236,7 @@ async fn acquire_connection_lock_inner(
     Ok(lock_id)
 }
 
-#[instrument(skip(db), fields(lock_id, user_id = %user_id))]
+#[instrument(level = "debug" skip(db), fields(lock_id, user_id = %user_id))]
 async fn replace_connection_record(
     db: &impl ConnectionTrait,
     lock_id: i64,
@@ -111,7 +259,7 @@ async fn replace_connection_record(
     Ok(())
 }
 
-#[instrument(skip(db), fields(user_id = %user_id, has_expected_lock_id = expected_lock_id.is_some()))]
+#[instrument(level = "debug" skip(db), fields(user_id = %user_id, has_expected_lock_id = expected_lock_id.is_some()))]
 pub async fn ensure_connection_lock(
     db: &impl ConnectionTrait,
     user_id: &str,
@@ -138,7 +286,7 @@ pub async fn ensure_connection_lock(
     acquire_connection_lock_inner(db, lock_id, user_id).await
 }
 
-#[instrument(skip(db), fields(lock_id))]
+#[instrument(level = "debug" skip(db), fields(lock_id))]
 async fn current_connection_holds_lock(db: &impl ConnectionTrait, lock_id: i64) -> Result<bool> {
     let (classid, objid) = split_advisory_lock_id(lock_id);
 
@@ -158,7 +306,7 @@ async fn current_connection_holds_lock(db: &impl ConnectionTrait, lock_id: i64) 
     .await
 }
 
-#[instrument(skip(db), fields(lock_id))]
+#[instrument(level = "debug" skip(db), fields(lock_id))]
 pub async fn release_connection_lock(db: &impl ConnectionTrait, lock_id: i64) -> Result<()> {
     let connection = websocket_connections::Entity::find_by_id(lock_id)
         .one(db)
@@ -179,7 +327,7 @@ pub async fn release_connection_lock(db: &impl ConnectionTrait, lock_id: i64) ->
     Ok(())
 }
 
-#[instrument(skip(db), fields(lock_id))]
+#[instrument(level = "debug" skip(db), fields(lock_id))]
 pub async fn update_heartbeat(db: &impl ConnectionTrait, lock_id: i64) -> Result<()> {
     let now = Utc::now();
     websocket_connections::Entity::update_many()
@@ -193,7 +341,7 @@ pub async fn update_heartbeat(db: &impl ConnectionTrait, lock_id: i64) -> Result
     Ok(())
 }
 
-#[instrument(skip(db), fields(account_user_id = ?account_user_id))]
+#[instrument(level = "debug" skip(db), fields(account_user_id = ?account_user_id))]
 pub async fn get_active_connections(
     db: &impl ConnectionTrait,
     account_user_id: Option<&str>,
@@ -221,7 +369,7 @@ pub async fn get_active_connections(
     Ok(rows.into_iter().collect())
 }
 
-#[instrument(skip(db), fields(account_user_id = %account_user_id))]
+#[instrument(level = "debug" skip(db), fields(account_user_id = %account_user_id))]
 pub async fn is_credential_in_use(
     db: &impl ConnectionTrait,
     account_user_id: &str,
@@ -244,7 +392,7 @@ pub async fn is_credential_in_use(
     .await
 }
 
-#[instrument(skip(db), fields(timeout_seconds))]
+#[instrument(level = "debug" skip(db), fields(timeout_seconds))]
 pub async fn cleanup_stale_connections(
     db: &impl ConnectionTrait,
     timeout_seconds: i64,
@@ -384,6 +532,45 @@ mod tests {
         })
         .await
         .expect("test_update_heartbeat_updates_timestamp");
+    }
+
+    #[tokio::test]
+    async fn test_dedicated_connection_lock_lifecycle_owns_one_session() {
+        let test_db = lilium_test_fixtures::TestDb::acquire(
+            lilium_test_fixtures::FixtureProfile::WebsocketConnection,
+        )
+        .await
+        .expect("init websocket db");
+
+        let mut lock_connection =
+            lilium_database::DedicatedDbConnection::connect(test_db.dedicated_database_config())
+                .await
+                .expect("connect dedicated lock db");
+
+        let lock_id = acquire_dedicated_connection_lock(&mut lock_connection, "user_test_acquire")
+            .await
+            .expect("acquire dedicated lock");
+        ensure_dedicated_connection_lock(&mut lock_connection, "user_test_acquire", Some(lock_id))
+            .await
+            .expect("ensure dedicated lock");
+        update_dedicated_heartbeat(&mut lock_connection, lock_id)
+            .await
+            .expect("update dedicated heartbeat");
+
+        lilium_database::transaction!(test_db.database(), |session| {
+            assert!(
+                is_credential_in_use(session, "user_test_acquire")
+                    .await
+                    .unwrap()
+            );
+            Ok(())
+        })
+        .await
+        .expect("query active dedicated lock");
+
+        release_dedicated_connection_lock(&mut lock_connection, lock_id)
+            .await
+            .expect("release dedicated lock");
     }
 
     #[tokio::test]

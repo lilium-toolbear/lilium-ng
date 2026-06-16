@@ -141,7 +141,7 @@ Stop and re-check the Python source when any of these appear:
 - placeholder comments, empty functions, `todo!()`, `unimplemented!()`, dead
   public symbols, or unused service dependencies
 - broad `anyhow::Error` in service code where the caller needs domain semantics
-- `#[instrument(skip_all)]` added without checking field sensitivity
+- `#[instrument(level = "debug" skip_all)]` added without checking field sensitivity
 - copied SQL that duplicates ORM responsibilities without a clear PostgreSQL
   reason
 - tests gated by `#[ignore]` for required infrastructure

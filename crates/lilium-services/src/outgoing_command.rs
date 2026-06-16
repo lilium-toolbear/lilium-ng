@@ -21,7 +21,6 @@ const RATE_LIMIT_ERROR_MARKERS: &[&str] = &[
     "429",
 ];
 
-#[instrument(fields(event = %event))]
 pub(crate) fn default_max_attempts_for_event(event: &str) -> i32 {
     if event == "message:send" {
         MESSAGE_SEND_RATE_LIMIT_MAX_ATTEMPTS
@@ -30,7 +29,6 @@ pub(crate) fn default_max_attempts_for_event(event: &str) -> i32 {
     }
 }
 
-#[instrument(fields(has_error = error_message.is_some()))]
 pub(crate) fn is_rate_limited_error(error_message: Option<&str>) -> bool {
     let msg = match error_message {
         Some(m) => m,
@@ -42,12 +40,10 @@ pub(crate) fn is_rate_limited_error(error_message: Option<&str>) -> bool {
         .any(|marker| normalized.contains(marker))
 }
 
-#[instrument(skip(command), fields(event = %command.event))]
 pub(crate) fn is_rate_limited_message_send(command: &OutgoingCommand) -> bool {
     command.event == "message:send" && is_rate_limited_error(command.error_message.as_deref())
 }
 
-#[instrument(skip(command), fields(command_id = command.id))]
 pub(crate) fn rate_limited_retry_not_before(command: &OutgoingCommand) -> chrono::DateTime<Utc> {
     let delay_limit = command
         .attempt_count
@@ -56,7 +52,6 @@ pub(crate) fn rate_limited_retry_not_before(command: &OutgoingCommand) -> chrono
     command.created_at + Duration::seconds(total_delay)
 }
 
-#[instrument(skip(command), fields(command_id = command.id, now = %now))]
 pub(crate) fn is_ready_for_processing(
     command: &OutgoingCommand,
     now: chrono::DateTime<Utc>,
@@ -70,7 +65,7 @@ pub(crate) fn is_ready_for_processing(
     rate_limited_retry_not_before(command) <= now
 }
 
-#[instrument(skip(db, data), fields(account_user_id = %account_user_id, event = %event, require_ack, has_max_attempts = max_attempts.is_some()))]
+#[instrument(level = "debug" skip(db, data), fields(account_user_id = %account_user_id, event = %event, require_ack, has_max_attempts = max_attempts.is_some()))]
 pub async fn create_command<C>(
     db: &C,
     account_user_id: &str,
@@ -101,7 +96,7 @@ where
     Ok(command)
 }
 
-#[instrument(skip(db), fields(account_user_id = %account_user_id, limit))]
+#[instrument(level = "debug" skip(db), fields(account_user_id = %account_user_id, limit))]
 pub async fn get_pending_commands<C>(
     db: &C,
     account_user_id: &str,
@@ -135,7 +130,7 @@ where
     Ok(ready_commands)
 }
 
-#[instrument(skip(db), fields(command_id))]
+#[instrument(level = "debug" skip(db), fields(command_id))]
 pub async fn get_command<C>(db: &C, command_id: i32) -> Result<Option<OutgoingCommand>>
 where
     C: ConnectionTrait,
@@ -147,7 +142,7 @@ where
     Ok(command)
 }
 
-#[instrument(skip(db), fields(command_id))]
+#[instrument(level = "debug" skip(db), fields(command_id))]
 pub async fn mark_processing<C>(db: &C, command_id: i32) -> Result<()>
 where
     C: ConnectionTrait,
@@ -169,7 +164,7 @@ where
     Ok(())
 }
 
-#[instrument(skip(db, ack_response), fields(command_id))]
+#[instrument(level = "debug" skip(db, ack_response), fields(command_id))]
 pub async fn mark_success<C>(
     db: &C,
     command_id: i32,
@@ -195,7 +190,7 @@ where
     Ok(())
 }
 
-#[instrument(skip(db, error_message), fields(command_id))]
+#[instrument(level = "debug" skip(db, error_message), fields(command_id))]
 pub async fn mark_failed<C>(db: &C, command_id: i32, error_message: &str) -> Result<()>
 where
     C: ConnectionTrait,
@@ -217,7 +212,7 @@ where
     Ok(())
 }
 
-#[instrument(skip(db), fields(command_id))]
+#[instrument(level = "debug" skip(db), fields(command_id))]
 pub async fn mark_timeout<C>(db: &C, command_id: i32) -> Result<()>
 where
     C: ConnectionTrait,
@@ -239,7 +234,7 @@ where
     Ok(())
 }
 
-#[instrument(skip(db, error_message), fields(command_id))]
+#[instrument(level = "debug" skip(db, error_message), fields(command_id))]
 pub async fn retry_or_fail<C>(db: &C, command_id: i32, error_message: &str) -> Result<bool>
 where
     C: ConnectionTrait,
@@ -293,7 +288,7 @@ where
     }
 }
 
-#[instrument(skip(db), fields(command_id))]
+#[instrument(level = "debug" skip(db), fields(command_id))]
 pub async fn get_command_result<C>(db: &C, command_id: i32) -> Result<Option<OutgoingCommand>>
 where
     C: ConnectionTrait,
@@ -301,7 +296,7 @@ where
     get_command(db, command_id).await
 }
 
-#[instrument(skip(db), fields(cutoff = %cutoff))]
+#[instrument(level = "debug" skip(db), fields(cutoff = %cutoff))]
 pub async fn prune_processed_before<C>(db: &C, cutoff: chrono::DateTime<Utc>) -> Result<i64>
 where
     C: ConnectionTrait,

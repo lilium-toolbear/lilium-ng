@@ -1,7 +1,7 @@
 use crate::pal_work_constants::*;
 use tracing::instrument;
 
-#[instrument(fields(total_eff, scale, cap))]
+#[instrument(level = "debug" fields(total_eff, scale, cap))]
 fn capped_bonus(total_eff: f64, scale: f64, cap: f64) -> f64 {
     if total_eff <= 0.0 || scale <= 0.0 {
         return 0.0;
@@ -9,7 +9,7 @@ fn capped_bonus(total_eff: f64, scale: f64, cap: f64) -> f64 {
     cap * total_eff / (total_eff + scale)
 }
 
-#[instrument(fields(level, cap, scale, power))]
+#[instrument(level = "debug" fields(level, cap, scale, power))]
 fn s_curve_multiplier(level: i32, cap: f64, scale: f64, power: f64) -> f64 {
     if level <= 0 || cap <= 0.0 || scale <= 0.0 || power <= 0.0 {
         return 1.0;
@@ -18,22 +18,22 @@ fn s_curve_multiplier(level: i32, cap: f64, scale: f64, power: f64) -> f64 {
     1.0 + cap * l.powf(power) / (l.powf(power) + scale.powf(power))
 }
 
-#[instrument(fields(total_watering_eff))]
+#[instrument(level = "debug" fields(total_watering_eff))]
 pub fn calculate_farm_time_bonus(total_watering_eff: f64) -> f64 {
     capped_bonus(total_watering_eff, 500.0, 1.0)
 }
 
-#[instrument(fields(total_planting_eff))]
+#[instrument(level = "debug" fields(total_planting_eff))]
 pub fn calculate_farm_capacity_bonus(total_planting_eff: f64) -> f64 {
     capped_bonus(total_planting_eff, 1000.0, 2.5)
 }
 
-#[instrument(fields(total_gathering_eff))]
+#[instrument(level = "debug" fields(total_gathering_eff))]
 pub fn calculate_farm_harvest_bonus(total_gathering_eff: f64) -> f64 {
     capped_bonus(total_gathering_eff, 1200.0, 1.5)
 }
 
-#[instrument(fields(total_hauling_eff))]
+#[instrument(level = "debug" fields(total_hauling_eff))]
 pub fn calculate_warehouse_capacity_bonus(total_hauling_eff: f64) -> f64 {
     if total_hauling_eff <= 0.0 {
         return 0.0;
@@ -41,34 +41,34 @@ pub fn calculate_warehouse_capacity_bonus(total_hauling_eff: f64) -> f64 {
     total_hauling_eff / 333.0
 }
 
-#[instrument(fields(total_eff))]
+#[instrument(level = "debug" fields(total_eff))]
 pub fn calculate_credit_income_per_hour(total_eff: f64) -> f64 {
     total_eff * CREDIT_RATE
 }
 
-#[instrument(fields(level))]
+#[instrument(level = "debug" fields(level))]
 pub fn calculate_resource_level_multiplier(level: i32) -> f64 {
     s_curve_multiplier(level, 4.0, 6.0, 2.0)
 }
 
-#[instrument(fields(level))]
+#[instrument(level = "debug" fields(level))]
 pub fn calculate_resource_cache_hours(level: i32) -> f64 {
     24.0 * s_curve_multiplier(level, 6.0, 10.0, 2.0)
 }
 
-#[instrument(fields(total_eff))]
+#[instrument(level = "debug" fields(total_eff))]
 pub fn calculate_resource_worker_multiplier(total_eff: f64) -> f64 {
     capped_bonus(total_eff, 1200.0, 3.0)
 }
 
-#[instrument(fields(total_eff, level))]
+#[instrument(level = "debug" fields(total_eff, level))]
 pub fn calculate_resource_income_per_hour(total_eff: f64, level: i32) -> f64 {
     let level_mult = calculate_resource_level_multiplier(level);
     let worker_mult = calculate_resource_worker_multiplier(total_eff);
     200.0 * 1200.0 * level_mult * worker_mult
 }
 
-#[instrument(fields(total_eff, level))]
+#[instrument(level = "debug" fields(total_eff, level))]
 pub fn calculate_resource_cache_cap(total_eff: f64, level: i32) -> f64 {
     let income = calculate_resource_income_per_hour(total_eff, level);
     let hours = calculate_resource_cache_hours(level);

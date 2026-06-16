@@ -58,6 +58,10 @@ impl TestDatabaseConnection {
     pub(crate) fn database_config(&self) -> lilium_database::DatabaseConfig {
         lilium_database::DatabaseConfig::from_url(self.database_url.clone(), self.max_connections)
     }
+
+    pub(crate) fn dedicated_database_config(&self) -> lilium_database::DedicatedDatabaseConfig {
+        lilium_database::DedicatedDatabaseConfig::from_url(self.database_url.clone())
+    }
 }
 
 impl std::fmt::Debug for TestDatabaseConnection {

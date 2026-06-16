@@ -371,18 +371,11 @@ pub struct DzmmApi {
 }
 
 impl DzmmApi {
-    #[instrument(
-        skip(auth),
-        fields(user_id = ?auth.user_id.as_deref(), auto_refresh = auth.auto_refresh)
-    )]
+
     pub fn new(auth: DzmmApiAuth) -> Result<Self> {
         Self::new_with_config(ApiClientConfig::default(), auth)
     }
 
-    #[instrument(
-        skip(auth),
-        fields(user_id = ?auth.user_id.as_deref(), auto_refresh = auth.auto_refresh, base_url = %config.base_url)
-    )]
     pub fn new_with_config(config: ApiClientConfig, auth: DzmmApiAuth) -> Result<Self> {
         let base_url = normalize_base_url(&config.base_url)?;
         let cookie_url = Url::parse(&base_url).context("Invalid API base URL")?;
@@ -423,7 +416,6 @@ impl DzmmApi {
         &self.base_url
     }
 
-    #[instrument(skip(self))]
     pub async fn get_cookie_string(&self) -> String {
         let map = self.combined_cookie_map().await;
         let mut pairs: Vec<String> = map.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
@@ -486,14 +478,14 @@ impl DzmmApi {
         }
     }
 
-    #[instrument(skip(self))]
+    #[instrument(level = "debug" skip(self))]
     pub async fn authenticate(&self) -> Result<()> {
         info!("Authenticating...");
         self.get_my_info(false).await?;
         Ok(())
     }
 
-    #[instrument(skip(self))]
+    #[instrument(level = "debug" skip(self))]
     pub async fn refresh_cookies(&self) -> Result<bool> {
         let _guard = self.refresh_lock.lock().await;
         info!("Refreshing authentication cookies...");
@@ -553,7 +545,7 @@ impl DzmmApi {
         Ok(false)
     }
 
-    #[instrument(skip(self, email, password))]
+    #[instrument(level = "debug" skip(self, email, password))]
     pub async fn login_with_email_password(&self, email: &str, password: &str) -> Result<bool> {
         info!("Logging in with email and password...");
 
@@ -612,7 +604,7 @@ impl DzmmApi {
         Ok(true)
     }
 
-    #[instrument(skip(self, encrypted_token), fields(token_len = encrypted_token.len()))]
+    #[instrument(level = "debug" skip(self, encrypted_token), fields(token_len = encrypted_token.len()))]
     pub async fn login_with_qr_code(&self, encrypted_token: &str) -> Result<bool> {
         info!("Logging in with QR code token...");
 
@@ -643,7 +635,7 @@ impl DzmmApi {
         Ok(false)
     }
 
-    #[instrument(skip(self, image, mime_type), fields(image_len = image.len(), mime_type = %mime_type))]
+    #[instrument(level = "debug" skip(self, image, mime_type), fields(image_len = image.len(), mime_type = %mime_type))]
     pub async fn login_with_qr_image(&self, image: &[u8], mime_type: &str) -> Result<bool> {
         info!("Logging in with QR code image (server-side scan)...");
 
@@ -711,11 +703,12 @@ impl DzmmApi {
     fn build_headers(&self) -> HeaderMap {
         let mut headers = HeaderMap::new();
         for (k, v) in DZMM_HEADERS {
-            headers.insert(
-                reqwest::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
-                HeaderValue::from_str(v).unwrap(),
-            );
+            headers.insert(*k, HeaderValue::from_static(v));
         }
+        headers.insert(
+            "Accept",
+            HeaderValue::from_static("application/json, text/plain, */*"),
+        );
         headers.insert("Sec-Fetch-Dest", HeaderValue::from_static("empty"));
         headers.insert("Sec-Fetch-Mode", HeaderValue::from_static("cors"));
         headers.insert("Sec-Fetch-Site", HeaderValue::from_static("same-origin"));
@@ -775,7 +768,7 @@ impl DzmmApi {
         }
     }
 
-    #[instrument(
+    #[instrument(level = "debug"
         skip(self, request),
         fields(method = ?request.method, endpoint = %request.endpoint, user_id = ?self.auth.user_id.as_deref())
     )]
@@ -824,7 +817,7 @@ impl DzmmApi {
         Ok((status, body_bytes.to_vec(), resp_headers))
     }
 
-    #[instrument(skip(self, request), fields(method = ?request.method, endpoint = %request.endpoint))]
+    #[instrument(level = "debug" skip(self, request), fields(method = ?request.method, endpoint = %request.endpoint))]
     async fn _request(&self, mut request: ApiRequest<'_>) -> Result<Value> {
         let mut retried = false;
 
@@ -877,7 +870,7 @@ impl DzmmApi {
         }
     }
 
-    #[instrument(skip(self), fields(retried))]
+    #[instrument(level = "debug" skip(self), fields(retried))]
     pub async fn get_my_info(&self, retried: bool) -> Result<Value> {
         let input_data = json!({"0": {"json": Value::Null}});
         let response = self
@@ -900,7 +893,7 @@ impl DzmmApi {
         Ok(parsed)
     }
 
-    #[instrument(skip(self), fields(user_id = %user_id, room_id = %room_id))]
+    #[instrument(level = "debug" skip(self), fields(user_id = %user_id, room_id = %room_id))]
     pub async fn get_user_info(&self, user_id: &str, room_id: &str) -> Result<Value> {
         let input_data = json!({"0": {"json": {"userId": user_id, "chatroomId": room_id}}});
         let response = self
@@ -922,7 +915,7 @@ impl DzmmApi {
         Ok(Value::Object(serde_json::Map::new()))
     }
 
-    #[instrument(skip(self), fields(user_id = %user_id))]
+    #[instrument(level = "debug" skip(self), fields(user_id = %user_id))]
     pub async fn get_public_user_profile(&self, user_id: &str) -> Result<Value> {
         let input_data = json!({"0": {"json": {"userid": user_id}}});
         let response = self
@@ -986,7 +979,7 @@ impl DzmmApi {
         Ok(Value::Object(data))
     }
 
-    #[instrument(skip(self, user_room_pairs), fields(pair_count = user_room_pairs.len()))]
+    #[instrument(level = "debug" skip(self, user_room_pairs), fields(pair_count = user_room_pairs.len()))]
     pub async fn batch_get_user_info(
         &self,
         user_room_pairs: &[(String, String)],
@@ -1033,7 +1026,7 @@ impl DzmmApi {
         Ok(results)
     }
 
-    #[instrument(skip(self), fields(room_id = %room_id))]
+    #[instrument(level = "debug" skip(self), fields(room_id = %room_id))]
     pub async fn get_room_info(&self, room_id: &str) -> Result<Option<Value>> {
         let input_data = json!({"0": {"json": {"chatroomId": room_id}}});
         let response = self
@@ -1063,7 +1056,7 @@ impl DzmmApi {
         }
     }
 
-    #[instrument(skip(self, invite_code), fields(invite_code_len = invite_code.len()))]
+    #[instrument(level = "debug" skip(self, invite_code), fields(invite_code_len = invite_code.len()))]
     pub async fn preview_invite(&self, invite_code: &str) -> Result<Value> {
         let input_data = json!({"0": {"json": {"code": invite_code}}});
         let response = self
@@ -1081,7 +1074,7 @@ impl DzmmApi {
         bail!("Invalid tRPC response for preview_invite: {}", response);
     }
 
-    #[instrument(skip(self, invite_code), fields(invite_code_len = invite_code.len()))]
+    #[instrument(level = "debug" skip(self, invite_code), fields(invite_code_len = invite_code.len()))]
     pub async fn join_room_by_invite(&self, invite_code: &str) -> Result<Value> {
         let body = json!({"0": {"json": {"inviteCode": invite_code, "gender": "male"}}});
         let response = self
@@ -1103,7 +1096,7 @@ impl DzmmApi {
         );
     }
 
-    #[instrument(skip(self, tags), fields(title = %title, is_public, tag_count = tags.map(|t| t.len()).unwrap_or(0)))]
+    #[instrument(level = "debug" skip(self, tags), fields(title = %title, is_public, tag_count = tags.map(|t| t.len()).unwrap_or(0)))]
     pub async fn create_group_chat(
         &self,
         title: &str,
@@ -1145,7 +1138,7 @@ impl DzmmApi {
         Ok(response)
     }
 
-    #[instrument(skip(self), fields(chatroom_id = %chatroom_id))]
+    #[instrument(level = "debug" skip(self), fields(chatroom_id = %chatroom_id))]
     pub async fn generate_invite(&self, chatroom_id: &str) -> Result<String> {
         let payload = json!({"0": {"json": {"chatroomId": chatroom_id}}});
         let result = self
@@ -1160,7 +1153,7 @@ impl DzmmApi {
             .to_string())
     }
 
-    #[instrument(skip(self), fields(chatroom_id = %chatroom_id, member_id = %member_id))]
+    #[instrument(level = "debug" skip(self), fields(chatroom_id = %chatroom_id, member_id = %member_id))]
     pub async fn remove_group_member(&self, chatroom_id: &str, member_id: &str) -> Result<()> {
         let payload = json!({"0": {"json": {"chatroomId": chatroom_id, "memberId": member_id}}});
         self._request(ApiRequest::post("/api/trpc/groupChat.removeMember?batch=1").json(payload))
@@ -1168,7 +1161,7 @@ impl DzmmApi {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(chatroom_id = %chatroom_id, target_user_id = %target_user_id))]
+    #[instrument(level = "debug" skip(self), fields(chatroom_id = %chatroom_id, target_user_id = %target_user_id))]
     pub async fn set_group_admin(&self, chatroom_id: &str, target_user_id: &str) -> Result<()> {
         let payload =
             json!({"0": {"json": {"chatroomId": chatroom_id, "targetUserId": target_user_id}}});
@@ -1177,7 +1170,7 @@ impl DzmmApi {
         Ok(())
     }
 
-    #[instrument(skip(self, image_data), fields(chatroom_id = %chatroom_id, filename = %filename, content_type = %content_type, image_len = image_data.len()))]
+    #[instrument(level = "debug" skip(self, image_data), fields(chatroom_id = %chatroom_id, filename = %filename, content_type = %content_type, image_len = image_data.len()))]
     pub async fn update_room_avatar(
         &self,
         chatroom_id: &str,
@@ -1213,7 +1206,7 @@ impl DzmmApi {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(chatroom_id = %chatroom_id, title = %title))]
+    #[instrument(level = "debug" skip(self), fields(chatroom_id = %chatroom_id, title = %title))]
     pub async fn rename_room(&self, chatroom_id: &str, title: &str) -> Result<()> {
         let body = json!({"json": {"chatroomId": chatroom_id, "title": title}});
         self._request(ApiRequest::post("/api/trpc/groupChat.rename").json(body))
@@ -1221,7 +1214,7 @@ impl DzmmApi {
         Ok(())
     }
 
-    #[instrument(skip(self, resource_id), fields(share_type = share_type.unwrap_or("group_invite")))]
+    #[instrument(level = "debug" skip(self, resource_id), fields(share_type = share_type.unwrap_or("group_invite")))]
     pub async fn get_share_resource_preview(
         &self,
         resource_id: &str,
@@ -1252,7 +1245,7 @@ impl DzmmApi {
         }
     }
 
-    #[instrument(skip(self))]
+    #[instrument(level = "debug" skip(self))]
     pub async fn send_heartbeat(&self) -> Result<bool> {
         match self
             ._request(ApiRequest::post("/api/heartbeat").timeout(Duration::from_secs(5)))

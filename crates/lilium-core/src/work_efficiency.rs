@@ -1,7 +1,7 @@
 use crate::pal_work_constants::*;
 use tracing::instrument;
 
-#[instrument(fields(numerator, denominator))]
+#[instrument(level = "debug" fields(numerator, denominator))]
 fn clamped_ratio(numerator: i32, denominator: i32) -> f64 {
     if denominator <= 0 {
         return 0.0;
@@ -9,7 +9,7 @@ fn clamped_ratio(numerator: i32, denominator: i32) -> f64 {
     (numerator.max(0) as f64 / denominator as f64).min(1.0)
 }
 
-#[instrument(fields(male_count, female_count))]
+#[instrument(level = "debug" fields(male_count, female_count))]
 pub fn calculate_gender_balance(male_count: i32, female_count: i32) -> f64 {
     let m = male_count.max(0);
     let f = female_count.max(0);
@@ -20,7 +20,7 @@ pub fn calculate_gender_balance(male_count: i32, female_count: i32) -> f64 {
     1.0 - ((m - f).abs() as f64 / total as f64)
 }
 
-#[instrument(fields(
+#[instrument(level = "debug" fields(
     discovered_species,
     total_species,
     active_unique_species,

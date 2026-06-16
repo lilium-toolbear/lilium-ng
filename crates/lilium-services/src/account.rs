@@ -23,17 +23,6 @@ pub struct CreateAccountParams<'a> {
     pub cookies: Option<&'a str>,
 }
 
-#[instrument(
-    skip(account),
-    fields(
-        user_id = %account.user_id,
-        has_email = account.email.is_some(),
-        has_password = account.password.is_some(),
-        has_signin_code = account.signin_code.is_some(),
-        has_signin_code_image = account.signin_code_image.is_some(),
-        has_cookies = account.cookies.is_some()
-    )
-)]
 pub fn create_auth_client(account: DzmmAccount) -> Result<DzmmApi> {
     DzmmApi::new(DzmmApiAuth {
         email: account.email.map(Cow::Owned),
@@ -49,7 +38,7 @@ pub fn create_auth_client(account: DzmmAccount) -> Result<DzmmApi> {
     .map_err(|e| LiliumError::service("ACCOUNT_AUTH_CLIENT_BUILD_FAILED", e.to_string()))
 }
 
-#[instrument(
+#[instrument(level = "debug"
     skip(db, params),
     fields(
         user_id = %params.user_id,
@@ -125,7 +114,7 @@ where
     Ok(account)
 }
 
-#[instrument(skip(db), fields(user_id = %user_id))]
+#[instrument(level = "debug" skip(db), fields(user_id = %user_id))]
 pub async fn get_account<C>(db: &C, user_id: &str) -> Result<Option<DzmmAccount>>
 where
     C: ConnectionTrait,
@@ -137,7 +126,7 @@ where
     Ok(account)
 }
 
-#[instrument(skip(db), fields(enabled_only))]
+#[instrument(level = "debug" skip(db), fields(enabled_only))]
 pub async fn list_accounts<C>(db: &C, enabled_only: bool) -> Result<Vec<DzmmAccount>>
 where
     C: ConnectionTrait,
@@ -158,7 +147,7 @@ where
     Ok(accounts.into_iter().collect())
 }
 
-#[instrument(skip(db, new_password), fields(user_id = %user_id))]
+#[instrument(level = "debug" skip(db, new_password), fields(user_id = %user_id))]
 pub async fn update_password<C>(db: &C, user_id: &str, new_password: &str) -> Result<DzmmAccount>
 where
     C: ConnectionTrait,
@@ -197,7 +186,7 @@ where
     Ok(updated)
 }
 
-#[instrument(skip(db, cookies), fields(user_id = %user_id))]
+#[instrument(level = "debug" skip(db, cookies), fields(user_id = %user_id))]
 pub async fn update_cookies<C>(db: &C, user_id: &str, cookies: &str) -> Result<()>
 where
     C: ConnectionTrait,
@@ -223,7 +212,7 @@ where
     Ok(())
 }
 
-#[instrument(skip(db, user_profile), fields(user_id = %user_id))]
+#[instrument(level = "debug" skip(db, user_profile), fields(user_id = %user_id))]
 pub async fn update_user_profile<C>(
     db: &C,
     user_id: &str,
@@ -253,7 +242,7 @@ where
     Ok(updated)
 }
 
-#[instrument(skip(db), fields(user_id = %user_id))]
+#[instrument(level = "debug" skip(db), fields(user_id = %user_id))]
 pub async fn activate_account<C>(db: &C, user_id: &str) -> Result<DzmmAccount>
 where
     C: ConnectionTrait,
@@ -279,7 +268,7 @@ where
     Ok(updated)
 }
 
-#[instrument(skip(db), fields(user_id = %user_id))]
+#[instrument(level = "debug" skip(db), fields(user_id = %user_id))]
 pub async fn deactivate_account<C>(db: &C, user_id: &str) -> Result<DzmmAccount>
 where
     C: ConnectionTrait,
@@ -305,7 +294,7 @@ where
     Ok(updated)
 }
 
-#[instrument(skip(db), fields(user_id = %user_id))]
+#[instrument(level = "debug" skip(db), fields(user_id = %user_id))]
 pub async fn delete_account<C>(db: &C, user_id: &str) -> Result<()>
 where
     C: ConnectionTrait,
@@ -342,7 +331,7 @@ where
     Ok(())
 }
 
-#[instrument(skip(db))]
+#[instrument(level = "debug" skip(db))]
 pub async fn get_next_available_account<C>(db: &C) -> Result<Option<DzmmAccount>>
 where
     C: ConnectionTrait,

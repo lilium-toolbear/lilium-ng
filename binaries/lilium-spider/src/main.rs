@@ -1,6 +1,6 @@
 use anyhow::Result;
 use lilium_database::Database;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tracing::Instrument;
 
 mod arbiter;
 mod config;
@@ -8,18 +8,7 @@ mod control;
 mod ingestion;
 mod worker;
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    dotenvy::dotenv().ok();
-    let _sentry_guard = lilium_common::observability::init_backend_sentry("ws_arbiter");
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .with(sentry_tracing::layer())
-        .with(tracing_subscriber::fmt::layer())
-        .init();
-
+async fn async_main() -> Result<()> {
     let config = config::Config::load()?;
     tracing::info!("Starting lilium-spider");
 
@@ -29,4 +18,19 @@ async fn main() -> Result<()> {
 
     let arbiter = arbiter::Arbiter::new(config, db);
     arbiter.run().await
+}
+
+fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
+    let _sentry_guard = lilium_common::observability::init_backend_sentry("ws_arbiter");
+    let root_span = tracing::info_span!(
+        "lilium-spider.run",
+        sentry.name = "spider run",
+        sentry.op = "spider.run",
+    );
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async_main().instrument(root_span))
 }

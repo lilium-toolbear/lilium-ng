@@ -147,6 +147,12 @@ impl From<DatabaseConfig> for lilium_database::DatabaseConfig {
     }
 }
 
+impl From<DatabaseConfig> for lilium_database::DedicatedDatabaseConfig {
+    fn from(value: DatabaseConfig) -> Self {
+        lilium_database::DedicatedDatabaseConfig::from_url(value.url)
+    }
+}
+
 impl From<NotificationConfig> for lilium_database::NotificationDatabaseConfig {
     fn from(value: NotificationConfig) -> Self {
         lilium_database::NotificationDatabaseConfig::from_url(value.url)

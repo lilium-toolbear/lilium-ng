@@ -247,7 +247,7 @@ impl SocketCommandExecutor {
 }
 
 impl WsClient {
-    #[instrument(fields(account_id = %account_id, has_cookie_header = cookie_header.is_some()))]
+    #[instrument(level = "debug" fields(account_id = %account_id, has_cookie_header = cookie_header.is_some()))]
     pub fn new(account_id: String, url: String, cookie_header: Option<String>) -> Self {
         Self {
             account_id,
@@ -396,7 +396,38 @@ impl WsClient {
         Ok(builder)
     }
 
-    #[instrument(skip(self, on_event, shutdown, shutdown_notify, reconnect_notify, command_executor), fields(account_id = %self.account_id))]
+    async fn connect_socketio<F>(
+        &self,
+        on_event: Arc<tokio::sync::Mutex<F>>,
+        disconnect_notify: Arc<Notify>,
+        disconnect_state: Arc<AtomicBool>,
+    ) -> Result<rust_socketio::asynchronous::Client>
+    where
+        F: FnMut(EventEnvelope) -> BoxFuture<'static, ()> + Send + 'static,
+    {
+        let builder = self.build_socketio_client(on_event, disconnect_notify, disconnect_state)?;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let request = builder
+                .websocket_request()
+                .context("Failed to build Socket.IO websocket request")?;
+            let request_uri = request.uri().to_string();
+            let local_address = dzmm_local_address_from_env()?;
+            info!(
+                request_uri = %request_uri,
+                local_address = ?local_address,
+                "Opening Socket.IO websocket handshake"
+            );
+            let stream = connect_websocket_request(request, local_address).await?;
+            builder
+                .connect_with_websocket_stream(stream)
+                .await
+                .context("Failed to connect to Socket.IO")
+        })
+        .await
+        .context("Timed out while connecting to Socket.IO")?
+    }
+
+    #[instrument(level = "debug" skip(self, on_event, shutdown, shutdown_notify, reconnect_notify, command_executor), fields(account_id = %self.account_id))]
     pub async fn run<F>(
         &mut self,
         on_event: F,
@@ -416,35 +447,16 @@ impl WsClient {
         }
 
         let on_event = Arc::new(tokio::sync::Mutex::new(on_event));
-        let disconnect_notify = Arc::new(Notify::new());
+        let mut disconnect_notify = Arc::new(Notify::new());
         let disconnect_state = Arc::new(AtomicBool::new(false));
-        let builder = self.build_socketio_client(
-            on_event,
-            disconnect_notify.clone(),
-            disconnect_state.clone(),
-        )?;
 
-        let connect_result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            let request = builder
-                .websocket_request()
-                .context("Failed to build Socket.IO websocket request")?;
-            let request_uri = request.uri().to_string();
-            let local_address = dzmm_local_address_from_env()?;
-            info!(
-                request_uri = %request_uri,
-                local_address = ?local_address,
-                "Opening Socket.IO websocket handshake"
-            );
-            let stream = connect_websocket_request(request, local_address).await?;
-            builder
-                .connect_with_websocket_stream(stream)
-                .await
-                .context("Failed to connect to Socket.IO")
-        })
-        .await
-        .context("Timed out while connecting to Socket.IO")??;
-
-        let socket = connect_result;
+        let mut socket = self
+            .connect_socketio(
+                on_event.clone(),
+                disconnect_notify.clone(),
+                disconnect_state.clone(),
+            )
+            .await?;
         info!(account = %self.account_id, "WebSocket connected");
         if let Some(executor) = command_executor.as_ref() {
             executor.set_connected(socket.clone()).await;
@@ -456,15 +468,55 @@ impl WsClient {
             return Ok(());
         }
 
-        tokio::select! {
-            _ = shutdown_notify.notified() => {
-                info!(account = %self.account_id, "WebSocket shutdown signalled");
-            }
-            _ = reconnect_notify.notified() => {
-                info!(account = %self.account_id, "WebSocket reconnect requested");
-            }
-            _ = disconnect_notify.notified() => {
-                info!(account = %self.account_id, "WebSocket disconnected");
+        loop {
+            tokio::select! {
+                _ = shutdown_notify.notified() => {
+                    info!(account = %self.account_id, "WebSocket shutdown signalled");
+                    break;
+                }
+                _ = reconnect_notify.notified() => {
+                    info!(account = %self.account_id, "WebSocket hot-swap reconnect requested");
+                    let next_disconnect_notify = Arc::new(Notify::new());
+                    let next_disconnect_state = Arc::new(AtomicBool::new(false));
+                    match self
+                        .connect_socketio(
+                            on_event.clone(),
+                            next_disconnect_notify.clone(),
+                            next_disconnect_state.clone(),
+                        )
+                        .await
+                    {
+                        Ok(next_socket) => {
+                            if next_disconnect_state.load(Ordering::Relaxed) {
+                                warn!(
+                                    account = %self.account_id,
+                                    "Hot-swap socket disconnected during connect; keeping current socket"
+                                );
+                                let _ = next_socket.disconnect().await;
+                                continue;
+                            }
+
+                            if let Some(executor) = command_executor.as_ref() {
+                                executor.set_connected(next_socket.clone()).await;
+                            }
+                            let old_socket = std::mem::replace(&mut socket, next_socket);
+                            disconnect_notify = next_disconnect_notify;
+                            let _ = old_socket.disconnect().await;
+                            info!(account = %self.account_id, "WebSocket hot-swap reconnect completed");
+                        }
+                        Err(error) => {
+                            warn!(
+                                account = %self.account_id,
+                                error = %error,
+                                "WebSocket hot-swap reconnect failed; keeping current socket"
+                            );
+                        }
+                    }
+                }
+                _ = disconnect_notify.notified() => {
+                    info!(account = %self.account_id, "WebSocket disconnected");
+                    break;
+                }
             }
         }
 

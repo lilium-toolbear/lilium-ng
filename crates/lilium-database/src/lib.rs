@@ -2,15 +2,18 @@
 //!
 //! Application code should use [`Database::orm`] and SeaORM's
 //! [`sea_orm::ConnectionTrait`] for ordinary service-layer CRUD. Dedicated
-//! PostgreSQL connection state such as `LISTEN`/`NOTIFY` is exposed through
-//! specialized types instead of the normal ORM pool.
+//! PostgreSQL connection state such as `LISTEN`/`NOTIFY` and session-level
+//! advisory locks is exposed through specialized types instead of the normal
+//! ORM pool.
 
 pub mod database;
+mod observability;
 mod pool;
 pub mod transaction;
 
 pub use database::{
-    Database, DatabaseConfig, NotificationConnection, NotificationDatabaseConfig, RawDbConnection,
+    Database, DatabaseConfig, DedicatedDatabaseConfig, DedicatedDbConnection,
+    NotificationConnection, NotificationDatabaseConfig, RawDbConnection,
 };
 /// Transaction handle passed into service functions that need one atomic
 /// database operation.
