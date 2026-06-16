@@ -590,7 +590,6 @@ enum Cursor {
     ThreePart(DateTime<Utc>, DateTime<Utc>, String),
 }
 
-#[allow(clippy::result_large_err)]
 fn decode_cursor(cursor: &str) -> std::result::Result<Cursor, LiliumError> {
     let parts: Vec<&str> = cursor.splitn(3, '|').collect();
     match parts.len() {

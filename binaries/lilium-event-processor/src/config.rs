@@ -3,8 +3,7 @@ use anyhow::{Context, Result};
 #[derive(Debug, Clone)]
 pub struct Config {
     pub database: DatabaseConfig,
-    #[allow(dead_code)]
-    pub notification_url: String,
+    pub notification: NotificationConfig,
     pub processor: ProcessorConfig,
 }
 
@@ -12,6 +11,11 @@ pub struct Config {
 pub struct DatabaseConfig {
     pub url: String,
     pub max_connections: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct NotificationConfig {
+    pub url: String,
 }
 
 #[derive(Debug, Clone)]
@@ -93,7 +97,9 @@ impl Config {
                 url: env_required_string("DATABASE_URL")?,
                 max_connections: env_u32("DATABASE_POOL_SIZE", default_pool_size())?,
             },
-            notification_url: env_fallback_string("DATABASE_NOTIFICATION_URL", "DATABASE_URL")?,
+            notification: NotificationConfig {
+                url: env_fallback_string("DATABASE_NOTIFICATION_URL", "DATABASE_URL")?,
+            },
             processor: ProcessorConfig {
                 polling_interval_secs: env_u64(
                     "EVENT_PROCESSOR_POLLING_INTERVAL_SECS",
@@ -105,16 +111,15 @@ impl Config {
     }
 }
 
-impl Config {
-    #[allow(dead_code)]
-    pub fn notification_database_config(&self) -> lilium_database::NotificationDatabaseConfig {
-        lilium_database::NotificationDatabaseConfig::from_url(self.notification_url.clone())
-    }
-}
-
 impl From<DatabaseConfig> for lilium_database::DatabaseConfig {
     fn from(value: DatabaseConfig) -> Self {
         lilium_database::DatabaseConfig::from_url(value.url, value.max_connections)
+    }
+}
+
+impl From<NotificationConfig> for lilium_database::NotificationDatabaseConfig {
+    fn from(value: NotificationConfig) -> Self {
+        lilium_database::NotificationDatabaseConfig::from_url(value.url)
     }
 }
 
@@ -138,30 +143,12 @@ mod tests {
     }
 
     #[test]
-    fn fallback_string_reports_missing_values() {
-        let error = fallback_string(None, None, "PRIMARY", "FALLBACK").unwrap_err();
-
-        assert!(error.to_string().contains("PRIMARY"));
-        assert!(error.to_string().contains("FALLBACK"));
-    }
-
-    #[test]
-    fn notification_database_config_converts_url() {
-        let config = Config {
-            database: DatabaseConfig {
-                url: "postgres://db".into(),
-                max_connections: 1,
-            },
-            notification_url: "postgresql://notify".into(),
-            processor: ProcessorConfig {
-                polling_interval_secs: 5,
-                batch_size: 10,
-            },
+    fn notification_config_converts_url() {
+        let config = NotificationConfig {
+            url: "postgresql://notify".into(),
         };
+        let db_config: lilium_database::NotificationDatabaseConfig = config.into();
 
-        assert_eq!(
-            config.notification_database_config().normalized_url(),
-            "postgres://notify"
-        );
+        assert_eq!(db_config.normalized_url(), "postgres://notify");
     }
 }

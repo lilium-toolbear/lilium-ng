@@ -29,9 +29,11 @@ struct WorkerHandle {
 struct WorkerSpec {
     account: String,
     database: Database,
+    notification_config: lilium_database::NotificationDatabaseConfig,
     queue_size: usize,
     batch_size: usize,
     buffer_dir: PathBuf,
+    runtime_dir: PathBuf,
     websocket_url: String,
     reconnect_delay_ms: u64,
 }
@@ -51,23 +53,26 @@ impl WorkerSpawner for TokioWorkerSpawner {
             let WorkerSpec {
                 account,
                 database,
+                notification_config,
                 queue_size,
                 batch_size,
                 buffer_dir,
+                runtime_dir,
                 websocket_url,
                 reconnect_delay_ms,
             } = spec;
 
             info!(account = %account, "Worker starting");
-            let worker = super::worker::Worker::new(
-                account.clone(),
-                database,
+            let runtime = super::worker::WorkerRuntimeConfig::new(
+                notification_config,
                 queue_size,
                 batch_size,
                 buffer_dir,
+                runtime_dir,
                 websocket_url,
                 reconnect_delay_ms,
             );
+            let worker = super::worker::Worker::new(account.clone(), database, runtime);
             if let Err(e) = worker.run(worker_shutdown).await {
                 error!(account = %account, error = %e, "Worker failed");
             } else {
@@ -165,9 +170,11 @@ impl Arbiter {
         let handle = self.worker_spawner.spawn_worker(WorkerSpec {
             account,
             database: self.database.clone(),
+            notification_config: self.config.notification.clone().into(),
             queue_size: self.config.worker.queue_size,
             batch_size: self.config.worker.batch_size,
             buffer_dir: self.config.worker.buffer_dir.clone(),
+            runtime_dir: self.config.worker.runtime_dir.clone(),
             websocket_url: self.config.worker.websocket_url.clone(),
             reconnect_delay_ms: self.config.worker.reconnect_delay_ms,
         });
@@ -340,7 +347,9 @@ mod tests {
                 url: "postgres://localhost/lilium_test".to_string(),
                 max_connections: 1,
             },
-            notification_url: "postgres://localhost/lilium_test".to_string(),
+            notification: crate::config::NotificationConfig {
+                url: "postgres://localhost/lilium_test_notify".to_string(),
+            },
             worker: crate::config::WorkerConfig {
                 queue_size: 100,
                 batch_size: 10,

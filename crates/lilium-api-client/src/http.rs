@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -11,7 +12,7 @@ use rand::RngExt;
 use reqwest::{
     Client, Method, StatusCode,
     cookie::{CookieStore, Jar},
-    header::{ACCEPT, CONTENT_TYPE, COOKIE, HeaderMap, HeaderValue, ORIGIN, REFERER, SET_COOKIE},
+    header::{CONTENT_TYPE, COOKIE, HeaderMap, HeaderValue, ORIGIN, REFERER, SET_COOKIE},
     multipart::{Form, Part},
     redirect::Policy,
 };
@@ -27,9 +28,6 @@ const DZMM_HEADERS: &[(&str, &str)] = &[
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
     ),
     ("Accept-Language", "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7"),
-    ("Accept-Encoding", "gzip, deflate"),
-    ("Cache-Control", "no-cache"),
-    ("Pragma", "no-cache"),
     (
         "Sec-Ch-Ua",
         "\"Chromium\";v=\"148\", \"Brave\";v=\"148\", \"Not/A)Brand\";v=\"99\"",
@@ -269,17 +267,102 @@ impl RateLimiter {
 pub type CookieRefreshCallback =
     Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
+#[derive(Clone, Default)]
+pub struct DzmmApiAuth {
+    pub email: Option<Cow<'static, str>>,
+    pub password: Option<Cow<'static, str>>,
+    pub signin_code: Option<Cow<'static, str>>,
+    pub signin_code_image: Option<Vec<u8>>,
+    pub signin_code_image_mime: Option<Cow<'static, str>>,
+    pub cookies: Option<Cow<'static, str>>,
+    pub user_id: Option<Cow<'static, str>>,
+    pub auto_refresh: bool,
+    pub on_cookies_refreshed: Option<CookieRefreshCallback>,
+}
+
+pub struct ImageEditRequest<'a> {
+    pub prompt: &'a str,
+    pub image_urls: &'a [String],
+    pub image_width: Option<u64>,
+    pub image_height: Option<u64>,
+    pub num_inference_steps: Option<u64>,
+    pub text_guidance_scale: Option<f64>,
+    pub image_guidance_scale: Option<f64>,
+    pub num_images: Option<u64>,
+    pub enable_safety_checker: Option<bool>,
+    pub model: Option<&'a str>,
+    pub tag_ids: Option<&'a [String]>,
+}
+
+struct ApiRequest<'a> {
+    method: Method,
+    endpoint: Cow<'a, str>,
+    query: Vec<(Cow<'a, str>, Cow<'a, str>)>,
+    json_body: Option<Value>,
+    multipart_form: Option<Form>,
+    timeout: Option<Duration>,
+}
+
+impl<'a> ApiRequest<'a> {
+    fn new(method: Method, endpoint: impl Into<Cow<'a, str>>) -> Self {
+        Self {
+            method,
+            endpoint: endpoint.into(),
+            query: Vec::new(),
+            json_body: None,
+            multipart_form: None,
+            timeout: None,
+        }
+    }
+
+    fn get(endpoint: impl Into<Cow<'a, str>>) -> Self {
+        Self::new(Method::GET, endpoint)
+    }
+
+    fn post(endpoint: impl Into<Cow<'a, str>>) -> Self {
+        Self::new(Method::POST, endpoint)
+    }
+
+    fn query<K, V, I>(mut self, query: I) -> Self
+    where
+        K: Into<Cow<'a, str>>,
+        V: Into<Cow<'a, str>>,
+        I: IntoIterator<Item = (K, V)>,
+    {
+        self.query = query
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect();
+        self
+    }
+
+    fn json(mut self, body: Value) -> Self {
+        self.json_body = Some(body);
+        self
+    }
+
+    fn multipart(mut self, form: Form) -> Self {
+        self.multipart_form = Some(form);
+        self
+    }
+
+    fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+}
+
+fn trpc_batch_query<'a>(input_data: &Value) -> Vec<(Cow<'a, str>, Cow<'a, str>)> {
+    vec![
+        (Cow::Borrowed("batch"), Cow::Borrowed("1")),
+        (Cow::Borrowed("input"), Cow::Owned(input_data.to_string())),
+    ]
+}
+
 pub struct DzmmApi {
     client: Client,
     base_url: String,
-    email: Option<String>,
-    password: Option<String>,
-    signin_code: Option<String>,
-    signin_code_image: Option<Vec<u8>>,
-    signin_code_image_mime: Option<String>,
-    user_id: Option<String>,
-    auto_refresh: bool,
-    on_cookies_refreshed: Option<CookieRefreshCallback>,
+    auth: DzmmApiAuth,
     rate_limiter: Arc<Mutex<RateLimiter>>,
     refresh_lock: Arc<Mutex<()>>,
     cookie_map: Arc<Mutex<HashMap<String, String>>>,
@@ -289,71 +372,21 @@ pub struct DzmmApi {
 
 impl DzmmApi {
     #[instrument(
-        skip(
-            email,
-            password,
-            signin_code,
-            signin_code_image,
-            signin_code_image_mime,
-            cookies,
-            on_cookies_refreshed
-        ),
-        fields(user_id = ?user_id.as_deref(), auto_refresh)
+        skip(auth),
+        fields(user_id = ?auth.user_id.as_deref(), auto_refresh = auth.auto_refresh)
     )]
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        email: Option<String>,
-        password: Option<String>,
-        signin_code: Option<String>,
-        signin_code_image: Option<Vec<u8>>,
-        signin_code_image_mime: Option<String>,
-        cookies: Option<String>,
-        user_id: Option<String>,
-        auto_refresh: bool,
-        on_cookies_refreshed: Option<CookieRefreshCallback>,
-    ) -> Result<Self> {
-        Self::new_with_config(
-            ApiClientConfig::default(),
-            email,
-            password,
-            signin_code,
-            signin_code_image,
-            signin_code_image_mime,
-            cookies,
-            user_id,
-            auto_refresh,
-            on_cookies_refreshed,
-        )
+    pub fn new(auth: DzmmApiAuth) -> Result<Self> {
+        Self::new_with_config(ApiClientConfig::default(), auth)
     }
 
     #[instrument(
-        skip(
-            email,
-            password,
-            signin_code,
-            signin_code_image,
-            signin_code_image_mime,
-            cookies,
-            on_cookies_refreshed
-        ),
-        fields(user_id = ?user_id.as_deref(), auto_refresh, base_url = %config.base_url)
+        skip(auth),
+        fields(user_id = ?auth.user_id.as_deref(), auto_refresh = auth.auto_refresh, base_url = %config.base_url)
     )]
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_config(
-        config: ApiClientConfig,
-        email: Option<String>,
-        password: Option<String>,
-        signin_code: Option<String>,
-        signin_code_image: Option<Vec<u8>>,
-        signin_code_image_mime: Option<String>,
-        cookies: Option<String>,
-        user_id: Option<String>,
-        auto_refresh: bool,
-        on_cookies_refreshed: Option<CookieRefreshCallback>,
-    ) -> Result<Self> {
+    pub fn new_with_config(config: ApiClientConfig, auth: DzmmApiAuth) -> Result<Self> {
         let base_url = normalize_base_url(&config.base_url)?;
         let cookie_url = Url::parse(&base_url).context("Invalid API base URL")?;
-        let cookie_map = if let Some(ref c) = cookies {
+        let cookie_map = if let Some(ref c) = auth.cookies {
             parse_cookie_header(c)
         } else {
             HashMap::new()
@@ -376,15 +409,8 @@ impl DzmmApi {
 
         Ok(Self {
             client,
-            base_url: normalize_base_url(&config.base_url)?,
-            email,
-            password,
-            signin_code,
-            signin_code_image,
-            signin_code_image_mime,
-            user_id,
-            auto_refresh,
-            on_cookies_refreshed,
+            base_url,
+            auth,
             rate_limiter: Arc::new(Mutex::new(RateLimiter::new(None, None, None, None))),
             refresh_lock: Arc::new(Mutex::new(())),
             cookie_map: Arc::new(Mutex::new(cookie_map)),
@@ -454,7 +480,7 @@ impl DzmmApi {
     }
 
     async fn invoke_cookies_refreshed(&self) {
-        if let Some(ref cb) = self.on_cookies_refreshed {
+        if let Some(ref cb) = self.auth.on_cookies_refreshed {
             let cookie_str = self.get_cookie_string().await;
             cb(cookie_str).await;
         }
@@ -474,11 +500,7 @@ impl DzmmApi {
 
         let token_url = format!("{}/api/auth/token", self.base_url());
         match self
-            .send_request(
-                self.client
-                    .get(&token_url)
-                    .headers(self.build_headers(None)),
-            )
+            .send_request(self.client.get(&token_url).headers(self.build_headers()))
             .await
         {
             Ok(response) => {
@@ -509,20 +531,20 @@ impl DzmmApi {
             }
         }
 
-        if let (Some(email), Some(password)) = (&self.email, &self.password) {
+        if let (Some(email), Some(password)) = (&self.auth.email, &self.auth.password) {
             info!("Falling back to password login...");
             return self.login_with_email_password(email, password).await;
         }
 
         if let (Some(image), Some(mime)) = (
-            self.signin_code_image.as_ref(),
-            self.signin_code_image_mime.as_ref(),
+            self.auth.signin_code_image.as_ref(),
+            self.auth.signin_code_image_mime.as_ref(),
         ) {
             info!("Falling back to QR code image login...");
             return self.login_with_qr_image(image, mime).await;
         }
 
-        if let Some(ref signin_code) = self.signin_code {
+        if let Some(ref signin_code) = self.auth.signin_code {
             info!("Falling back to QR code signin...");
             return self.login_with_qr_code(signin_code).await;
         }
@@ -544,7 +566,7 @@ impl DzmmApi {
             .send_request(
                 self.client
                     .post(&sign_in_url)
-                    .headers(self.build_headers(Some(&[("Content-Type", "application/json")])))
+                    .headers(self.build_headers())
                     .json(&body),
             )
             .await
@@ -562,11 +584,7 @@ impl DzmmApi {
 
         let token_url = format!("{}/api/auth/token", self.base_url());
         let token_response = self
-            .send_request(
-                self.client
-                    .get(&token_url)
-                    .headers(self.build_headers(None)),
-            )
+            .send_request(self.client.get(&token_url).headers(self.build_headers()))
             .await
             .context("Token request failed")?;
 
@@ -606,7 +624,7 @@ impl DzmmApi {
             encrypted_token
         );
         let response = self
-            .send_request(self.client.get(&url).headers(self.build_headers(None)))
+            .send_request(self.client.get(&url).headers(self.build_headers()))
             .await
             .context("QR code login request failed")?;
 
@@ -658,7 +676,7 @@ impl DzmmApi {
             .send_request(
                 self.client
                     .post(&url)
-                    .headers(self.build_headers(None))
+                    .headers(self.build_headers())
                     .multipart(form),
             )
             .await
@@ -690,7 +708,7 @@ impl DzmmApi {
         Ok(false)
     }
 
-    fn build_headers(&self, extra_headers: Option<&[(&str, &str)]>) -> HeaderMap {
+    fn build_headers(&self) -> HeaderMap {
         let mut headers = HeaderMap::new();
         for (k, v) in DZMM_HEADERS {
             headers.insert(
@@ -698,10 +716,6 @@ impl DzmmApi {
                 HeaderValue::from_str(v).unwrap(),
             );
         }
-        headers.insert(
-            ACCEPT,
-            HeaderValue::from_static("application/json, text/plain, */*"),
-        );
         headers.insert("Sec-Fetch-Dest", HeaderValue::from_static("empty"));
         headers.insert("Sec-Fetch-Mode", HeaderValue::from_static("cors"));
         headers.insert("Sec-Fetch-Site", HeaderValue::from_static("same-origin"));
@@ -709,15 +723,6 @@ impl DzmmApi {
 
         let referer = format!("{}/chat", self.base_url());
         headers.insert(REFERER, HeaderValue::from_str(&referer).unwrap());
-
-        if let Some(extra) = extra_headers {
-            for (k, v) in extra {
-                headers.insert(
-                    reqwest::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
-                    HeaderValue::from_str(v).unwrap(),
-                );
-            }
-        }
 
         headers.insert(
             "x-dzmm-request-id",
@@ -771,42 +776,40 @@ impl DzmmApi {
     }
 
     #[instrument(
-        skip(self, query, json_body, multipart_form, extra_headers, timeout),
-        fields(method = ?method, endpoint = %endpoint, user_id = ?self.user_id.as_deref())
+        skip(self, request),
+        fields(method = ?request.method, endpoint = %request.endpoint, user_id = ?self.auth.user_id.as_deref())
     )]
-    #[allow(clippy::too_many_arguments)]
     async fn _request_inner(
         &self,
-        method: Method,
-        endpoint: &str,
-        query: Option<&[(&str, &str)]>,
-        json_body: Option<&Value>,
-        multipart_form: Option<Form>,
-        extra_headers: Option<&[(&str, &str)]>,
-        timeout: Option<Duration>,
+        request: &mut ApiRequest<'_>,
     ) -> Result<(StatusCode, Vec<u8>, HeaderMap)> {
-        let mut url = Url::parse(&format!("{}{}", self.base_url(), endpoint))?;
-        if let Some(q) = query {
-            url.query_pairs_mut().extend_pairs(q.iter());
+        let mut url = Url::parse(&format!("{}{}", self.base_url(), request.endpoint.as_ref()))?;
+        if !request.query.is_empty() {
+            url.query_pairs_mut().extend_pairs(
+                request
+                    .query
+                    .iter()
+                    .map(|(key, value)| (key.as_ref(), value.as_ref())),
+            );
         }
 
-        let mut builder = self.client.request(method, url);
+        let mut builder = self.client.request(request.method.clone(), url);
 
-        let mut headers = self.build_headers(extra_headers);
+        let mut headers = self.build_headers();
         if let Some(cookie_val) = self.build_cookie_header_value().await {
             headers.insert(COOKIE, HeaderValue::from_str(&cookie_val).unwrap());
         }
         builder = builder.headers(headers);
 
-        if let Some(body) = json_body {
+        if let Some(body) = &request.json_body {
             builder = builder.json(body);
         }
 
-        if let Some(form) = multipart_form {
+        if let Some(form) = request.multipart_form.take() {
             builder = builder.multipart(form);
         }
 
-        if let Some(t) = timeout {
+        if let Some(t) = request.timeout {
             builder = builder.timeout(t);
         }
 
@@ -821,37 +824,14 @@ impl DzmmApi {
         Ok((status, body_bytes.to_vec(), resp_headers))
     }
 
-    #[instrument(skip(self, query, json_body, multipart_form, extra_headers, timeout), fields(method = ?method, endpoint = %endpoint))]
-    #[allow(clippy::too_many_arguments)]
-    async fn _request(
-        &self,
-        method: Method,
-        endpoint: &str,
-        query: Option<&[(&str, &str)]>,
-        json_body: Option<&Value>,
-        multipart_form: Option<Form>,
-        extra_headers: Option<&[(&str, &str)]>,
-        timeout: Option<Duration>,
-    ) -> Result<Value> {
+    #[instrument(skip(self, request), fields(method = ?request.method, endpoint = %request.endpoint))]
+    async fn _request(&self, mut request: ApiRequest<'_>) -> Result<Value> {
         let mut retried = false;
-        let mut form = multipart_form;
 
         loop {
             self.rate_limiter.lock().await.wait().await;
 
-            let current_form = if retried { None } else { form.take() };
-            let body_ref = json_body.cloned();
-            let (status, body_bytes, resp_headers) = self
-                ._request_inner(
-                    method.clone(),
-                    endpoint,
-                    query,
-                    body_ref.as_ref(),
-                    current_form,
-                    extra_headers,
-                    timeout,
-                )
-                .await?;
+            let (status, body_bytes, resp_headers) = self._request_inner(&mut request).await?;
 
             self.merge_response_cookies(&resp_headers).await;
 
@@ -869,10 +849,10 @@ impl DzmmApi {
             let is_biz_forbidden = is_trpc_business_forbidden(&body_text);
             let is_auth = matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN);
 
-            if is_auth && !is_biz_forbidden && self.auto_refresh && !retried {
+            if is_auth && !is_biz_forbidden && self.auth.auto_refresh && !retried {
                 warn!(
                     "Auth error before retry {} for {}\nResult: {}",
-                    status, endpoint, body_text
+                    status, request.endpoint, body_text
                 );
                 if self.refresh_cookies().await.unwrap_or(false) {
                     info!("Retrying with fresh cookies...");
@@ -884,16 +864,16 @@ impl DzmmApi {
             if is_biz_forbidden {
                 warn!(
                     "Business forbidden {} for {}\nResult: {}",
-                    status, endpoint, body_text
+                    status, request.endpoint, body_text
                 );
                 bail!("Business forbidden: {} {}", status, body_text);
             }
 
             error!(
                 "HTTP error {} for {}\nResult: {}",
-                status, endpoint, body_text
+                status, request.endpoint, body_text
             );
-            bail!("HTTP {} for {}: {}", status, endpoint, body_text);
+            bail!("HTTP {} for {}: {}", status, request.endpoint, body_text);
         }
     }
 
@@ -901,21 +881,13 @@ impl DzmmApi {
     pub async fn get_my_info(&self, retried: bool) -> Result<Value> {
         let input_data = json!({"0": {"json": Value::Null}});
         let response = self
-            ._request(
-                Method::GET,
-                "/api/trpc/user.getMe",
-                Some(&[("batch", "1"), ("input", &input_data.to_string())]),
-                None,
-                None,
-                None,
-                None,
-            )
+            ._request(ApiRequest::get("/api/trpc/user.getMe").query(trpc_batch_query(&input_data)))
             .await?;
 
         let parsed = parse_trpc_response(&response, 0, None);
 
         if !parsed.is_object() || parsed.get("isLoggedIn") == Some(&Value::Bool(false)) {
-            if !retried && self.auto_refresh {
+            if !retried && self.auth.auto_refresh {
                 warn!("isLoggedIn=false, attempting cookie refresh...");
                 if self.refresh_cookies().await.unwrap_or(false) {
                     info!("Retrying with fresh cookies...");
@@ -933,13 +905,8 @@ impl DzmmApi {
         let input_data = json!({"0": {"json": {"userId": user_id, "chatroomId": room_id}}});
         let response = self
             ._request(
-                Method::GET,
-                "/api/trpc/user.getChatroomUser",
-                Some(&[("batch", "1"), ("input", &input_data.to_string())]),
-                None,
-                None,
-                None,
-                None,
+                ApiRequest::get("/api/trpc/user.getChatroomUser")
+                    .query(trpc_batch_query(&input_data)),
             )
             .await?;
 
@@ -960,13 +927,8 @@ impl DzmmApi {
         let input_data = json!({"0": {"json": {"userid": user_id}}});
         let response = self
             ._request(
-                Method::GET,
-                "/api/trpc/user.getProfilePage",
-                Some(&[("batch", "1"), ("input", &input_data.to_string())]),
-                None,
-                None,
-                None,
-                None,
+                ApiRequest::get("/api/trpc/user.getProfilePage")
+                    .query(trpc_batch_query(&input_data)),
             )
             .await?;
 
@@ -1049,15 +1011,10 @@ impl DzmmApi {
         let endpoint = format!("/api/trpc/{}", procedure_names);
 
         let response = self
-            ._request(
-                Method::GET,
-                &endpoint,
-                Some(&[("batch", "1"), ("input", &input_data)]),
-                None,
-                None,
-                None,
-                None,
-            )
+            ._request(ApiRequest::get(&endpoint).query([
+                ("batch".to_string(), "1".to_string()),
+                ("input".to_string(), input_data),
+            ]))
             .await?;
 
         let mut results = Vec::new();
@@ -1081,13 +1038,8 @@ impl DzmmApi {
         let input_data = json!({"0": {"json": {"chatroomId": room_id}}});
         let response = self
             ._request(
-                Method::GET,
-                "/api/trpc/chatroom.getPreview",
-                Some(&[("batch", "1"), ("input", &input_data.to_string())]),
-                None,
-                None,
-                None,
-                None,
+                ApiRequest::get("/api/trpc/chatroom.getPreview")
+                    .query(trpc_batch_query(&input_data)),
             )
             .await;
 
@@ -1116,13 +1068,8 @@ impl DzmmApi {
         let input_data = json!({"0": {"json": {"code": invite_code}}});
         let response = self
             ._request(
-                Method::GET,
-                "/api/trpc/groupChat.getInviteInfo",
-                Some(&[("batch", "1"), ("input", &input_data.to_string())]),
-                None,
-                None,
-                None,
-                None,
+                ApiRequest::get("/api/trpc/groupChat.getInviteInfo")
+                    .query(trpc_batch_query(&input_data)),
             )
             .await?;
 
@@ -1139,13 +1086,9 @@ impl DzmmApi {
         let body = json!({"0": {"json": {"inviteCode": invite_code, "gender": "male"}}});
         let response = self
             ._request(
-                Method::POST,
-                "/api/trpc/groupChat.joinByInvite",
-                Some(&[("batch", "1")]),
-                Some(&body),
-                None,
-                None,
-                None,
+                ApiRequest::post("/api/trpc/groupChat.joinByInvite")
+                    .query([("batch", "1")])
+                    .json(body),
             )
             .await?;
 
@@ -1178,15 +1121,7 @@ impl DzmmApi {
             .text("tags", tags_json);
 
         let response = self
-            ._request(
-                Method::POST,
-                "/api/trpc/groupChat.create",
-                None,
-                None,
-                Some(form),
-                None,
-                None,
-            )
+            ._request(ApiRequest::post("/api/trpc/groupChat.create").multipart(form))
             .await?;
 
         if let Some(obj) = response.as_object() {
@@ -1214,15 +1149,7 @@ impl DzmmApi {
     pub async fn generate_invite(&self, chatroom_id: &str) -> Result<String> {
         let payload = json!({"0": {"json": {"chatroomId": chatroom_id}}});
         let result = self
-            ._request(
-                Method::POST,
-                "/api/trpc/groupChat.generateInvite?batch=1",
-                None,
-                Some(&payload),
-                None,
-                None,
-                None,
-            )
+            ._request(ApiRequest::post("/api/trpc/groupChat.generateInvite?batch=1").json(payload))
             .await?;
 
         let data = parse_trpc_response(&result, 0, None);
@@ -1236,16 +1163,8 @@ impl DzmmApi {
     #[instrument(skip(self), fields(chatroom_id = %chatroom_id, member_id = %member_id))]
     pub async fn remove_group_member(&self, chatroom_id: &str, member_id: &str) -> Result<()> {
         let payload = json!({"0": {"json": {"chatroomId": chatroom_id, "memberId": member_id}}});
-        self._request(
-            Method::POST,
-            "/api/trpc/groupChat.removeMember?batch=1",
-            None,
-            Some(&payload),
-            None,
-            None,
-            None,
-        )
-        .await?;
+        self._request(ApiRequest::post("/api/trpc/groupChat.removeMember?batch=1").json(payload))
+            .await?;
         Ok(())
     }
 
@@ -1253,16 +1172,8 @@ impl DzmmApi {
     pub async fn set_group_admin(&self, chatroom_id: &str, target_user_id: &str) -> Result<()> {
         let payload =
             json!({"0": {"json": {"chatroomId": chatroom_id, "targetUserId": target_user_id}}});
-        self._request(
-            Method::POST,
-            "/api/trpc/groupChat.setAdmin?batch=1",
-            None,
-            Some(&payload),
-            None,
-            None,
-            None,
-        )
-        .await?;
+        self._request(ApiRequest::post("/api/trpc/groupChat.setAdmin?batch=1").json(payload))
+            .await?;
         Ok(())
     }
 
@@ -1285,7 +1196,7 @@ impl DzmmApi {
             .send_request(
                 self.client
                     .put(&url)
-                    .headers(self.build_headers(None))
+                    .headers(self.build_headers())
                     .multipart(form),
             )
             .await
@@ -1305,16 +1216,8 @@ impl DzmmApi {
     #[instrument(skip(self), fields(chatroom_id = %chatroom_id, title = %title))]
     pub async fn rename_room(&self, chatroom_id: &str, title: &str) -> Result<()> {
         let body = json!({"json": {"chatroomId": chatroom_id, "title": title}});
-        self._request(
-            Method::POST,
-            "/api/trpc/groupChat.rename",
-            None,
-            Some(&body),
-            None,
-            None,
-            None,
-        )
-        .await?;
+        self._request(ApiRequest::post("/api/trpc/groupChat.rename").json(body))
+            .await?;
         Ok(())
     }
 
@@ -1328,13 +1231,8 @@ impl DzmmApi {
         let input_data = json!({"0": {"json": {"type": st, "resourceId": resource_id}}});
         let response = self
             ._request(
-                Method::GET,
-                "/api/trpc/share.getResourcePreview",
-                Some(&[("batch", "1"), ("input", &input_data.to_string())]),
-                None,
-                None,
-                None,
-                None,
+                ApiRequest::get("/api/trpc/share.getResourcePreview")
+                    .query(trpc_batch_query(&input_data)),
             )
             .await?;
 
@@ -1357,15 +1255,7 @@ impl DzmmApi {
     #[instrument(skip(self))]
     pub async fn send_heartbeat(&self) -> Result<bool> {
         match self
-            ._request(
-                Method::POST,
-                "/api/heartbeat",
-                None,
-                None,
-                None,
-                None,
-                Some(Duration::from_secs(5)),
-            )
+            ._request(ApiRequest::post("/api/heartbeat").timeout(Duration::from_secs(5)))
             .await
         {
             Ok(_) => {
@@ -1383,13 +1273,7 @@ impl DzmmApi {
         let input_data = json!({"0": {}});
         let response = self
             ._request(
-                Method::GET,
-                "/api/trpc/chat.listAll",
-                Some(&[("batch", "1"), ("input", &input_data.to_string())]),
-                None,
-                None,
-                None,
-                None,
+                ApiRequest::get("/api/trpc/chat.listAll").query(trpc_batch_query(&input_data)),
             )
             .await?;
 
@@ -1438,13 +1322,8 @@ impl DzmmApi {
         let input_data = json!({"0": {"json": Value::Object(input_obj)}});
         let response = self
             ._request(
-                Method::GET,
-                "/api/trpc/chatroom.getMessages",
-                Some(&[("batch", "1"), ("input", &input_data.to_string())]),
-                None,
-                None,
-                None,
-                None,
+                ApiRequest::get("/api/trpc/chatroom.getMessages")
+                    .query(trpc_batch_query(&input_data)),
             )
             .await?;
 
@@ -1476,13 +1355,7 @@ impl DzmmApi {
 
         let response = self
             ._request(
-                Method::GET,
-                "/api/trpc/search.search",
-                Some(&[("batch", "1"), ("input", &input_data.to_string())]),
-                None,
-                None,
-                None,
-                None,
+                ApiRequest::get("/api/trpc/search.search").query(trpc_batch_query(&input_data)),
             )
             .await?;
 
@@ -1498,13 +1371,8 @@ impl DzmmApi {
         let input_obj = json!({"json": {"bookId": book_id}});
         let response = self
             ._request(
-                Method::GET,
-                "/api/trpc/novel.book.get",
-                Some(&[("input", &input_obj.to_string())]),
-                None,
-                None,
-                None,
-                None,
+                ApiRequest::get("/api/trpc/novel.book.get")
+                    .query([("input".to_string(), input_obj.to_string())]),
             )
             .await?;
 
@@ -1555,13 +1423,8 @@ impl DzmmApi {
         let input_data = json!({"0": {"json": Value::Object(input_obj)}});
         let response = self
             ._request(
-                Method::GET,
-                "/api/trpc/chatroom.listMembers",
-                Some(&[("batch", "1"), ("input", &input_data.to_string())]),
-                None,
-                None,
-                None,
-                None,
+                ApiRequest::get("/api/trpc/chatroom.listMembers")
+                    .query(trpc_batch_query(&input_data)),
             )
             .await?;
 
@@ -1643,15 +1506,7 @@ impl DzmmApi {
         info!("Uploading image: {}", filename);
 
         let response = self
-            ._request(
-                Method::POST,
-                "/api/trpc/chatroom.uploadImage",
-                None,
-                None,
-                Some(form),
-                None,
-                None,
-            )
+            ._request(ApiRequest::post("/api/trpc/chatroom.uploadImage").multipart(form))
             .await?;
 
         let image_url = if let Some(arr) = response.as_array() {
@@ -1709,15 +1564,7 @@ impl DzmmApi {
         info!("Uploading voice: {}", filename);
 
         let response = self
-            ._request(
-                Method::POST,
-                "/api/trpc/chat.uploadVoiceMessage",
-                None,
-                None,
-                Some(form),
-                None,
-                None,
-            )
+            ._request(ApiRequest::post("/api/trpc/chat.uploadVoiceMessage").multipart(form))
             .await?;
 
         let (voice_url, data_to_return) = if let Some(arr) = response.as_array() {
@@ -1777,15 +1624,7 @@ impl DzmmApi {
         info!("Uploading video: {}", filename);
 
         let response = self
-            ._request(
-                Method::POST,
-                "/api/trpc/media.uploadVideo",
-                None,
-                None,
-                Some(form),
-                None,
-                None,
-            )
+            ._request(ApiRequest::post("/api/trpc/media.uploadVideo").multipart(form))
             .await?;
 
         let (video_url, data_to_return) = if let Some(arr) = response.as_array() {
@@ -1859,15 +1698,7 @@ impl DzmmApi {
         info!("Uploading tweet image via tRPC: {}", filename_str);
 
         let response = self
-            ._request(
-                Method::POST,
-                "/api/trpc/tweet.uploadImage",
-                None,
-                None,
-                Some(form),
-                None,
-                None,
-            )
+            ._request(ApiRequest::post("/api/trpc/tweet.uploadImage").multipart(form))
             .await?;
 
         let (image_url, data_to_return) = if let Some(arr) = response.as_array() {
@@ -1921,15 +1752,7 @@ impl DzmmApi {
         let input_data = json!({"0": {"json": input_obj}});
 
         let response = self
-            ._request(
-                Method::GET,
-                "/api/trpc/tweet.list",
-                Some(&[("batch", "1"), ("input", &input_data.to_string())]),
-                None,
-                None,
-                None,
-                None,
-            )
+            ._request(ApiRequest::get("/api/trpc/tweet.list").query(trpc_batch_query(&input_data)))
             .await?;
 
         let parsed = parse_trpc_response(&response, 0, None);
@@ -1977,15 +1800,7 @@ impl DzmmApi {
         );
 
         let response = self
-            ._request(
-                Method::POST,
-                "/api/gamefy/draw",
-                None,
-                Some(&payload),
-                None,
-                Some(&[("Content-Type", "application/json")]),
-                None,
-            )
+            ._request(ApiRequest::post("/api/gamefy/draw").json(payload))
             .await?;
 
         let data = response;
@@ -2010,15 +1825,7 @@ impl DzmmApi {
 
     pub async fn poll_generation_task(&self, task_id: &str) -> Result<Value> {
         let response = self
-            ._request(
-                Method::GET,
-                "/api/gamefy/draw/status",
-                Some(&[("taskId", task_id)]),
-                None,
-                None,
-                None,
-                None,
-            )
+            ._request(ApiRequest::get("/api/gamefy/draw/status").query([("taskId", task_id)]))
             .await?;
 
         let mut data = if let Some(task) = response.get("task").filter(|v| v.is_object()) {
@@ -2159,15 +1966,7 @@ impl DzmmApi {
         });
 
         let data = self
-            ._request(
-                Method::POST,
-                "/api/gamefy/draw/upload-reference",
-                None,
-                Some(&payload),
-                None,
-                Some(&[("Content-Type", "application/json")]),
-                None,
-            )
+            ._request(ApiRequest::post("/api/gamefy/draw/upload-reference").json(payload))
             .await?;
 
         if data.get("success").and_then(|v| v.as_bool()) == Some(false) {
@@ -2185,60 +1984,38 @@ impl DzmmApi {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn start_image_edit(
-        &self,
-        prompt: &str,
-        image_urls: &[String],
-        image_width: Option<u64>,
-        image_height: Option<u64>,
-        num_inference_steps: Option<u64>,
-        text_guidance_scale: Option<f64>,
-        image_guidance_scale: Option<f64>,
-        num_images: Option<u64>,
-        enable_safety_checker: Option<bool>,
-        model: Option<&str>,
-        tag_ids: Option<&[String]>,
-    ) -> Result<String> {
-        if image_urls.len() > 4 {
+    pub async fn start_image_edit(&self, request: ImageEditRequest<'_>) -> Result<String> {
+        if request.image_urls.len() > 4 {
             bail!(
                 "Maximum 4 reference images allowed, got {}",
-                image_urls.len()
+                request.image_urls.len()
             );
         }
 
-        let tag_ids = tag_ids.unwrap_or(&[]);
-        let model = model.unwrap_or("nalang-dream");
+        let tag_ids = request.tag_ids.unwrap_or(&[]);
+        let model = request.model.unwrap_or("nalang-dream");
 
         let payload = json!({
-            "prompt": prompt,
-            "images": image_urls,
-            "imageSize": {"width": image_width.unwrap_or(1024), "height": image_height.unwrap_or(1024)},
-            "numInferenceSteps": num_inference_steps.unwrap_or(30),
-            "textGuidanceScale": text_guidance_scale.unwrap_or(5.0),
-            "imageGuidanceScale": image_guidance_scale.unwrap_or(6.0),
-            "numImages": num_images.unwrap_or(1),
-            "enableSafetyChecker": enable_safety_checker.unwrap_or(true),
+            "prompt": request.prompt,
+            "images": request.image_urls,
+            "imageSize": {"width": request.image_width.unwrap_or(1024), "height": request.image_height.unwrap_or(1024)},
+            "numInferenceSteps": request.num_inference_steps.unwrap_or(30),
+            "textGuidanceScale": request.text_guidance_scale.unwrap_or(5.0),
+            "imageGuidanceScale": request.image_guidance_scale.unwrap_or(6.0),
+            "numImages": request.num_images.unwrap_or(1),
+            "enableSafetyChecker": request.enable_safety_checker.unwrap_or(true),
             "model": model,
             "tagIds": tag_ids,
         });
 
         info!(
             "Starting image edit: prompt='{}...', model={}",
-            &prompt.chars().take(50).collect::<String>(),
+            &request.prompt.chars().take(50).collect::<String>(),
             model
         );
 
         let response = self
-            ._request(
-                Method::POST,
-                "/api/gamefy/draw/edit",
-                None,
-                Some(&payload),
-                None,
-                Some(&[("Content-Type", "application/json")]),
-                None,
-            )
+            ._request(ApiRequest::post("/api/gamefy/draw/edit").json(payload))
             .await?;
 
         let data = response;
@@ -2278,20 +2055,21 @@ impl DzmmApi {
             .upload_reference_image(image_bytes, Some(&filename), Some(image_mime_type))
             .await?;
 
+        let image_urls = vec![ref_url];
         let task_id = self
-            .start_image_edit(
+            .start_image_edit(ImageEditRequest {
                 prompt,
-                &[ref_url],
+                image_urls: &image_urls,
                 image_width,
                 image_height,
-                None,
-                None,
-                None,
-                None,
-                None,
+                num_inference_steps: None,
+                text_guidance_scale: None,
+                image_guidance_scale: None,
+                num_images: None,
+                enable_safety_checker: None,
                 model,
-                None,
-            )
+                tag_ids: None,
+            })
             .await?;
 
         info!("Polling for edit task completion: {}", task_id);
@@ -2629,15 +2407,7 @@ mod tests {
                 base_url,
                 ..ApiClientConfig::default()
             },
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-            None,
+            DzmmApiAuth::default(),
         )
         .unwrap();
         api.rate_limiter = Arc::new(Mutex::new(RateLimiter {
@@ -2809,8 +2579,9 @@ mod tests {
         });
 
         let api = test_api(base_url);
+        let mut request = ApiRequest::get("/compressed");
         let (status, body, _) = api
-            ._request_inner(Method::GET, "/compressed", None, None, None, None, None)
+            ._request_inner(&mut request)
             .await
             .expect("request succeeds");
 

@@ -7,8 +7,9 @@ use lilium_models::ingestion::EventEnvelope;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use tokio::net::{TcpSocket, TcpStream, lookup_host};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, RwLock, oneshot};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, client_async, client_async_tls_with_config, connect_async,
     tungstenite::{handshake::client::Response, http::Request},
@@ -130,6 +131,119 @@ pub struct WsClient {
     account_id: String,
     url: String,
     cookie_header: Option<String>,
+}
+
+struct SocketCommandState {
+    client: Option<rust_socketio::asynchronous::Client>,
+    generation: u64,
+}
+
+#[derive(Clone)]
+pub struct SocketCommandExecutor {
+    state: Arc<RwLock<SocketCommandState>>,
+    connect_notify: Arc<Notify>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SocketCommandError {
+    NotConnected,
+    AckTimeout,
+    AckCanceled,
+    Socket(String),
+}
+
+impl std::fmt::Display for SocketCommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotConnected => write!(f, "Socket.IO client is not connected"),
+            Self::AckTimeout => write!(f, "Socket.IO ACK timed out"),
+            Self::AckCanceled => write!(f, "Socket.IO ACK callback was canceled"),
+            Self::Socket(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for SocketCommandError {}
+
+impl Default for SocketCommandExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SocketCommandExecutor {
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(RwLock::new(SocketCommandState {
+                client: None,
+                generation: 0,
+            })),
+            connect_notify: Arc::new(Notify::new()),
+        }
+    }
+
+    pub async fn set_connected(&self, client: rust_socketio::asynchronous::Client) {
+        let mut state = self.state.write().await;
+        state.client = Some(client);
+        state.generation = state.generation.saturating_add(1);
+        self.connect_notify.notify_waiters();
+    }
+
+    pub async fn clear(&self) {
+        let mut state = self.state.write().await;
+        state.client = None;
+    }
+
+    pub async fn is_connected(&self) -> bool {
+        self.state.read().await.client.is_some()
+    }
+
+    pub async fn connected_generation(&self) -> Option<u64> {
+        let state = self.state.read().await;
+        state.client.as_ref().map(|_| state.generation)
+    }
+
+    pub async fn wait_for_connection_after(&self, generation: u64, timeout: Duration) -> bool {
+        tokio::time::timeout(timeout, async {
+            loop {
+                if self
+                    .connected_generation()
+                    .await
+                    .is_some_and(|current| current > generation)
+                {
+                    return true;
+                }
+                self.connect_notify.notified().await;
+            }
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    pub async fn execute(
+        &self,
+        event: &str,
+        data: serde_json::Value,
+        require_ack: bool,
+    ) -> std::result::Result<Option<serde_json::Value>, SocketCommandError> {
+        let client = {
+            let state = self.state.read().await;
+            state
+                .client
+                .clone()
+                .ok_or(SocketCommandError::NotConnected)?
+        };
+
+        if require_ack {
+            emit_with_ack_value(client, event.to_owned(), data).await
+        } else {
+            client
+                .emit(event, data)
+                .await
+                .map_err(|error| SocketCommandError::Socket(error.to_string()))?;
+            Ok(None)
+        }
+    }
 }
 
 impl WsClient {
@@ -282,13 +396,14 @@ impl WsClient {
         Ok(builder)
     }
 
-    #[instrument(skip(self, on_event, shutdown, shutdown_notify, reconnect_notify), fields(account_id = %self.account_id))]
+    #[instrument(skip(self, on_event, shutdown, shutdown_notify, reconnect_notify, command_executor), fields(account_id = %self.account_id))]
     pub async fn run<F>(
         &mut self,
         on_event: F,
         shutdown: Arc<AtomicBool>,
         shutdown_notify: Arc<Notify>,
         reconnect_notify: Arc<Notify>,
+        command_executor: Option<SocketCommandExecutor>,
     ) -> Result<()>
     where
         F: FnMut(EventEnvelope) -> BoxFuture<'static, ()> + Send + 'static,
@@ -331,6 +446,9 @@ impl WsClient {
 
         let socket = connect_result;
         info!(account = %self.account_id, "WebSocket connected");
+        if let Some(executor) = command_executor.as_ref() {
+            executor.set_connected(socket.clone()).await;
+        }
 
         if disconnect_state.load(Ordering::Relaxed) {
             info!(account = %self.account_id, "WebSocket disconnected during connect");
@@ -350,9 +468,46 @@ impl WsClient {
             }
         }
 
+        if let Some(executor) = command_executor.as_ref() {
+            executor.clear().await;
+        }
         let _ = socket.disconnect().await;
         Ok(())
     }
+}
+
+async fn emit_with_ack_value(
+    client: rust_socketio::asynchronous::Client,
+    event: String,
+    data: serde_json::Value,
+) -> std::result::Result<Option<serde_json::Value>, SocketCommandError> {
+    let (sender, receiver) = oneshot::channel::<serde_json::Value>();
+    let sender = Arc::new(tokio::sync::Mutex::new(Some(sender)));
+    let callback_sender = sender.clone();
+
+    client
+        .emit_with_ack(
+            event,
+            data,
+            Duration::from_secs(10),
+            move |payload, _client| {
+                let sender = callback_sender.clone();
+                async move {
+                    if let Some(sender) = sender.lock().await.take() {
+                        let _ = sender.send(socketio_payload_to_ack_value(payload));
+                    }
+                }
+                .boxed()
+            },
+        )
+        .await
+        .map_err(|error| SocketCommandError::Socket(error.to_string()))?;
+
+    let ack = tokio::time::timeout(Duration::from_secs(10), receiver)
+        .await
+        .map_err(|_| SocketCommandError::AckTimeout)?
+        .map_err(|_| SocketCommandError::AckCanceled)?;
+    Ok(Some(ack))
 }
 
 async fn emit_envelope<F>(on_event: Arc<tokio::sync::Mutex<F>>, event: EventEnvelope)
@@ -465,10 +620,36 @@ fn socketio_payload_to_value(payload: rust_socketio::Payload) -> serde_json::Val
                 bytes.into_iter().map(serde_json::Value::from).collect(),
             )),
         },
-        #[allow(deprecated)]
+        #[expect(
+            deprecated,
+            reason = "rust_socketio 0.6 still exposes this legacy payload variant; preserve old inbound payload semantics"
+        )]
         rust_socketio::Payload::String(text) => python_event_payload(
             serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text)),
         ),
+    }
+}
+
+fn socketio_payload_to_ack_value(payload: rust_socketio::Payload) -> serde_json::Value {
+    match payload {
+        rust_socketio::Payload::Text(values) => match values.as_slice() {
+            [single] => decode_value(single),
+            [] => serde_json::Value::Null,
+            many => serde_json::Value::Array(many.iter().map(decode_value).collect()),
+        },
+        rust_socketio::Payload::Binary(bytes) => match String::from_utf8(bytes.to_vec()) {
+            Ok(text) => serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text)),
+            Err(_) => {
+                serde_json::Value::Array(bytes.into_iter().map(serde_json::Value::from).collect())
+            }
+        },
+        #[expect(
+            deprecated,
+            reason = "rust_socketio 0.6 still exposes this legacy payload variant; preserve ACK payload semantics"
+        )]
+        rust_socketio::Payload::String(text) => {
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text))
+        }
     }
 }
 

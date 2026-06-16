@@ -1,17 +1,28 @@
 use crate::Result;
 use chrono::Utc;
-use lilium_api_client::http::DzmmApi;
+use lilium_api_client::http::{DzmmApi, DzmmApiAuth};
 use lilium_common::LiliumError;
 use lilium_models::dzmm::{account as dzmm_account, websocket_connection as websocket_connections};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter,
     QueryOrder, Set,
 };
+use std::borrow::Cow;
 use tracing::instrument;
 
 type DzmmAccount = dzmm_account::Model;
 
-#[allow(clippy::result_large_err)]
+pub struct CreateAccountParams<'a> {
+    pub user_id: &'a str,
+    pub user_profile: serde_json::Value,
+    pub email: Option<&'a str>,
+    pub password: Option<&'a str>,
+    pub signin_code: Option<&'a str>,
+    pub signin_code_image: Option<&'a [u8]>,
+    pub signin_code_image_mime: Option<&'a str>,
+    pub cookies: Option<&'a str>,
+}
+
 #[instrument(
     skip(account),
     fields(
@@ -23,57 +34,48 @@ type DzmmAccount = dzmm_account::Model;
         has_cookies = account.cookies.is_some()
     )
 )]
-pub fn create_auth_client(account: &DzmmAccount) -> Result<DzmmApi> {
-    DzmmApi::new(
-        account.email.clone(),
-        account.password.clone(),
-        account.signin_code.clone(),
-        account.signin_code_image.clone(),
-        account.signin_code_image_mime.clone(),
-        account.cookies.clone(),
-        Some(account.user_id.clone()),
-        true,
-        None,
-    )
+pub fn create_auth_client(account: DzmmAccount) -> Result<DzmmApi> {
+    DzmmApi::new(DzmmApiAuth {
+        email: account.email.map(Cow::Owned),
+        password: account.password.map(Cow::Owned),
+        signin_code: account.signin_code.map(Cow::Owned),
+        signin_code_image: account.signin_code_image,
+        signin_code_image_mime: account.signin_code_image_mime.map(Cow::Owned),
+        cookies: account.cookies.map(Cow::Owned),
+        user_id: Some(Cow::Owned(account.user_id)),
+        auto_refresh: true,
+        on_cookies_refreshed: None,
+    })
     .map_err(|e| LiliumError::service("ACCOUNT_AUTH_CLIENT_BUILD_FAILED", e.to_string()))
 }
 
-#[allow(clippy::too_many_arguments)]
 #[instrument(
-    skip(
-        db,
+    skip(db, params),
+    fields(
+        user_id = %params.user_id,
+        has_email = params.email.is_some(),
+        has_password = params.password.is_some(),
+        has_signin_code = params.signin_code.is_some(),
+        has_signin_code_image = params.signin_code_image.is_some(),
+        has_signin_code_image_mime = params.signin_code_image_mime.is_some(),
+        has_cookies = params.cookies.is_some()
+    )
+)]
+pub async fn create_account<C>(db: &C, params: CreateAccountParams<'_>) -> Result<DzmmAccount>
+where
+    C: ConnectionTrait,
+{
+    let CreateAccountParams {
+        user_id,
         user_profile,
         email,
         password,
         signin_code,
         signin_code_image,
         signin_code_image_mime,
-        cookies
-    ),
-    fields(
-        user_id = %user_id,
-        has_email = email.is_some(),
-        has_password = password.is_some(),
-        has_signin_code = signin_code.is_some(),
-        has_signin_code_image = signin_code_image.is_some(),
-        has_signin_code_image_mime = signin_code_image_mime.is_some(),
-        has_cookies = cookies.is_some()
-    )
-)]
-pub async fn create_account<C>(
-    db: &C,
-    user_id: &str,
-    user_profile: serde_json::Value,
-    email: Option<&str>,
-    password: Option<&str>,
-    signin_code: Option<&str>,
-    signin_code_image: Option<&[u8]>,
-    signin_code_image_mime: Option<&str>,
-    cookies: Option<&str>,
-) -> Result<DzmmAccount>
-where
-    C: ConnectionTrait,
-{
+        cookies,
+    } = params;
+
     let existing = get_account(db, user_id).await?;
     if existing.is_some() {
         return Err(LiliumError::domain_service_with_code(
@@ -390,14 +392,16 @@ mod tests {
             let profile = json!({"nickname": "test_account"});
             let created = create_account(
                 tx,
-                &user_id,
-                profile.clone(),
-                Some("test@example.com"),
-                Some("password"),
-                None,
-                None,
-                None,
-                Some("a=b"),
+                CreateAccountParams {
+                    user_id: &user_id,
+                    user_profile: profile.clone(),
+                    email: Some("test@example.com"),
+                    password: Some("password"),
+                    signin_code: None,
+                    signin_code_image: None,
+                    signin_code_image_mime: None,
+                    cookies: Some("a=b"),
+                },
             )
             .await
             .expect("create account");

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, mpsc};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use lilium_common::LiliumError;
 use lilium_database::Database;
@@ -160,8 +160,15 @@ pub struct EventIngestor {
     accepted_count: AtomicU64,
     spilled_count: AtomicU64,
     is_accepting: AtomicBool,
-    #[allow(dead_code)]
     max_queue_size: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventIngestorMetrics {
+    pub queue_depth: usize,
+    pub accepted_count: u64,
+    pub spilled_count: u64,
+    pub is_accepting: bool,
 }
 
 impl EventIngestor {
@@ -214,29 +221,17 @@ impl EventIngestor {
         }
     }
 
-    #[allow(dead_code)]
     pub fn stop_accepting(&self) {
         self.is_accepting.store(false, Ordering::Relaxed);
     }
 
-    #[allow(dead_code)]
-    pub fn queue_depth(&self) -> usize {
-        self.max_queue_size - self.queue.capacity()
-    }
-
-    #[allow(dead_code)]
-    pub fn accepted_count(&self) -> u64 {
-        self.accepted_count.load(Ordering::Relaxed)
-    }
-
-    #[allow(dead_code)]
-    pub fn spilled_count(&self) -> u64 {
-        self.spilled_count.load(Ordering::Relaxed)
-    }
-
-    #[allow(dead_code)]
-    pub fn is_accepting(&self) -> bool {
-        self.is_accepting.load(Ordering::Relaxed)
+    pub fn metrics(&self) -> EventIngestorMetrics {
+        EventIngestorMetrics {
+            queue_depth: self.max_queue_size - self.queue.capacity(),
+            accepted_count: self.accepted_count.load(Ordering::Relaxed),
+            spilled_count: self.spilled_count.load(Ordering::Relaxed),
+            is_accepting: self.is_accepting.load(Ordering::Relaxed),
+        }
     }
 
     pub fn spill(&self) -> &DiskSpillBuffer {
@@ -250,6 +245,11 @@ pub struct EventWriter {
     receiver: Arc<Mutex<mpsc::Receiver<EventEnvelope>>>,
     batch_size: usize,
     inserted_count: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventWriterMetrics {
+    pub inserted_count: u64,
 }
 
 impl EventWriter {
@@ -268,7 +268,6 @@ impl EventWriter {
         }
     }
 
-    #[allow(dead_code)]
     pub async fn run(&self, stop_event: &Arc<AtomicBool>) {
         loop {
             let inserted = match self.drain_once().await {
@@ -279,6 +278,18 @@ impl EventWriter {
                 }
             };
             let spill_pending = self.ingestor.spill().has_pending().await;
+            if inserted > 0 {
+                let metrics = self.ingestor.metrics();
+                debug!(
+                    inserted,
+                    queue_depth = metrics.queue_depth,
+                    accepted = metrics.accepted_count,
+                    spilled = metrics.spilled_count,
+                    accepting = metrics.is_accepting,
+                    total_inserted = self.inserted_count.load(Ordering::Relaxed),
+                    "Event writer drained batch"
+                );
+            }
 
             if stop_event.load(Ordering::Relaxed)
                 && inserted == 0
@@ -323,6 +334,12 @@ impl EventWriter {
                 self.spill_memory_events(&events).await?;
                 Err(error)
             }
+        }
+    }
+
+    pub fn metrics(&self) -> EventWriterMetrics {
+        EventWriterMetrics {
+            inserted_count: self.inserted_count.load(Ordering::Relaxed),
         }
     }
 
@@ -381,7 +398,6 @@ impl EventWriter {
         Ok(())
     }
 
-    #[allow(dead_code)]
     async fn spill_memory_queue(&self) -> Result<()> {
         loop {
             let events = self.drain_memory_batch().await?;
@@ -391,11 +407,6 @@ impl EventWriter {
             self.spill_memory_events(&events).await?;
         }
         Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn inserted_count(&self) -> u64 {
-        self.inserted_count.load(Ordering::Relaxed)
     }
 }
 
@@ -423,10 +434,11 @@ mod tests {
         let (ingestor, _rx) = EventIngestor::new("user_a".to_string(), 2, spill);
 
         let accepted = ingestor.accept_event(make_event(1)).await;
+        let metrics = ingestor.metrics();
         assert!(accepted);
-        assert_eq!(ingestor.queue_depth(), 1);
-        assert_eq!(ingestor.accepted_count(), 1);
-        assert_eq!(ingestor.spilled_count(), 0);
+        assert_eq!(metrics.queue_depth, 1);
+        assert_eq!(metrics.accepted_count, 1);
+        assert_eq!(metrics.spilled_count, 0);
     }
 
     #[tokio::test]
@@ -438,8 +450,9 @@ mod tests {
         assert!(ingestor.accept_event(make_event(1)).await);
         assert!(!ingestor.accept_event(make_event(2)).await);
 
-        assert_eq!(ingestor.queue_depth(), 1);
-        assert_eq!(ingestor.spilled_count(), 1);
+        let metrics = ingestor.metrics();
+        assert_eq!(metrics.queue_depth, 1);
+        assert_eq!(metrics.spilled_count, 1);
     }
 
     #[tokio::test]
@@ -520,11 +533,11 @@ mod tests {
         let (ingestor, _rx) = EventIngestor::new("user_a".to_string(), 10, spill);
 
         ingestor.stop_accepting();
-        assert!(!ingestor.is_accepting());
+        assert!(!ingestor.metrics().is_accepting);
 
         let accepted = ingestor.accept_event(make_event(1)).await;
         assert!(!accepted);
-        assert_eq!(ingestor.spilled_count(), 1);
+        assert_eq!(ingestor.metrics().spilled_count, 1);
     }
 
     #[tokio::test]

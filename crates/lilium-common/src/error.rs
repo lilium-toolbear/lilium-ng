@@ -2,6 +2,35 @@ use std::collections::HashMap;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
+#[error("[{code}] {message}")]
+pub struct ServiceError {
+    pub code: String,
+    pub message: String,
+    pub status_code: Option<u16>,
+    pub retryable: bool,
+    pub details: Option<serde_json::Value>,
+    pub headers: Option<HashMap<String, String>>,
+    #[source]
+    pub source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+
+#[derive(Error, Debug)]
+#[error("[{code}] {message}")]
+pub struct DomainServiceError {
+    pub code: String,
+    pub message: String,
+    pub status_code: u16,
+}
+
+#[derive(Error, Debug)]
+#[error("[{code}] {message}")]
+pub struct ConnectionConflictError {
+    pub code: String,
+    pub message: String,
+    pub lock_id: Option<i64>,
+}
+
+#[derive(Error, Debug)]
 pub enum LiliumError {
     #[error("Database error: {0}")]
     Database(String),
@@ -21,31 +50,14 @@ pub enum LiliumError {
     #[error("WebSocket error: {0}")]
     WebSocket(String),
 
-    #[error("[{code}] {message}")]
-    Service {
-        code: String,
-        message: String,
-        status_code: Option<u16>,
-        retryable: bool,
-        details: Option<serde_json::Value>,
-        headers: Option<HashMap<String, String>>,
-        #[source]
-        source: Option<Box<dyn std::error::Error + Send + Sync>>,
-    },
+    #[error(transparent)]
+    Service(Box<ServiceError>),
 
-    #[error("[{code}] {message}")]
-    DomainService {
-        code: String,
-        message: String,
-        status_code: u16,
-    },
+    #[error(transparent)]
+    DomainService(Box<DomainServiceError>),
 
-    #[error("[{code}] {message}")]
-    ConnectionConflict {
-        code: String,
-        message: String,
-        lock_id: Option<i64>,
-    },
+    #[error(transparent)]
+    ConnectionConflict(Box<ConnectionConflictError>),
 }
 
 impl LiliumError {
@@ -66,7 +78,7 @@ impl LiliumError {
     }
 
     pub fn service(code: impl Into<String>, message: impl Into<String>) -> Self {
-        LiliumError::Service {
+        LiliumError::Service(Box::new(ServiceError {
             code: code.into(),
             message: message.into(),
             status_code: None,
@@ -74,15 +86,15 @@ impl LiliumError {
             details: None,
             headers: None,
             source: None,
-        }
+        }))
     }
 
     pub fn domain_service_with_code(code: impl Into<String>, message: impl Into<String>) -> Self {
-        LiliumError::DomainService {
+        LiliumError::DomainService(Box::new(DomainServiceError {
             code: code.into(),
             message: message.into(),
             status_code: 400,
-        }
+        }))
     }
 
     pub fn domain_service(message: impl Into<String>) -> Self {
@@ -90,34 +102,34 @@ impl LiliumError {
     }
 
     pub fn connection_conflict(message: impl Into<String>, lock_id: Option<i64>) -> Self {
-        LiliumError::ConnectionConflict {
+        LiliumError::ConnectionConflict(Box::new(ConnectionConflictError {
             code: "WEBSOCKET_CONNECTION_LOCK_CONFLICT".to_string(),
             message: message.into(),
             lock_id,
-        }
+        }))
     }
 
     pub fn is_retryable(&self) -> bool {
         match self {
             LiliumError::Http(msg) => msg.contains("401") || msg.contains("403"),
-            LiliumError::Service { retryable, .. } => *retryable,
+            LiliumError::Service(error) => error.retryable,
             _ => false,
         }
     }
 
     pub fn status_code(&self) -> Option<u16> {
         match self {
-            LiliumError::Service { status_code, .. } => *status_code,
-            LiliumError::DomainService { status_code, .. } => Some(*status_code),
+            LiliumError::Service(error) => error.status_code,
+            LiliumError::DomainService(error) => Some(error.status_code),
             _ => None,
         }
     }
 
     pub fn code(&self) -> Option<&str> {
         match self {
-            LiliumError::Service { code, .. } => Some(code),
-            LiliumError::DomainService { code, .. } => Some(code),
-            LiliumError::ConnectionConflict { code, .. } => Some(code),
+            LiliumError::Service(error) => Some(&error.code),
+            LiliumError::DomainService(error) => Some(&error.code),
+            LiliumError::ConnectionConflict(error) => Some(&error.code),
             _ => None,
         }
     }

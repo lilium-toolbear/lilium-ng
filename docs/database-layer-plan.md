@@ -54,11 +54,18 @@ escape hatch for short-lived maintenance SQL.
 
 PostgreSQL `LISTEN/NOTIFY` uses `NotificationConnection`, a dedicated direct
 `sqlx::postgres::PgListener` outside the ordinary application pool. Production
-configuration loads `DATABASE_NOTIFICATION_URL` and falls back to
-`DATABASE_URL`. Test configuration loads `TEST_DATABASE_NOTIFICATION_URL` and
-falls back to `TEST_DATABASE_URL`. Notification listeners do not use SeaORM,
-`Database::transaction`, `Database::raw_connection`, or shared `PgPool`
-connections.
+notification consumers load `DATABASE_NOTIFICATION_URL` and fall back to
+`DATABASE_URL`. Test notification consumers load
+`TEST_DATABASE_NOTIFICATION_URL` and fall back to `TEST_DATABASE_URL`.
+Notification listeners do not use SeaORM, `Database::transaction`,
+`Database::raw_connection`, or shared `PgPool` connections.
+
+Connection-stateful worker runtime concerns follow the same rule. A component
+that must own PostgreSQL session state for its full lifecycle uses a dedicated
+connection owner, not the shared application pool. This includes
+`LISTEN`/`NOTIFY` listeners and websocket advisory-lock ownership. Service
+functions may still expose the domain operations, but the binary/runtime layer
+must provide the dedicated connection that owns the PostgreSQL session state.
 
 ## Service Layer
 
@@ -137,6 +144,12 @@ SeaORM-backed service reads currently cover `user::get_by_id`,
 `user::get_by_ids`, and `user::fetch_user_profile`. SQLx-backed service
 functions remain where the function requires the current raw transaction
 boundary or PostgreSQL-specific SQL.
+
+Spider and event-processor notification consumers now use
+`NotificationConnection` with `DATABASE_NOTIFICATION_URL`. Spider websocket
+advisory-lock ownership is still an open runtime gap and must be implemented
+with a dedicated lock-owning connection before the Python heartbeat/lock loop is
+considered migrated.
 
 ## Verification Commands
 
