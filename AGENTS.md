@@ -5,11 +5,12 @@ This repository is a Rust workspace for the Lilium NG rewrite. Core code lives u
 
 - `crates/lilium-common`: shared utilities, constants, and error types
 - `crates/lilium-models`: data models and row mappings
-- `crates/lilium-database`: Database runtime, SeaORM entities, and raw SQL sessions
+- `crates/lilium-database`: Database runtime, connection owners, transactions, and raw SQL sessions
 - `crates/lilium-test-fixtures`: test-only database leasing, reset, and fixture profiles
 - `crates/lilium-core`: pure business logic
+- `crates/lilium-api-client`: external HTTP and Socket.IO transport
 - `crates/lilium-services`: service-layer orchestration
-- `binaries/lilium-spider` and `binaries/lilium-event-processor`: executable entry points
+- `binaries/lilium-spider`, `binaries/lilium-event-processor`, and `binaries/lilium-cli`: executable entry points
 - `docs/database-layer-plan.md`: current database layer architecture spec
 - `docs/python-to-rust-migration-sop.md`: required Python-to-Rust parity workflow
 - `docs/python-to-rust-migration-progress.md`: current scenario-based migration progress tracker
@@ -19,15 +20,17 @@ Keep tests close to the code they verify. Use `crates/lilium-test-fixtures` for 
 ## Architecture
 
 ```
-Binaries (lilium-spider, lilium-event-processor)
+Binaries (lilium-spider, lilium-event-processor, lilium-cli)
     → Service Layer (lilium-services)
         → Core Layer (lilium-core) — pure business logic, no async/DB
-            → Domain Layer (lilium-models) — SeaORM entities and row mappings
-                → Data Access (lilium-database) — connection pool, sessions, transactions
-                    → API Client (lilium-api-client) — external API calls
+        → Domain Layer (lilium-models) — SeaORM entities and row mappings
+        → Data Access (lilium-database) — connection pool, sessions, transactions
+        → API Client (lilium-api-client) — external HTTP and Socket.IO calls
 ```
 
 **Rule:** Never skip layers. Presentation code (binaries) must not use raw `sea_orm::Entity` queries directly — go through services.
+Data access and API clients are sibling dependencies of services and binaries;
+`lilium-database` must not depend on `lilium-api-client`.
 
 ## Build, Test, and Development Commands
 
@@ -36,6 +39,7 @@ Binaries (lilium-spider, lilium-event-processor)
 - `cargo test -p lilium-database`: run database-layer tests only
 - `cargo run --bin lilium-spider`: start the spider binary locally
 - `cargo run --bin lilium-event-processor`: start the event processor locally
+- `cargo run --bin lilium-cli`: run the operational CLI locally
 - `cargo fmt --all`: format code with standard Rust formatting
 - `cargo clippy --all-targets --all-features`: run lint checks
 
@@ -100,6 +104,11 @@ If tests cannot run (missing database, external service), report explicitly and 
 
 Do not add tests that assert constant values, tuning numbers, or static content data. These create maintenance burden without verifying behavior. Test the logic that *uses* constants, not the constants themselves.
 
+Protocol and storage contract values are behavior, not tuning constants: event
+names, JSON field names, environment variable names, database table/column names,
+and exit-code semantics may be asserted when they prove Python parity or public
+compatibility.
+
 ## Observability Guidelines
 Instrument service-layer boundaries that perform external I/O or orchestrate external I/O: database calls, dedicated PostgreSQL sessions, API/network requests, filesystem reads or writes, notification listeners, and long-running polling loops.
 
@@ -163,7 +172,10 @@ When a pull request has failing CI or checks:
 
 ### Design-First Rule
 
-For multi-step feature work or system behavior changes that require a design/plan document in `docs/plans/`, the design document must be completed and committed before implementation begins.
+For multi-step feature work or system behavior changes that require a durable
+design document, the design document must be completed under `docs/plans/` and
+committed before implementation begins. Agent execution plans under
+`docs/superpowers/plans/` are not design documents.
 
 - Do not start implementation code changes until the design doc exists and is committed.
 - If the design changes materially during review, update and commit the design doc again before continuing.
@@ -217,6 +229,10 @@ For multi-step feature work or system behavior changes that require a design/pla
 ## Agent Notes
 Before changing behavior, confirm the root cause with code or runtime evidence. Avoid speculative fixes, avoid noisy reruns, and resolve PR review threads after addressing them.
 For Python parity work, read the real Python source first and treat markdown analysis as index or hints only, not as the source of truth.
-During Python parity scans, update code comments, architecture docs, and `docs/python-to-rust-migration-progress.md` in the same change set as the code.
-Always uses rust 2024 edition
+During Python parity scans, update code comments and
+`docs/python-to-rust-migration-progress.md` in the same change set as the code.
+Update architecture docs in the same change set when the scan changes ownership,
+runtime boundaries, connection lifetimes, config rules, public APIs, or
+cross-crate boundaries.
+Always use Rust 2024 edition.
 Do not add test backdoors to production code. Avoid `#[cfg(test)]` / `#[cfg(not(test))]` behavior branches, magic `__test` values, noop implementations, or test-only constructors in production modules. When tests need to isolate network, workers, time, or external services, define an explicit dependency boundary and use a real mock library or fixture in the test module.
