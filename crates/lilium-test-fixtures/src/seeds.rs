@@ -1,3 +1,5 @@
+// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 tests/conftest.py
+
 use anyhow::{Context, Result};
 use chrono::Utc;
 use lilium_models::dzmm::{account as dzmm_account, room as rooms, user as users};

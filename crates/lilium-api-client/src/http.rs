@@ -1,3 +1,5 @@
+// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 dzmm_client/api.py, dzmm_client/rate_limiter.py, dzmm_client/utils.py
+
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
@@ -371,7 +373,6 @@ pub struct DzmmApi {
 }
 
 impl DzmmApi {
-
     pub fn new(auth: DzmmApiAuth) -> Result<Self> {
         Self::new_with_config(ApiClientConfig::default(), auth)
     }

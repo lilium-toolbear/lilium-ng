@@ -1,3 +1,5 @@
+// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 services/room_member_service.py
+// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 services/room_member_service.py
 use std::collections::HashMap;
 
 use crate::Result;

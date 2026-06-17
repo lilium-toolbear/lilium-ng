@@ -1,3 +1,6 @@
+// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 services/websocket_event_service.py
+// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 services/event_processor_offset_service.py
+// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 services/websocket_event_service.py, services/event_processor_offset_service.py
 use crate::Result;
 use chrono::{DateTime, Utc};
 use lilium_common::LiliumError;

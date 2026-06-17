@@ -16,7 +16,7 @@ use lilium_services::message;
 use lilium_services::{room_member, user};
 use sea_orm::ConnectionTrait;
 
-// Python parity source: dzmm_archive@6a92a9914602d633ff6fa3f5908fa68d00c36fcd spider/ws_runtime.py
+// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 spider/event_processor.py
 const WEBSOCKET_EVENT_INSERTED_CHANNEL: &str = "websocket_event_inserted";
 
 #[derive(Debug, Default)]

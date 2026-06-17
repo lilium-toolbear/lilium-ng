@@ -1,3 +1,6 @@
+// This module is new Rust code with no direct Python equivalent.
+// It combines media download logic from multiple Python sources into a single service.
+// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 core/media.py
 use crate::user::AvatarDownload;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -719,7 +722,7 @@ fn gps_timestamp(exif: &exif::Exif) -> Option<DateTime<Utc>> {
         .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
 }
 
-fn extract_audio_duration(file_path: &Path) -> Option<f64> {
+pub fn extract_audio_duration(file_path: &Path) -> Option<f64> {
     let tagged_file = match lofty::read_from_path(file_path) {
         Ok(file) => file,
         Err(error) => {

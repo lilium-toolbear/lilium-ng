@@ -1,3 +1,6 @@
+// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 services/errors.py
+// NOTE: LiliumError enum and is_retryable (401/403 check on Http variant) are Rust extensions not in Python.
+
 use std::collections::HashMap;
 use thiserror::Error;
 

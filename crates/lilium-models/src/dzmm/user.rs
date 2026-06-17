@@ -2,10 +2,14 @@ use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
-// Python parity source: dzmm_archive@6a92a9914602d633ff6fa3f5908fa68d00c36fcd models/dzmm/user.py
-// Parity decision: Python exposes `name_tsv`, but Rust intentionally keeps
-// PostgreSQL search vectors out of the table row model. The DB column still
-// exists and is only referenced from search predicates.
+// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 models/dzmm/user.py
+// Parity decisions:
+// - Python exposes `name_tsv` (TSVECTOR), but Rust intentionally keeps PostgreSQL
+//   search vectors out of the table row model. The DB column still exists and is
+//   only referenced from search predicates.
+// - Python's `user_metadata` maps to DB column `metadata`; Rust field is named `metadata`.
+// - Python `from_api()` also checks `displayName`/`avatar` fallback keys; Rust only
+//   checks `fullName`/`avatarUrl` (current API shape).
 pub type User = Model;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]

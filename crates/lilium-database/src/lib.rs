@@ -1,3 +1,5 @@
+// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 database/__init__.py
+
 //! Database infrastructure for Lilium.
 //!
 //! Application code should use [`Database::orm`] and SeaORM's

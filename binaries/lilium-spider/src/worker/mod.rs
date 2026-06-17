@@ -1,3 +1,4 @@
+// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 spider/ws_runtime.py spider/ws_worker.py
 use anyhow::{Context, Result};
 use lilium_api_client::http::{CookieRefreshCallback, DzmmApi, DzmmApiAuth};
 use lilium_api_client::websocket::{SocketCommandError, SocketCommandExecutor, WsClient};
@@ -394,7 +395,7 @@ impl Worker {
         stop_event: Arc<AtomicBool>,
         shutdown: Arc<Notify>,
     ) -> Result<()> {
-        // Python parity source: dzmm_archive@6a92a9914602d633ff6fa3f5908fa68d00c36fcd spider/ws_runtime.py
+        // Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 spider/ws_runtime.py
         const OUTGOING_COMMAND_INSERTED_CHANNEL: &str = "outgoing_command_inserted";
         const POLLING_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -455,7 +456,7 @@ impl Worker {
         listener: UnixListener,
         context: WorkerControlContext,
     ) -> Result<()> {
-        // Python parity source: dzmm_archive@6a92a9914602d633ff6fa3f5908fa68d00c36fcd spider/ws_runtime.py
+        // Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 spider/ws_runtime.py
         loop {
             tokio::select! {
                 _ = context.shutdown.notified() => {
@@ -491,7 +492,7 @@ impl Worker {
         stop_event: Arc<AtomicBool>,
         shutdown: Arc<Notify>,
     ) -> Result<()> {
-        // Python parity source: dzmm_archive@6a92a9914602d633ff6fa3f5908fa68d00c36fcd spider/ws_runtime.py
+        // Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 spider/ws_runtime.py
         let mut heartbeat = tokio::time::interval(Duration::from_secs(2));
         loop {
             tokio::select! {

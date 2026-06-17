@@ -17,6 +17,96 @@ covers, and what remains to migrate.
 - Move completed gaps into the verified scenario list when code and tests land.
 - Delete obsolete one-off notes after their content is represented here.
 
+## 2026-06-17: lilium-cli send-command (Phase 1 of CLI port)
+
+Python commit: `dzmm_archive@0efb507c6126a2638d3d38aca4018a804431291e`
+
+Python sources read:
+
+- `/Users/bearice/Working/github/dzmm_archive/cli/send_command.py`
+- `/Users/bearice/Working/github/dzmm_archive/cli/explore.py`
+- `/Users/bearice/Working/github/dzmm_archive/cli/sync_members.py`
+- `/Users/bearice/Working/github/dzmm_archive/cli/sync_rooms.py`
+- `/Users/bearice/Working/github/dzmm_archive/cli/CLAUDE.md`
+- `/Users/bearice/Working/github/dzmm_archive/core/explore.py`
+- `/Users/bearice/Working/github/dzmm_archive/core/sync.py`
+- `/Users/bearice/Working/github/dzmm_archive/core/history.py`
+- `/Users/bearice/Working/github/dzmm_archive/services/room_service.py`
+- `/Users/bearice/Working/github/dzmm_archive/services/room_member_service.py`
+- `/Users/bearice/Working/github/dzmm_archive/services/account_service.py`
+- `/Users/bearice/Working/github/dzmm_archive/services/outgoing_command_service.py`
+- `/Users/bearice/Working/github/dzmm_archive/models/dzmm/room.py`
+- `/Users/bearice/Working/github/dzmm_archive/models/dzmm/room_member.py`
+
+Scope decision: only `send_command.py`'s dependencies already exist in Rust
+(`outgoing_command` service, `NotificationConnection`, `DzmmApi` uploads). The
+other three CLIs depend on unmigrated core modules (`core.explore`,
+`core.sync`, `core.history`) plus a missing `RoomService` and six missing
+explore-content entities. The user opted to migrate the core modules too, in
+phases. This entry covers Phase 1; later phases will add their own entries.
+
+Rust files added/updated:
+
+- `binaries/lilium-cli/Cargo.toml` (new binary)
+- `binaries/lilium-cli/src/main.rs`
+- `binaries/lilium-cli/src/config.rs`
+- `binaries/lilium-cli/src/send_command.rs`
+- `Cargo.toml` (workspace members + `uuid` dep)
+- `crates/lilium-services/src/media.rs` (`extract_audio_duration` made `pub` for
+  `send-voice` duration detection, reusing the lofty-based helper instead of
+  ffprobe/mutagen)
+
+Verified scenarios:
+
+- `lilium-cli send-command` exposes all 18 Python click subcommands: `send`,
+  `status`, `join-room`, `heartbeat`, `reconnect`, `list-pending`,
+  `send-message`, `send-reply`, `leave-room`, `start-match`, `cancel-match`,
+  `fetch-match-limit`, `edit-message`, `recall-message`, `delete-message`,
+  `mark-read`, `send-image`, `send-voice`.
+- JSON payloads are preserved verbatim from Python (`message:send` text/image/
+  voice/reply, `message:edit`/`recall`/`delete`/`read`, `match:*`,
+  `system:reconnect`, `heartbeat` with millisecond timestamp).
+- `send` creates a command via `outgoing_command::create_command` with
+  `require_ack = !no_ack` and default max-attempts per event.
+- `--no-wait` queues and returns immediately; `--wait` (default) waits for a
+  terminal status.
+- `wait_for_result` LISTENs on `outgoing_command_updated` (the
+  `outgoing_command_updated_trigger` fires `AFTER UPDATE` with payload
+  `{"id","account_user_id","status"}`), filters by command id + terminal
+  status, and falls back to a final `get_command_result` fetch on timeout
+  (parity with Python `poll_timeout`).
+- `status` and `list-pending` read from the DB; `list-pending` lists all
+  pending regardless of rate-limit readiness (matching Python, unlike the
+  spider's readiness-filtered `get_pending_commands`).
+- `send-image`/`send-voice` resolve the account via `account::get_account` +
+  `create_auth_client`, upload via `DzmmApi::upload_chat_image` /
+  `upload_voice_message`, then send the `message:send` payload. Voice duration
+  is detected via `media::extract_audio_duration` (lofty).
+- Exit codes: success 0, command failure / poll-timeout / not-found 1.
+
+Verification commands:
+
+```bash
+cargo build -p lilium-cli
+cargo test -p lilium-cli
+./target/debug/lilium-cli --help
+./target/debug/lilium-cli send-command --help
+```
+
+Remaining gaps (tracked as phases 2–8):
+
+- Phase 2: `RoomService` (`crates/lilium-services/src/room.rs`) — not yet
+  ported; blocks sync CLIs and history.
+- Phase 3: `core::sync` (`RoomSyncer`, `MemberSyncer`) + `room_member`
+  `batch_upsert_members`/`clear_room_members`.
+- Phase 4: `sync-members` + `sync-rooms` CLIs (incl. poll mode + reconnect).
+- Phase 5: `core::history` (`HistoryFetcher`).
+- Phase 6: `core::explore` + six explore-content entities/services
+  (`tweet`/`card`/`gallery`/`checkpoint`/`book`/`chapter`) + schema bootstrap
+  tables.
+- Phase 7: `explore` CLI.
+- Phase 8: parity comments + this doc + memory updates.
+
 ## 2026-06-16: Spider Worker Runtime And Notifications
 
 Python commit: `dzmm_archive@6a92a9914602d633ff6fa3f5908fa68d00c36fcd`

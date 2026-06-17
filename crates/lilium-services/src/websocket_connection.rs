@@ -1,3 +1,7 @@
+// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 services/websocket_connection_service.py
+// Parity decision: Rust uses md5-based lock_id calculation matching Python's hashlib.md5 algorithm.
+// Rust provides both pooled and dedicated-connection lock paths; Python uses asyncpg directly.
+// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 services/websocket_connection_service.py
 use crate::Result;
 use chrono::{Duration, Utc};
 use lilium_database::DedicatedDbConnection;

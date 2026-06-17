@@ -1,3 +1,5 @@
+// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 tests/conftest.py, database/partitioning.py
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use sea_orm::{ConnectionTrait, Statement};

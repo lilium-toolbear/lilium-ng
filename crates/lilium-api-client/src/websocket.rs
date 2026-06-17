@@ -1,3 +1,5 @@
+// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 dzmm_client/websocket.py, spider/ws_runtime.py
+
 use crate::config::dzmm_local_address_from_env;
 use anyhow::{Context, Result};
 use chrono::Utc;

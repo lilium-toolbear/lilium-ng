@@ -1,3 +1,5 @@
+// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 services/account_service.py
+// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 services/account_service.py
 use crate::Result;
 use chrono::Utc;
 use lilium_api_client::http::{DzmmApi, DzmmApiAuth};

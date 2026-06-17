@@ -2,9 +2,9 @@ use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
-// Python parity source: dzmm_archive@6a92a9914602d633ff6fa3f5908fa68d00c36fcd models/ingestion/websocket_event.py
+// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 models/ingestion/websocket_event.py
 pub type WebSocketEvent = websocket_event::Model;
-// Python parity source: dzmm_archive@6a92a9914602d633ff6fa3f5908fa68d00c36fcd models/ingestion/event_processor_offset.py
+// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 models/ingestion/event_processor_offset.py
 pub type EventProcessorOffset = event_processor_offset::Model;
 
 pub mod websocket_event {
