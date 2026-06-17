@@ -16,6 +16,19 @@ This repository is a Rust workspace for the Lilium NG rewrite. Core code lives u
 
 Keep tests close to the code they verify. Use `crates/lilium-test-fixtures` for DB-backed integration tests.
 
+## Architecture
+
+```
+Binaries (lilium-spider, lilium-event-processor)
+    → Service Layer (lilium-services)
+        → Core Layer (lilium-core) — pure business logic, no async/DB
+            → Domain Layer (lilium-models) — SeaORM entities and row mappings
+                → Data Access (lilium-database) — connection pool, sessions, transactions
+                    → API Client (lilium-api-client) — external API calls
+```
+
+**Rule:** Never skip layers. Presentation code (binaries) must not use raw `sea_orm::Entity` queries directly — go through services.
+
 ## Build, Test, and Development Commands
 
 - `cargo build`: compile the full workspace
@@ -35,10 +48,57 @@ Use standard Rust style and `rustfmt` defaults. Prefer small, explicit modules a
 - functions, variables, and fields: `snake_case`
 - binaries and workspace crates: descriptive, feature-specific names
 
+## Critical Rules
+
+### Database Migrations — Never Run Without Permission
+
+**NEVER execute `sea-orm-cli migrate` or any migration apply command without explicit user approval.** This includes test databases that may share production credentials via `.env`.
+
+- Generating migration files with `sea-orm-cli migrate generate` is OK.
+- Applying migrations is FORBIDDEN unless the user explicitly says to run it.
+- Subagents and background agents must also follow this rule.
+- When generating migration scripts, verify model/migration consistency manually before treating the migration as complete.
+
+### Message Lifecycle
+
+- **New**: Insert with deduplication (`message_id` as PK)
+- **Updated**: Preserve old content in `history` JSON array, update `updated_at`
+- **Deleted/Recalled**: Set flag only. **DO NOT change content.**
+
+### Wallet Balance — Never Direct UPDATE
+
+All balance changes must go through `WalletService` methods (`credit`, `debit`, `freeze`, `unfreeze`, `release`, `transfer`) which create `wallet_transaction` records. Direct updates break ledger reconciliation.
+
+### Enum Handling
+
+- Use SeaORM `DeriveActiveEnum` for database enums.
+- JSON serialization should use `snake_case` string values, not repr strings like `"Type::Variant"`.
+- Compare with enum members directly, never with string matching.
+
+### Constant And Content Data Changes
+
+Do not add or update tests that merely pin constant values, static content data, tuning numbers, spawn rates, loot rates, or other balance constants. Changing constants does not require tests by itself.
+
 ## Testing Guidelines
 Write tests that verify behavior, not constants or placeholder assertions. Prefer targeted tests for the affected crate or module, and use the shared DB fixture helpers for transactional database cases.
 
 Observability should be treated as day-0 infrastructure for migrated binaries. Keep tracing in place, and carry over the Python-side Sentry/telemetry surface when a feature depends on runtime diagnostics.
+
+### Agent Test Rule (Narrowest Verification)
+
+After code changes, run verification that matches the surface area you touched:
+
+- Single-crate changes: `cargo test -p <crate>`
+- Single-module changes: `cargo test -p <crate> <module>`
+- Prefer `cargo test -p <crate> --all-targets` over full `cargo test`
+- Run full `cargo test` only when the user explicitly asks, or when changes are broad enough that targeted verification is not credible
+- Always run `cargo fmt --all` and `cargo clippy --all-targets --all-features` before committing
+
+If tests cannot run (missing database, external service), report explicitly and continue.
+
+### Do Not Pin Constant Values in Tests
+
+Do not add tests that assert constant values, tuning numbers, or static content data. These create maintenance burden without verifying behavior. Test the logic that *uses* constants, not the constants themselves.
 
 ## Observability Guidelines
 Instrument service-layer boundaries that perform external I/O or orchestrate external I/O: database calls, dedicated PostgreSQL sessions, API/network requests, filesystem reads or writes, notification listeners, and long-running polling loops.
@@ -49,10 +109,110 @@ When adding `#[instrument]`, skip large or sensitive values such as database han
 
 Sentry queries made during debugging should default to `statsPeriod=1h`; only expand the window when explicitly requested.
 
-## Commit & Pull Request Guidelines
-Commit history uses conventional prefixes such as `feat:`, `fix:`, `docs:`, `refactor:`, and `chore:`. Keep commit messages short and imperative.
+When investigating production/runtime issues or checking logs, query Sentry first. Do not inspect local log files by default — only if Sentry does not contain the needed evidence or the user explicitly asks for local log analysis.
 
-Pull requests should explain the change, reference any related issue or audit note, and list the commands you ran. Include screenshots only for UI-facing changes.
+## Before Committing
+
+1. Only commit files you modified
+2. `cargo fmt --all`
+3. `cargo clippy --all-targets --all-features`
+4. Run the narrowest credible test verification for the code you touched
+5. If parity work: update `docs/python-to-rust-migration-progress.md` and parity comments
+6. If models changed: create or update migration files
+7. DO NOT change upstream remote URLs — if SSH is not working, ask the user
+
+## Commit & Pull Request Guidelines
+
+### Commit Message Format
+
+All commits must follow Conventional Commits:
+
+- Preferred format: `type(scope): short summary`
+- Allowed when no scope adds value: `type: short summary`
+- Lowercase type, imperative mood, no trailing period
+- Keep one intent per commit when practical
+- Types: `feat`, `fix`, `refactor`, `docs`, `test`, `chore`, `perf`, `ci`, `build`, `revert`
+- Use `!` or a `BREAKING CHANGE:` footer for breaking changes
+- For larger changes, add a body that explains why and a `Tests:` section
+
+### Pull Request Format
+
+Every PR description should be structured so reviewers can understand the change quickly:
+
+- **Why / Motivation**: what problem this PR solves, why it matters now, and any issue/spec/plan references
+- **Design / Approach**: the core implementation idea, important tradeoffs, non-obvious decisions
+- **Scope**: what is included and what is explicitly out of scope
+- **Validation**: commands run, manual verification, screenshots/logs when relevant
+- **Post-merge Follow-ups**: required migrations, config changes, monitoring, cleanup, or explicit `None`
+
+Additional rules:
+
+- Do not open PRs with empty descriptions or one-line summaries like "misc fixes"
+- If rollout or operational risk exists, call out rollback/mitigation notes
+- If CI failures are out of scope, say so explicitly in the PR body instead of silently fixing unrelated code
+- ALWAYS use squash merge, no exceptions!
+
+### PR CI Scope Rule
+
+When a pull request has failing CI or checks:
+
+- First determine whether the failure is caused by the branch diff, by the PR merge against the latest base branch, or by unrelated/pre-existing breakage elsewhere.
+- Do **not** expand the PR scope to fix unrelated CI failures by default.
+- If the failure is unrelated, document it with concrete evidence and treat it as out of scope unless the user explicitly asks to include it.
+- If the failure is due to base-branch drift, merging/rebasing the latest base branch is acceptable, but do not add unrelated code changes just to make the check pass.
+
+### Design-First Rule
+
+For multi-step feature work or system behavior changes that require a design/plan document in `docs/plans/`, the design document must be completed and committed before implementation begins.
+
+- Do not start implementation code changes until the design doc exists and is committed.
+- If the design changes materially during review, update and commit the design doc again before continuing.
+- Reference the committed design doc in tracking issues/PRs when applicable.
+
+## Per-Crate Conventions
+
+### Service Layer (`lilium-services`)
+
+- **Result types over panics** for expected failures (insufficient funds, limit exceeded, lock conflict). Services return `Result<T, LiliumError>` with domain-specific error variants, not `anyhow::Error` for business logic failures.
+- **Typed DTOs over `serde_json::Value`** inside the service layer. Use named structs for stable data structures and cross-service return values. Keep `serde_json::Value` at system boundaries (external APIs, raw JSONB columns, message queues).
+- **API boundary lives above services**. Service methods return typed domain models/DTOs, not ad-hoc JSON-ready values. Serialization into API response shapes belongs in the binary/presentation layer.
+- **Expected failures must be semantic**. Service-layer errors should carry stable context (error kind, message, retryable flag). Do not return bare `String` errors for business failures.
+- **Cursor-based pagination** for large result sets.
+- **No raw SQL in presentation code** — always go through services.
+
+### Database Layer (`lilium-database`)
+
+- **Pool health**: Set `pool_pre_ping` equivalent and connection recycle timeout for long-running processes.
+- **Timezone**: Enforce UTC on all connections.
+- **Dedicated connections**: Advisory lock connections and LISTEN/NOTIFY connections must use separate physical connections from the application pool.
+- **Migration consistency**: When generating or editing migration scripts, verify that model metadata and migration are consistent. Do not ship migrations that only "make the current database happy" while leaving model/migration drift.
+
+### Model Layer (`lilium-models`)
+
+- **One entity per module** when the entity is substantial. Shared domain types go in domain-local modules (e.g., `ingestion/mod.rs`).
+- **No ORM relationships in entities**. SeaORM relations are defined but joins are resolved in the service layer, not via lazy loading.
+- **Timestamps always timezone-aware** — use `DateTime<Utc>` (chrono) for all timestamp fields.
+- **Factory methods for derived fields** — use `impl` constructors that calculate derived state (expiry, settlement) rather than requiring callers to compute them.
+
+### Core Layer (`lilium-core`)
+
+- **Pure functions only** — no async, no DB access, no I/O. Input → output, no side effects.
+- **Testable without database** — all core logic must be unit-testable with mock/fixture data.
+- **Frozen by default** — prefer immutable data structures. Use `Clone`/`Copy` semantics, avoid interior mutability unless necessary.
+
+### API Client (`lilium-api-client`)
+
+- **Auth retry**: HTTP requests should automatically retry on 401/403 after refreshing credentials.
+- **Cookie management**: Merge cookies from jar and response, handle deduplication.
+- **Rate limiting**: Enforce request throttling to avoid detection.
+- **Anti-detection**: Realistic browser headers, randomized delays, no `Authorization` headers (cookies only).
+
+### Test Fixtures (`lilium-test-fixtures`)
+
+- **Database safety**: Tests must never connect to the production database. Use `TEST_DATABASE_URL` only.
+- **Per-process isolation**: Each test process gets a unique test database (PID + sequence).
+- **Truncate between tests**: Clear table rows between tests, don't drop/recreate tables.
+- **Fixture profiles**: Use composable fixture profiles (Empty, Shared, User, Message) rather than monolithic seed data.
 
 ## Agent Notes
 Before changing behavior, confirm the root cause with code or runtime evidence. Avoid speculative fixes, avoid noisy reruns, and resolve PR review threads after addressing them.
