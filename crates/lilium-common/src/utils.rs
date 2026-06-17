@@ -1,3 +1,6 @@
+// No Python parity: these are Rust convenience wrappers for chrono/decimal types.
+// Python equivalent: models.common.base.utc_now() for utc_now only.
+
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;

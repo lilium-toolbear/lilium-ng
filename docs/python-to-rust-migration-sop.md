@@ -5,6 +5,9 @@ codebase into this Rust workspace. Its purpose is to keep parity work grounded
 in real source code and prevent stale analysis documents from becoming the
 source of truth.
 
+For websocket spider runtime work, also read
+`docs/spider-migration-guide.md` before editing.
+
 ## Source Of Truth
 
 The Python source code is the source of truth.

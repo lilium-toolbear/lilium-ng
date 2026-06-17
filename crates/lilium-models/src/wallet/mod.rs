@@ -3,7 +3,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
-// Python parity source: dzmm_archive@6a92a9914602d633ff6fa3f5908fa68d00c36fcd models/wallet/wallet.py
+// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 models/wallet/wallet.py
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Wallet {
     pub user_id: String,
@@ -16,7 +16,13 @@ pub struct Wallet {
     pub created_at: DateTime<Utc>,
 }
 
-// Python parity source: dzmm_archive@6a92a9914602d633ff6fa3f5908fa68d00c36fcd models/wallet/wallet_transaction.py
+// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 models/wallet/wallet_transaction.py
+// Parity decisions:
+// - Rust `TransactionType` enum is a subset of Python's (22 vs 90+ variants).
+//   Rust only includes types currently used by migrated code; more will be added
+//   as features are ported.
+// - Python `principal_id` is `Optional[UUID]` with FK; Rust uses `Option<String>`.
+// - Python `metadata_json` maps to DB column `metadata`; Rust field is named `metadata`.
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct WalletTransaction {
     pub id: i64,

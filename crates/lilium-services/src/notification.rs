@@ -1,3 +1,7 @@
+// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 services/notification_service.py
+// Parity decision: Rust uses broadcast channels + spawn for LISTEN/NOTIFY + polling
+// instead of Python's asyncio-based approach. Functionality is equivalent.
+// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 services/notification_service.py
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;

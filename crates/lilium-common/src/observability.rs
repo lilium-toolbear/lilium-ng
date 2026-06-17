@@ -1,3 +1,8 @@
+// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 utils/sentry.py
+// NOTE: Python uses profile_session_sample_rate/profile_lifecycle/logging integration; Rust omits those.
+// NOTE: Python event_text checks logentry "formatted" key; Rust checks "message" only.
+
+use sentry::integrations::tracing::EventFilter;
 use sentry::protocol::{Context, Event, Value, map::Map};
 use sentry::{ClientInitGuard, ClientOptions};
 use std::borrow::Cow;
@@ -6,7 +11,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use sentry::integrations::tracing::EventFilter;
 
 fn env_float(name: &str, default: f32) -> f32 {
     env::var(name)

@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
-// Python parity source: dzmm_archive@6a92a9914602d633ff6fa3f5908fa68d00c36fcd models/ingestion/websocket_connection.py
+// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 models/ingestion/websocket_connection.py
 pub type WebsocketConnection = Model;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]

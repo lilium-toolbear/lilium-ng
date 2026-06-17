@@ -1,3 +1,6 @@
+// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 core/land_bonus.py
+// NOTE: Rust omits calculate_linear_bonus, calculate_log_bonus, calculate_dormitory_* functions from Python.
+
 use crate::pal_work_constants::*;
 use tracing::instrument;
 

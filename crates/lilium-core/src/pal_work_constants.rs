@@ -1,3 +1,7 @@
+// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 core/pal_work_constants.py
+// NOTE: Rust omits PRODUCTION_RATE, RESOURCE_* constants (live in land_bonus.py in Python via pal_work_constants).
+// NOTE: Rust omits FARM_BONUS_SCALE, WAREHOUSE_BOOST_SCALE, DORMITORY_BONUS_SCALE (land_bonus.py local).
+
 pub const PAL_MAX_LEVEL: i32 = 120;
 pub const PAL_EXP_BASE: f64 = 12.0;
 pub const PAL_EXP_POWER: f64 = 1.4;

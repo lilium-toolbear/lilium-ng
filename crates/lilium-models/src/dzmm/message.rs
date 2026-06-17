@@ -2,10 +2,14 @@ use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
-// Python parity source: dzmm_archive@6a92a9914602d633ff6fa3f5908fa68d00c36fcd models/dzmm/message.py
-// Parity decision: Python exposes `content_tsv`, but Rust intentionally keeps
-// PostgreSQL search vectors out of the table row model. The DB column still
-// exists and is only referenced from search predicates.
+// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 models/dzmm/message.py
+// Parity decisions:
+// - Python exposes `content_tsv` (TSVECTOR), but Rust intentionally keeps PostgreSQL
+//   search vectors out of the table row model. The DB column still exists and is
+//   only referenced from search predicates.
+// - Python's `message_metadata` maps to DB column `metadata`; Rust field is named `metadata`.
+// - Python `add_to_history()` also sets `updated_at = utc_now()`; Rust does not
+//   (no `updated_at` mutation in the Rust helper).
 pub type Message = Model;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
