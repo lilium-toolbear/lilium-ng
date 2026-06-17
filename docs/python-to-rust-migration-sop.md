@@ -155,7 +155,11 @@ Stop and re-check the Python source when any of these appear:
 
 - Production config is environment-driven and loaded by binaries.
 - Database access enters through `Database`, `DatabaseConfig`,
-  `transaction!`, `DbSession`, and `RawDbConnection`.
+  `transaction!`, SeaORM `ConnectionTrait`/`DatabaseTransaction`,
+  `RawDbConnection`, `NotificationConnection`, and `DedicatedDbConnection`.
+- Ordinary service operations accept `&impl ConnectionTrait`. Long-lived
+  PostgreSQL session state uses dedicated connection owners, not pooled
+  transactions.
 - SeaORM is the ORM layer. Raw SQL remains for PostgreSQL-specific behavior.
 - Test database isolation uses pooled temporary databases plus truncate/reset,
   not shared DB locking and not transaction rollback isolation.
