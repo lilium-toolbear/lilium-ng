@@ -817,6 +817,26 @@ impl EventProcessor {
     }
 }
 
+use crate::config::Config;
+
+pub async fn run(config: Config, db: Database) -> Result<()> {
+    let processor = EventProcessor::new(
+        db,
+        "event_processor_main".to_string(),
+        config.processor.batch_size,
+        config.processor.polling_interval_secs,
+    )
+    .with_notification_config(config.notification.into());
+
+    let shutdown = processor.shutdown_handle();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        shutdown.notify_waiters();
+    });
+
+    processor.run().await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

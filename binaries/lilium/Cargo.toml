@@ -1,10 +1,10 @@
 [package]
-name = "lilium-event-processor"
+name = "lilium"
 version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "lilium-event-processor"
+name = "lilium"
 path = "src/main.rs"
 
 [dependencies]
@@ -12,9 +12,11 @@ lilium-common.workspace = true
 lilium-models.workspace = true
 lilium-database.workspace = true
 lilium-services.workspace = true
+lilium-api-client.workspace = true
+lilium-core.workspace = true
 sea-orm.workspace = true
-tokio.workspace = true
 sqlx.workspace = true
+tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 dotenvy.workspace = true
@@ -24,8 +26,14 @@ sentry.workspace = true
 sentry-tracing.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+uuid.workspace = true
 rand.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
+mockall = "0.13"
 lilium-test-fixtures.workspace = true
