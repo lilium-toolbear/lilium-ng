@@ -1,6 +1,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tokio::time::{Duration, Instant, sleep};
@@ -36,6 +37,7 @@ pub struct EventProcessor {
     retry_backoff_factor: f64,
     shutdown: Arc<Notify>,
     notification_config: Option<NotificationDatabaseConfig>,
+    data_path: PathBuf,
 }
 
 impl EventProcessor {
@@ -44,6 +46,7 @@ impl EventProcessor {
         processor_id: String,
         batch_size: usize,
         polling_interval_secs: u64,
+        data_path: PathBuf,
     ) -> Self {
         Self {
             processor_id,
@@ -56,6 +59,7 @@ impl EventProcessor {
             retry_backoff_factor: 2.0,
             shutdown: Arc::new(Notify::new()),
             notification_config: None,
+            data_path,
         }
     }
 
@@ -544,6 +548,7 @@ impl EventProcessor {
         }
 
         let database = self.database.clone();
+        let data_path = self.data_path.clone();
         tokio::spawn(async move {
             let media_count = media_message_ids.len();
             let downloads = match lilium_database::transaction!(database, |session| {
@@ -564,7 +569,7 @@ impl EventProcessor {
                 }
             };
 
-            let media_service = MediaService::new();
+            let media_service = MediaService::with_data_path(data_path);
             let (updates, failure_count) =
                 match media_service.download_media_batch(&downloads).await {
                     Ok(result) => result,
@@ -612,9 +617,10 @@ impl EventProcessor {
         }
 
         let database = self.database.clone();
+        let data_path = self.data_path.clone();
         tokio::spawn(async move {
             let avatar_count = avatar_downloads.len();
-            let media_service = MediaService::new();
+            let media_service = MediaService::with_data_path(data_path);
             let (updates, failure_count) =
                 match media_service.download_user_avatars(&avatar_downloads).await {
                     Ok(result) => result,
@@ -825,6 +831,7 @@ pub async fn run(config: Config, db: Database) -> Result<()> {
         "event_processor_main".to_string(),
         config.processor.batch_size,
         config.processor.polling_interval_secs,
+        PathBuf::from(config.cli.data_path),
     )
     .with_notification_config(config.notification.into());
 
@@ -1093,6 +1100,7 @@ mod tests {
             "test_processor".to_string(),
             10,
             60,
+            PathBuf::from("./data"),
         );
         processor.max_retries = 0;
 
@@ -1146,6 +1154,7 @@ mod tests {
             "test_processor".to_string(),
             10,
             60,
+            PathBuf::from("./data"),
         );
         processor.max_retries = 0;
 

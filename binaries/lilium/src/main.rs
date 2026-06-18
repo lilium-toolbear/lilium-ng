@@ -115,7 +115,7 @@ async fn async_main() -> Result<u8> {
             args.run(&db).await?;
         }
         Verb::Explore(args) => {
-            args.run(&db).await?;
+            args.run(&db, &config.cli.data_path).await?;
         }
         Verb::Completion { .. } => unreachable!(),
     }
