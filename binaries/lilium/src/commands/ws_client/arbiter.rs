@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::UnixListener;
+use std::process::Stdio;
+use tokio::process::Child;
 use tokio::sync::{Notify, RwLock};
 use tracing::{error, info, warn};
 
@@ -23,7 +25,7 @@ pub struct Arbiter {
 }
 
 struct WorkerHandle {
-    shutdown: Arc<Notify>,
+    child: Child,
 }
 
 #[derive(Clone)]
@@ -44,53 +46,33 @@ trait WorkerSpawner: Send + Sync {
     fn spawn_worker(&self, spec: WorkerSpec) -> WorkerHandle;
 }
 
-struct TokioWorkerSpawner;
+struct ProcessWorkerSpawner;
 
-impl WorkerSpawner for TokioWorkerSpawner {
+impl WorkerSpawner for ProcessWorkerSpawner {
     fn spawn_worker(&self, spec: WorkerSpec) -> WorkerHandle {
-        let shutdown = Arc::new(Notify::new());
-        let worker_shutdown = shutdown.clone();
+        let account = spec.account;
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("ws-client")
+            .arg("worker")
+            .arg("--account")
+            .arg(&account)
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true);
 
-        tokio::spawn(async move {
-            let WorkerSpec {
-                account,
-                database,
-                notification_config,
-                lock_config,
-                queue_size,
-                batch_size,
-                buffer_dir,
-                runtime_dir,
-                websocket_url,
-                reconnect_delay_ms,
-            } = spec;
-
-            info!(account = %account, "Worker starting");
-            let runtime = super::worker::WorkerRuntimeConfig {
-                notification_config,
-                lock_config,
-                queue_size,
-                batch_size,
-                buffer_dir,
-                runtime_dir,
-                websocket_url,
-                reconnect_delay_ms,
-            };
-            let worker = super::worker::Worker::new(account.clone(), database, runtime);
-            if let Err(e) = worker.run(worker_shutdown).await {
-                error!(account = %account, error = %e, "Worker failed");
-            } else {
-                info!(account = %account, "Worker exited");
-            }
+        let child = command.spawn().unwrap_or_else(|e| {
+            panic!("failed to spawn worker process for account {account}: {e}")
         });
 
-        WorkerHandle { shutdown }
+        WorkerHandle { child }
     }
 }
 
 impl Arbiter {
     pub fn new(config: Config, database: Database) -> Self {
-        Self::with_worker_spawner(config, database, Arc::new(TokioWorkerSpawner))
+        Self::with_worker_spawner(config, database, Arc::new(ProcessWorkerSpawner))
     }
 
     fn with_worker_spawner(
@@ -190,8 +172,8 @@ impl Arbiter {
 
     pub async fn stop_worker(&self, account_id: &str) -> Result<()> {
         let mut workers = self.workers.write().await;
-        if let Some(handle) = workers.remove(account_id) {
-            handle.shutdown.notify_waiters();
+        if let Some(mut handle) = workers.remove(account_id) {
+            handle.child.start_kill().ok();
             info!(account = account_id, "Worker stop requested");
         } else {
             warn!(account = account_id, "Worker not running");
@@ -201,9 +183,9 @@ impl Arbiter {
 
     async fn stop_all_workers(&self) {
         let mut workers = self.workers.write().await;
-        for (account_id, handle) in workers.drain() {
+        for (account_id, mut handle) in workers.drain() {
             info!(account = %account_id, "Stopping worker");
-            handle.shutdown.notify_waiters();
+            handle.child.start_kill().ok();
         }
         info!("All workers stopped");
     }
@@ -378,7 +360,9 @@ mod tests {
             .withf(|spec| spec.account == "test_user")
             .times(1)
             .returning(|_| WorkerHandle {
-                shutdown: Arc::new(Notify::new()),
+                child: tokio::process::Command::new("true")
+                    .spawn()
+                    .expect("spawn true"),
             });
 
         let arbiter = Arbiter::with_worker_spawner(
