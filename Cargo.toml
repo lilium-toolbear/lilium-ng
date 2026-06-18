@@ -7,8 +7,6 @@ members = [
     "crates/lilium-core",
     "crates/lilium-services",
     "crates/lilium-api-client",
-    "binaries/lilium-spider",
-    "binaries/lilium-event-processor",
     "binaries/lilium",
 ]
 resolver = "2"
