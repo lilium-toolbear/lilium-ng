@@ -97,14 +97,10 @@ async fn async_main() -> Result<u8> {
         Verb::WsClient { worker: None } => {
             commands::ws_client::run(config, db).await?;
         }
-        // TODO: Uncomment when commands::ws_client::run_worker() is added (Task 7)
-        // Verb::WsClient {
-        //     worker: Some(WsClientWorker::Worker { account }),
-        // } => {
-        //     commands::ws_client::run_worker(account, config, db).await?;
-        // }
-        Verb::WsClient { worker: Some(_) } => {
-            anyhow::bail!("ws-client worker subcommand not yet implemented (Task 7)");
+        Verb::WsClient {
+            worker: Some(WsClientWorker::Worker { account }),
+        } => {
+            commands::ws_client::run_worker(account, config, db).await?;
         }
         Verb::EventProcessor => {
             commands::event_processor::run(config, db).await?;
