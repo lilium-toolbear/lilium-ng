@@ -310,16 +310,50 @@ impl Arbiter {
             std::mem::take(&mut *w)
         };
 
-        let accounts: Vec<String> = workers.into_keys().collect();
-        let futures: Vec<_> = accounts
-            .iter()
-            .map(|account_id| self.stop_worker(account_id))
-            .collect();
+        for (account_id, mut handle) in workers {
+            let socket_path =
+                control::worker_socket_path(&self.config.spider.runtime_dir, &account_id);
 
-        let results = futures::future::join_all(futures).await;
-        for (account, result) in accounts.iter().zip(results) {
-            if let Err(e) = result {
-                error!(account = %account, error = %e, "failed to stop worker");
+            let graceful = async {
+                let command = serde_json::json!({
+                    "action": "stop",
+                    "account_user_id": account_id,
+                })
+                .to_string();
+                match tokio::net::UnixStream::connect(&socket_path).await {
+                    Ok(mut stream) => {
+                        let _ = control::write_message(&mut stream, &command).await;
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(Self::WORKER_STOP_TIMEOUT_SECS),
+                            control::read_message(&mut stream),
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        warn!(account = account_id, error = %e, "worker control socket unavailable");
+                    }
+                }
+            };
+
+            graceful.await;
+
+            match tokio::time::timeout(
+                Duration::from_secs(Self::WORKER_STOP_TIMEOUT_SECS),
+                handle.child.wait(),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    info!(account = %account_id, "worker stopped gracefully");
+                }
+                _ => {
+                    warn!(account = %account_id, "worker did not stop gracefully; sending SIGTERM");
+                    let _ = handle.child.start_kill();
+                    match tokio::time::timeout(Duration::from_secs(5), handle.child.wait()).await {
+                        Ok(Ok(_)) => info!(account = %account_id, "worker killed"),
+                        _ => warn!(account = %account_id, "worker may be a zombie"),
+                    }
+                }
             }
         }
     }
