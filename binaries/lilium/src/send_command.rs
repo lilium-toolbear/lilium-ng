@@ -497,7 +497,7 @@ async fn send(
     if !wait {
         tracing::info!("--no-wait specified, not waiting for result");
         tracing::info!(
-            "Check status with: lilium-cli send-command status {}",
+            "Check status with: lilium send-command status {}",
             cmd.id
         );
         return Ok(0);
@@ -526,7 +526,7 @@ async fn send(
         WaitOutcome::PollTimeout(cmd) => {
             tracing::warn!("⚠️ CLI poll timeout (command may still be pending)");
             tracing::info!(
-                "Check status with: lilium-cli send-command status {}",
+                "Check status with: lilium send-command status {}",
                 cmd.id
             );
             Ok(1)
