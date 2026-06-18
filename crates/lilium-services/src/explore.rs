@@ -1,4 +1,5 @@
 // Python parity source: dzmm_archive@18fdefbc0b6979178d7f1eb4ce0624ec4a60a2f2 core/explore.py
+// Python parity source: dzmm_archive@18fdefbc0b6979178d7f1eb4ce0624ec4a60a2f2 core/user_sync.py
 // Ports ExploreFetcher orchestration. Per the migration SOP, orchestration lives
 // in lilium-services.
 //
@@ -128,15 +129,14 @@ impl<'a> ExploreFetcher<'a> {
             let (should_stop, user_ids) = self.process_items(db, &results, &mut stats).await?;
 
             // Update public user profiles for newly-seen authors.
+            // Uses get_public_user_profile (not batch_get_user_info) because
+            // explore content has no room context. Mirrors Python
+            // `batch_fetch_and_update_public_users` in `core/user_sync.py`.
             if !user_ids.is_empty() {
-                let pairs: Vec<(String, String)> = user_ids
-                    .iter()
-                    .map(|uid| (uid.clone(), String::new()))
-                    .collect();
-                let _ = user::batch_fetch_and_update_with_auth(
+                let _ = user::batch_fetch_and_update_public_users(
                     db,
                     self.auth,
-                    &pairs,
+                    &user_ids,
                     self.config.user_info_cache_hours,
                 )
                 .await;
