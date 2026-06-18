@@ -917,3 +917,171 @@ CREATE INDEX ix_websocket_events_user_id_timestamp_id ON ONLY public.websocket_e
 
 CREATE TRIGGER websocket_event_inserted_trigger AFTER INSERT ON public.websocket_events FOR EACH ROW EXECUTE FUNCTION public.notify_websocket_event_inserted();
 
+
+
+-- Explore content tables (Python parity: dzmm_archive models/dzmm/{tweet,card,gallery,checkpoint,book,chapter}.py)
+
+CREATE TABLE public.tweets (
+    tweet_id text NOT NULL,
+    user_id text,
+    content text,
+    media_urls text[],
+    local_media_paths text[],
+    source text,
+    tweet_type text,
+    parent_tweet_id text,
+    reply_to_tweet_id text,
+    reply_to_username text,
+    is_edited boolean NOT NULL DEFAULT false,
+    edit_history jsonb,
+    post_id text,
+    draw_id text,
+    likes_count integer NOT NULL DEFAULT 0,
+    comments_count integer NOT NULL DEFAULT 0,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    updated_at timestamp with time zone,
+    fetched_at timestamp with time zone NOT NULL DEFAULT now(),
+    is_deleted boolean NOT NULL DEFAULT false,
+    raw_data jsonb,
+    PRIMARY KEY (tweet_id)
+);
+CREATE INDEX idx_tweets_user_id ON public.tweets USING btree (user_id);
+CREATE INDEX idx_tweets_source ON public.tweets USING btree (source);
+CREATE INDEX idx_tweets_parent_tweet_id ON public.tweets USING btree (parent_tweet_id);
+CREATE INDEX idx_tweets_reply_to_tweet_id ON public.tweets USING btree (reply_to_tweet_id);
+CREATE INDEX idx_tweets_post_id ON public.tweets USING btree (post_id);
+CREATE INDEX idx_tweets_draw_id ON public.tweets USING btree (draw_id);
+CREATE INDEX idx_tweets_likes_count ON public.tweets USING btree (likes_count);
+CREATE INDEX idx_tweets_created_at ON public.tweets USING btree (created_at);
+
+CREATE TABLE public.cards (
+    card_id integer NOT NULL,
+    name text,
+    card_filename text,
+    original_filename text,
+    creator text,
+    creator_notes text,
+    user_id text,
+    creator_full_name text,
+    creator_avatar_url text,
+    tags text[],
+    is_public boolean NOT NULL DEFAULT true,
+    is_sensitive boolean NOT NULL DEFAULT false,
+    is_image_blur boolean NOT NULL DEFAULT false,
+    is_gamefy boolean NOT NULL DEFAULT false,
+    image_info jsonb,
+    weighted_rating text,
+    popularity_score text,
+    likes_count integer NOT NULL DEFAULT 0,
+    comments_count integer NOT NULL DEFAULT 0,
+    top_comments jsonb,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    published_at timestamp with time zone,
+    fetched_at timestamp with time zone NOT NULL DEFAULT now(),
+    raw_data jsonb,
+    PRIMARY KEY (card_id)
+);
+CREATE INDEX idx_cards_user_id ON public.cards USING btree (user_id);
+CREATE INDEX idx_cards_is_gamefy ON public.cards USING btree (is_gamefy);
+CREATE INDEX idx_cards_likes_count ON public.cards USING btree (likes_count);
+CREATE INDEX idx_cards_created_at ON public.cards USING btree (created_at);
+
+CREATE TABLE public.galleries (
+    gallery_id text NOT NULL,
+    title text,
+    user_id text,
+    user_full_name text,
+    user_avatar_url text,
+    images text[],
+    local_image_paths text[],
+    likes_count integer NOT NULL DEFAULT 0,
+    dislikes_count integer NOT NULL DEFAULT 0,
+    comments_count integer NOT NULL DEFAULT 0,
+    top_comments jsonb,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    fetched_at timestamp with time zone NOT NULL DEFAULT now(),
+    raw_data jsonb,
+    PRIMARY KEY (gallery_id)
+);
+CREATE INDEX idx_galleries_user_id ON public.galleries USING btree (user_id);
+CREATE INDEX idx_galleries_likes_count ON public.galleries USING btree (likes_count);
+CREATE INDEX idx_galleries_created_at ON public.galleries USING btree (created_at);
+
+CREATE TABLE public.checkpoints (
+    checkpoint_id text NOT NULL,
+    name text,
+    description text,
+    is_public boolean NOT NULL DEFAULT true,
+    user_id text,
+    user_name text,
+    user_avatar_url text,
+    creator jsonb,
+    rating_avg text,
+    rating_count integer NOT NULL DEFAULT 0,
+    review_status text,
+    share_code text,
+    character_cards jsonb,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    updated_at timestamp with time zone,
+    fetched_at timestamp with time zone NOT NULL DEFAULT now(),
+    raw_data jsonb,
+    PRIMARY KEY (checkpoint_id)
+);
+CREATE INDEX idx_checkpoints_user_id ON public.checkpoints USING btree (user_id);
+CREATE INDEX idx_checkpoints_review_status ON public.checkpoints USING btree (review_status);
+CREATE INDEX idx_checkpoints_share_code ON public.checkpoints USING btree (share_code);
+CREATE INDEX idx_checkpoints_created_at ON public.checkpoints USING btree (created_at);
+
+CREATE TABLE public.books (
+    book_id text NOT NULL,
+    title text,
+    description text,
+    slug text,
+    is_nsfw boolean NOT NULL DEFAULT false,
+    is_public boolean NOT NULL DEFAULT true,
+    cover_image_url text,
+    local_cover_path text,
+    user_id text,
+    author jsonb,
+    chapter_count integer NOT NULL DEFAULT 0,
+    total_word_count integer NOT NULL DEFAULT 0,
+    latest_chapter jsonb,
+    likes_count integer NOT NULL DEFAULT 0,
+    comments_count integer NOT NULL DEFAULT 0,
+    top_comments jsonb,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    updated_at timestamp with time zone,
+    published_at timestamp with time zone,
+    fetched_at timestamp with time zone NOT NULL DEFAULT now(),
+    raw_data jsonb,
+    PRIMARY KEY (book_id)
+);
+CREATE INDEX idx_books_slug ON public.books USING btree (slug);
+CREATE INDEX idx_books_is_nsfw ON public.books USING btree (is_nsfw);
+CREATE INDEX idx_books_user_id ON public.books USING btree (user_id);
+CREATE INDEX idx_books_likes_count ON public.books USING btree (likes_count);
+CREATE INDEX idx_books_created_at ON public.books USING btree (created_at);
+
+CREATE TABLE public.chapters (
+    chapter_id text NOT NULL,
+    title text,
+    content text,
+    is_adult boolean NOT NULL DEFAULT false,
+    is_nsfw boolean NOT NULL DEFAULT false,
+    user_id text,
+    author jsonb,
+    likes_count integer NOT NULL DEFAULT 0,
+    comments_count integer NOT NULL DEFAULT 0,
+    top_comments jsonb,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    updated_at timestamp with time zone,
+    published_at timestamp with time zone,
+    fetched_at timestamp with time zone NOT NULL DEFAULT now(),
+    raw_data jsonb,
+    PRIMARY KEY (chapter_id)
+);
+CREATE INDEX idx_chapters_is_adult ON public.chapters USING btree (is_adult);
+CREATE INDEX idx_chapters_is_nsfw ON public.chapters USING btree (is_nsfw);
+CREATE INDEX idx_chapters_user_id ON public.chapters USING btree (user_id);
+CREATE INDEX idx_chapters_likes_count ON public.chapters USING btree (likes_count);
+CREATE INDEX idx_chapters_created_at ON public.chapters USING btree (created_at);

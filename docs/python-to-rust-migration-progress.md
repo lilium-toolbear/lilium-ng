@@ -17,6 +17,136 @@ covers, and what remains to migrate.
 - Move completed gaps into the verified scenario list when code and tests land.
 - Delete obsolete one-off notes after their content is represented here.
 
+## 2026-06-18: Code quality review and logic consistency fixes
+
+Python commit: `dzmm_archive@18fdefbc0b6979178d7f1eb4ce0624ec4a60a2f2`
+
+Review and fixes for the Phase 2–7 migration code based on Brooks-Lint audit.
+
+Python sources read (for logic consistency verification):
+
+- `/Users/bearice/Working/github/dzmm_archive/models/dzmm/tweet.py` — verified `from_api` datetime parsing, media normalization, field extraction
+- `/Users/bearice/Working/github/dzmm_archive/services/explore_content_service.py` — verified upsert pattern (`model_dump(exclude_unset=True)`)
+- `/Users/bearice/Working/github/dzmm_archive/core/explore.py` — verified `_prefetch_book_detail` caching pattern (`item["_detailed_book"]`)
+- `/Users/bearice/Working/github/dzmm_archive/services/room_member_service.py` — verified `batch_upsert_members` and `clear_room_members`
+
+Rust files changed:
+
+- `crates/lilium-models/src/dzmm/mod.rs` — extracted common `parse_datetime`, `parse_optional_datetime`, `bool_field`, `int_field` helpers
+- `crates/lilium-models/src/dzmm/tweet.rs` — removed local helpers, now uses `super::` functions
+- `crates/lilium-models/src/dzmm/book.rs` — uses common helpers
+- `crates/lilium-models/src/dzmm/card.rs` — uses common helpers
+- `crates/lilium-models/src/dzmm/chapter.rs` — uses common helpers
+- `crates/lilium-models/src/dzmm/checkpoint.rs` — uses common helpers
+- `crates/lilium-models/src/dzmm/gallery.rs` — uses common helpers
+- `crates/lilium-services/src/room.rs` — delegates to `lilium_models::dzmm::parse_optional_datetime`
+- `crates/lilium-services/src/explore.rs` — fixed book details double-fetch with `book_details_cache`
+- `crates/lilium-services/src/explore_content.rs` — documented upsert divergence
+- `binaries/lilium-cli/src/explore.rs` — `fetcher` declared as `mut`
+
+Fixes applied:
+
+1. **Knowledge Duplication**: Extracted common JSON parsing helpers to `lilium-models/src/dzmm/mod.rs`
+2. **Accidental Complexity**: Fixed book details double-fetch by caching prefetched results in `ExploreFetcher.book_details_cache`
+3. **Logic Consistency**: Updated all Python parity source comments to current commit hash
+
+Divergences documented:
+
+- **Upsert pattern**: Python uses `model_dump(exclude_unset=True)` for partial updates; Rust uses `reset_all()` to update all fields. Acceptable because Rust models are always fully constructed from `from_api`.
+- **left_at timestamp**: Python uses `utc_now()` (application time); Rust uses `Expr::cust("NOW()")` (database time). Minor difference, acceptable for this use case.
+
+Verification commands:
+
+```bash
+cargo fmt --all
+cargo clippy --all-targets --all-features
+cargo test -p lilium-models -p lilium-services --all-targets
+```
+
+---
+
+## 2026-06-18: lilium-cli sync/explore CLIs + core modules (Phases 2–7)
+
+Python commit: `dzmm_archive@18fdefbc0b6979178d7f1eb4ce0624ec4a60a2f2`
+
+Ports the remaining three Python CLIs (`sync_members.py`, `sync_rooms.py`,
+`explore.py`) and their previously-unmigrated `core/` orchestration plus
+supporting services/models.
+
+Python sources read:
+
+- `/Users/bearice/Working/github/dzmm_archive/core/sync.py` (RoomSyncer, MemberSyncer)
+- `/Users/bearice/Working/github/dzmm_archive/core/history.py` (HistoryFetcher)
+- `/Users/bearice/Working/github/dzmm_archive/core/explore.py` (ExploreFetcher)
+- `/Users/bearice/Working/github/dzmm_archive/services/room_service.py`
+- `/Users/bearice/Working/github/dzmm_archive/services/room_member_service.py`
+- `/Users/bearice/Working/github/dzmm_archive/services/explore_content_service.py`
+- `/Users/bearice/Working/github/dzmm_archive/services/tweet_service.py`
+- `/Users/bearice/Working/github/dzmm_archive/models/dzmm/room.py`, `room_member.py`, `tweet.py`, `card.py`, `gallery.py`, `checkpoint.py`, `book.py`, `chapter.py`, `message.py`
+
+Rust files added/updated:
+
+- `crates/lilium-services/src/room.rs` — RoomService (get_by_id, get_all_rooms + RoomFilters, upsert_room_from_dict, mark_inactive_rooms, update_backfill_progress, mark_history_complete, parse_datetime).
+- `crates/lilium-services/src/room_member.rs` — added `batch_upsert_members` (leaver detection + chunked `INSERT ON CONFLICT`) and `clear_room_members`.
+- `crates/lilium-services/src/sync.rs` — RoomSyncer + MemberSyncer orchestration (Port of `core/sync.py`).
+- `crates/lilium-services/src/history.rs` — HistoryFetcher (backfill_to_start, save_messages, ensure_room_info, auth_for_room). Port of `core/history.py`.
+- `crates/lilium-services/src/explore.rs` — ExploreFetcher + ExploreFetchConfig/Stats. Port of `core/explore.py`.
+- `crates/lilium-services/src/explore_content.rs` — get_by_id + upsert for the six content entities + `set_tweet_local_media_paths`.
+- `crates/lilium-models/src/dzmm/{tweet,card,gallery,checkpoint,book,chapter}.rs` — six new SeaORM entities with `from_api` constructors.
+- `crates/lilium-models/src/dzmm/message.rs` — added `Message::from_api` (REST history format).
+- `crates/lilium-database/testdata/live_schema_bootstrap/0001_live_schema.sql` — added the six explore-content tables + indexes (Alembic still owns production migrations).
+- `binaries/lilium-cli/src/{sync_members,sync_rooms,explore}.rs` — three new CLI subcommands wired into `main.rs`.
+- `crates/lilium-services/src/lib.rs` — registered `room`, `sync`, `history`, `explore`, `explore_content` modules.
+
+Verified scenarios:
+
+- `lilium-cli sync-members <room>` selects an enabled account with room access
+  via `room.account_ids`; `sync-members` (no arg) syncs all active group rooms
+  and aggregates stats. `--force` clears members first.
+- `lilium-cli sync-rooms` syncs all enabled accounts (or `--account`),
+  `--list-accounts` lists profiles, `--poll` diffs the room-id set per cycle and
+  for new rooms: syncs members, backfills history, queues `system:reconnect`
+  commands (`require_ack=false`, `max_attempts=1`). Graceful shutdown on Ctrl-C.
+- `lilium-cli explore` fetches the feed, upserts tweets/cards/galleries/
+  checkpoints/books(+chapters), prints stats; `--poll` loops every 5 min;
+  backfill mode stops on known content (Python `--backfill` store_false
+  semantics: default backfill=True, flag turns it off).
+- RoomService: `upsert_room_from_dict` appends account_user_id; existing room
+  updated fields + re-activated; `mark_inactive_rooms` deactivates only when
+  `account_ids` empties (multi-account rooms stay active). Verified by DB tests.
+- `batch_upsert_members`: inserts new, marks leavers (`left_at`), reactivates
+  returning members (clears `left_at`), chunked upsert. Verified by DB tests.
+- Explore content upserts: check-then-insert/update with `reset_all()` to write
+  all non-PK fields on update. Verified by DB tests for tweet/card/book/chapter.
+- `Message::from_api` parses REST history dicts (content.type/text/url/alt/
+  stickerId/reference, video metadata). Verified by unit tests.
+- History backfill: pagination by oldest `sent_at` cursor, progress saved every
+  10 batches, `history_complete` set on completion; auth selected per-room.
+- Divergence recorded: explore fetcher does not download tweet media to disk
+  (`images_downloaded` stays 0; `media_urls` are stored). History fetcher does
+  not fire background media downloads (the spider/media pipeline handles
+  attachments). Both are noted as remaining gaps.
+
+Verification commands:
+
+```bash
+cargo build --workspace
+cargo fmt --all --check
+cargo test -p lilium-cli -p lilium-services -p lilium-models
+./target/debug/lilium-cli --help
+./target/debug/lilium-cli sync-rooms --help
+./target/debug/lilium-cli sync-members --help
+./target/debug/lilium-cli explore --help
+```
+
+Remaining gaps:
+
+- Explore tweet media download to disk (tweet attachment path + downloader).
+- History backfill media download for backfilled messages.
+- `cust_with_values` PG array binding pitfall documented in memory; the
+  `message.rs` `account_ids @> ARRAY[...]` predicate may share the issue and
+  should be revisited if that filter path is exercised.
+
 ## 2026-06-17: lilium-cli send-command (Phase 1 of CLI port)
 
 Python commit: `dzmm_archive@0efb507c6126a2638d3d38aca4018a804431291e`

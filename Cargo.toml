@@ -9,6 +9,7 @@ members = [
     "crates/lilium-api-client",
     "binaries/lilium-spider",
     "binaries/lilium-event-processor",
+    "binaries/lilium-cli",
 ]
 resolver = "2"
 
@@ -70,6 +71,7 @@ sentry-tracing = "0.48.2"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
 
 # 错误处理
 anyhow = "1"
