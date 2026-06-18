@@ -3,12 +3,16 @@
 
 pub mod account;
 pub mod event;
+pub mod explore;
+pub mod explore_content;
+pub mod history;
 pub mod media;
 pub mod message;
 pub mod notification;
 pub mod outgoing_command;
 pub mod room;
 pub mod room_member;
+pub mod sync;
 pub mod user;
 pub mod websocket_connection;
 

@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
-// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 models/dzmm/message.py
+// Python parity source: dzmm_archive@18fdefbc0b6979178d7f1eb4ce0624ec4a60a2f2 models/dzmm/message.py
 // Parity decisions:
 // - Python exposes `content_tsv` (TSVECTOR), but Rust intentionally keeps PostgreSQL
 //   search vectors out of the table row model. The DB column still exists and is
@@ -148,6 +148,107 @@ impl Message {
             metadata,
             raw_data: event_data.clone(),
             source: "spider".to_string(),
+            created_at: now,
+            updated_at: None,
+            is_deleted: false,
+            deleted_at: None,
+            deleted_by: None,
+            is_recalled: false,
+            is_edited: false,
+            history: None,
+            reference_message_id,
+            reference_data,
+        })
+    }
+
+    /// Create a Message from a REST API history response dict. Mirrors Python
+    /// `Message.from_api`. The `data` dict has top-level `message_id`,
+    /// `sent_by`, `sent_at`/`sentAt`, `content`, and optional `metadata`/
+    /// `attachment_file`.
+    pub fn from_api(data: &serde_json::Value, room_id: &str) -> Option<Self> {
+        let message_id = data.get("message_id")?.as_str()?.to_string();
+        let sent_by = data
+            .get("sent_by")
+            .or_else(|| data.get("sentBy"))
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .unwrap_or_default();
+        let sent_at = data
+            .get("sent_at")
+            .or_else(|| data.get("sentAt"))
+            .and_then(|v| v.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(Utc::now);
+
+        let content = data.get("content").unwrap_or(&serde_json::Value::Null);
+        let content_type = content
+            .get("type")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| "text".to_string());
+        let content_text = content
+            .get("text")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        let attachment_url = content
+            .get("url")
+            .or_else(|| content.get("videoUrl"))
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        let alt_text = content
+            .get("alt")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        let sticker_id = content
+            .get("stickerId")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        let reference_data = content.get("reference").filter(|v| v.is_object()).cloned();
+        let reference_message_id = reference_data
+            .as_ref()
+            .and_then(|v| v.get("id"))
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+
+        let mut metadata = data.get("metadata").filter(|v| v.is_object()).cloned();
+        if content_type == "video" {
+            let mut video = serde_json::Map::new();
+            for key in ["width", "height", "status", "blurhash", "duration"] {
+                if let Some(value) = content.get(key).filter(|v| !v.is_null()) {
+                    video.insert(key.to_string(), value.clone());
+                }
+            }
+            if let Some(value) = content.get("thumbnailUrl").filter(|v| !v.is_null()) {
+                video.insert("thumbnail_url".to_string(), value.clone());
+            }
+            if !video.is_empty() {
+                let mut map = metadata
+                    .and_then(|v| v.as_object().cloned())
+                    .unwrap_or_default();
+                map.insert("video".to_string(), serde_json::Value::Object(video));
+                metadata = Some(serde_json::Value::Object(map));
+            }
+        }
+
+        let now = Utc::now();
+        Some(Self {
+            message_id,
+            room_id: room_id.to_string(),
+            sent_at,
+            sent_by,
+            content_type,
+            content_text,
+            attachment_url,
+            attachment_file: data
+                .get("attachment_file")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
+            sticker_id,
+            alt_text,
+            metadata,
+            raw_data: data.clone(),
+            source: "api".to_string(),
             created_at: now,
             updated_at: None,
             is_deleted: false,
@@ -633,5 +734,31 @@ mod tests {
         assert!(msg.is_edited);
         let history = msg.history.unwrap();
         assert_eq!(history.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn from_api_parses_rest_history_dict() {
+        let data = serde_json::json!({
+            "message_id": "msg-1",
+            "sent_by": "u1",
+            "sent_at": "2024-11-16T04:27:00.123Z",
+            "content": {"type": "image", "url": "https://x/img.png", "alt": "hi"},
+            "metadata": {"k": "v"},
+        });
+        let m = Message::from_api(&data, "room-1").expect("parse");
+        assert_eq!(m.message_id, "msg-1");
+        assert_eq!(m.room_id, "room-1");
+        assert_eq!(m.sent_by, "u1");
+        assert_eq!(m.content_type, "image");
+        assert_eq!(m.attachment_url.as_deref(), Some("https://x/img.png"));
+        assert_eq!(m.alt_text.as_deref(), Some("hi"));
+        assert_eq!(m.source, "api");
+        assert_eq!(m.metadata.unwrap().get("k").unwrap().as_str().unwrap(), "v");
+    }
+
+    #[test]
+    fn from_api_returns_none_without_message_id() {
+        let data = serde_json::json!({"sent_by": "u1"});
+        assert!(Message::from_api(&data, "r").is_none());
     }
 }
