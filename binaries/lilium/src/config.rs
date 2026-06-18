@@ -1,3 +1,5 @@
+// Python parity source: dzmm_archive@0efb507c6126a2638d3d38aca4018a804431291e cli/send_command.py
+// Config is environment-driven, mirroring the Python `.env` + `setup_logging` bootstrap.
 use anyhow::{Context, Result};
 use lilium_api_client::config::ApiClientConfig;
 use std::path::PathBuf;
