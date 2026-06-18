@@ -10,7 +10,7 @@ use lilium_services::explore;
 use std::path::PathBuf;
 
 #[derive(Args)]
-pub struct ExploreArgs {
+pub struct SyncExploreArgs {
     /// Sort method (default: recent)
     #[arg(long, default_value = "recent")]
     pub sort: String,
@@ -38,7 +38,7 @@ pub struct ExploreArgs {
     pub types: String,
 }
 
-impl ExploreArgs {
+impl SyncExploreArgs {
     /// Execute the explore subcommand. Returns a process exit code.
     ///
     /// `data_path` is the global data directory from `Config.cli.data_path`
@@ -111,7 +111,6 @@ async fn run_fetch(
         tracing::error!("❌ No available accounts. Add an account first.");
         anyhow::bail!("No available accounts");
     };
-    tracing::info!("🔑 Using account: {}", api_user_id_hint(&api));
 
     let mut fetcher =
         explore::ExploreFetcher::new(&api, data_path.to_owned(), config.clone(), backfill);
@@ -127,11 +126,6 @@ async fn run_fetch(
         tracing::info!("✓ Sync complete: processed all available pages");
     }
     Ok(())
-}
-
-fn api_user_id_hint(_api: &lilium_api_client::http::DzmmApi) -> String {
-    // DzmmApi carries the user_id internally; a precise accessor isn't exposed.
-    "(from credentials)".to_string()
 }
 
 fn print_stats(stats: &explore::ExploreFetchStats) {
