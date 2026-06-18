@@ -3,10 +3,9 @@ use anyhow::Result;
 use lilium_database::Database;
 use lilium_services::account;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::net::UnixListener;
 use tokio::process::Child;
 use tokio::sync::{Notify, RwLock};
@@ -29,21 +28,6 @@ pub struct Arbiter {
 struct WorkerHandle {
     child: Child,
     restart_count: u32,
-    last_restart: Instant,
-}
-
-#[derive(Clone)]
-struct WorkerSpec {
-    account: String,
-    database: Database,
-    notification_config: lilium_database::NotificationDatabaseConfig,
-    lock_config: lilium_database::DedicatedDatabaseConfig,
-    queue_size: usize,
-    batch_size: usize,
-    buffer_dir: PathBuf,
-    runtime_dir: PathBuf,
-    websocket_url: String,
-    reconnect_delay_ms: u64,
 }
 
 fn backoff_delay(restart_count: u32) -> Duration {
@@ -54,14 +38,13 @@ fn backoff_delay(restart_count: u32) -> Duration {
 }
 
 trait WorkerSpawner: Send + Sync {
-    fn spawn_worker(&self, spec: WorkerSpec) -> WorkerHandle;
+    fn spawn_worker(&self, account: String) -> WorkerHandle;
 }
 
 struct ProcessWorkerSpawner;
 
 impl WorkerSpawner for ProcessWorkerSpawner {
-    fn spawn_worker(&self, spec: WorkerSpec) -> WorkerHandle {
-        let account = spec.account;
+    fn spawn_worker(&self, account: String) -> WorkerHandle {
         let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
         command
             .arg("ws-client")
@@ -80,7 +63,6 @@ impl WorkerSpawner for ProcessWorkerSpawner {
         WorkerHandle {
             child,
             restart_count: 0,
-            last_restart: Instant::now(),
         }
     }
 }
@@ -133,8 +115,6 @@ impl Arbiter {
         let restart_shutdown = self.shutdown.clone();
         let restart_workers = self.workers.clone();
         let restart_spawner = self.worker_spawner.clone();
-        let restart_config = self.config.clone();
-        let restart_db = self.database.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -163,22 +143,10 @@ impl Arbiter {
                             if let Some(mut handle) = workers.remove(&account) {
                                 let _ = handle.child.start_kill();
                                 let delay = backoff_delay(handle.restart_count);
-                                let new_handle = restart_spawner.spawn_worker(WorkerSpec {
-                                    account: account.clone(),
-                                    database: restart_db.clone(),
-                                    notification_config: restart_config.notification.clone().into(),
-                                    lock_config: restart_config.database.clone().into(),
-                                    queue_size: restart_config.spider.queue_size,
-                                    batch_size: restart_config.spider.batch_size,
-                                    buffer_dir: restart_config.spider.buffer_dir.clone(),
-                                    runtime_dir: restart_config.spider.runtime_dir.clone(),
-                                    websocket_url: restart_config.spider.websocket_url.clone(),
-                                    reconnect_delay_ms: restart_config.spider.reconnect_delay_ms,
-                                });
+                                let new_handle = restart_spawner.spawn_worker(account.clone());
                                 workers.insert(account, WorkerHandle {
                                     child: new_handle.child,
                                     restart_count: handle.restart_count + 1,
-                                    last_restart: Instant::now(),
                                 });
                                 sleep(delay).await;
                             }
@@ -220,21 +188,6 @@ impl Arbiter {
         .await
     }
 
-    fn worker_spec(&self, account: String) -> WorkerSpec {
-        WorkerSpec {
-            account,
-            database: self.database.clone(),
-            notification_config: self.config.notification.clone().into(),
-            lock_config: self.config.database.clone().into(),
-            queue_size: self.config.spider.queue_size,
-            batch_size: self.config.spider.batch_size,
-            buffer_dir: self.config.spider.buffer_dir.clone(),
-            runtime_dir: self.config.spider.runtime_dir.clone(),
-            websocket_url: self.config.spider.websocket_url.clone(),
-            reconnect_delay_ms: self.config.spider.reconnect_delay_ms,
-        }
-    }
-
     pub async fn start_worker(&self, account_id: &str) -> Result<()> {
         let mut workers = self.workers.write().await;
         if workers.contains_key(account_id) {
@@ -242,9 +195,7 @@ impl Arbiter {
             return Ok(());
         }
 
-        let handle = self
-            .worker_spawner
-            .spawn_worker(self.worker_spec(account_id.to_string()));
+        let handle = self.worker_spawner.spawn_worker(account_id.to_string());
 
         workers.insert(account_id.to_string(), handle);
         Ok(())
@@ -486,12 +437,13 @@ impl Arbiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     mockall::mock! {
         WorkerSpawner {}
 
         impl WorkerSpawner for WorkerSpawner {
-            fn spawn_worker(&self, spec: WorkerSpec) -> WorkerHandle;
+            fn spawn_worker(&self, account: String) -> WorkerHandle;
         }
     }
 
@@ -530,14 +482,13 @@ mod tests {
         let mut worker_spawner = MockWorkerSpawner::new();
         worker_spawner
             .expect_spawn_worker()
-            .withf(|spec| spec.account == "test_user")
+            .withf(|account| account == "test_user")
             .times(1)
             .returning(|_| WorkerHandle {
                 child: tokio::process::Command::new("true")
                     .spawn()
                     .expect("spawn true"),
                 restart_count: 0,
-                last_restart: Instant::now(),
             });
 
         let arbiter = Arbiter::with_worker_spawner(
