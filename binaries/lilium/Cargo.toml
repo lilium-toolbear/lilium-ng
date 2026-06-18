@@ -30,6 +30,7 @@ clap.workspace = true
 clap_complete.workspace = true
 uuid.workspace = true
 rand.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

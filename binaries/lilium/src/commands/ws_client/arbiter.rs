@@ -7,8 +7,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::UnixListener;
 use std::process::Stdio;
+use std::time::{Duration, Instant};
 use tokio::process::Child;
 use tokio::sync::{Notify, RwLock};
+use tokio::time::sleep;
 use tracing::{error, info, warn};
 
 use crate::commands::ws_client::control::{
@@ -26,6 +28,8 @@ pub struct Arbiter {
 
 struct WorkerHandle {
     child: Child,
+    restart_count: u32,
+    last_restart: Instant,
 }
 
 #[derive(Clone)]
@@ -40,6 +44,13 @@ struct WorkerSpec {
     runtime_dir: PathBuf,
     websocket_url: String,
     reconnect_delay_ms: u64,
+}
+
+fn backoff_delay(restart_count: u32) -> Duration {
+    let base: u64 = 100;
+    let max: u64 = 30_000;
+    let millis = base.saturating_mul(2u64.saturating_pow(restart_count));
+    Duration::from_millis(std::cmp::min(millis, max))
 }
 
 trait WorkerSpawner: Send + Sync {
@@ -66,7 +77,11 @@ impl WorkerSpawner for ProcessWorkerSpawner {
             panic!("failed to spawn worker process for account {account}: {e}")
         });
 
-        WorkerHandle { child }
+        WorkerHandle {
+            child,
+            restart_count: 0,
+            last_restart: Instant::now(),
+        }
     }
 }
 
@@ -113,6 +128,66 @@ impl Arbiter {
             self.start_worker(account_id).await?;
         }
 
+        // Spawn the restart watcher: polls every 1s for crashed workers,
+        // restarts them with exponential backoff.
+        let restart_shutdown = self.shutdown.clone();
+        let restart_workers = self.workers.clone();
+        let restart_spawner = self.worker_spawner.clone();
+        let restart_config = self.config.clone();
+        let restart_db = self.database.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = restart_shutdown.notified() => break,
+                    _ = sleep(Duration::from_secs(1)) => {
+                        let mut workers = restart_workers.write().await;
+                        let mut to_restart = Vec::new();
+                        for (account, handle) in workers.iter_mut() {
+                            match handle.child.try_wait() {
+                                Ok(Some(status)) if !status.success() => {
+                                    warn!(account = %account, status = ?status, "worker exited; will restart");
+                                    to_restart.push((account.clone(), false));
+                                }
+                                Ok(Some(status)) if status.success() => {
+                                    info!(account = %account, "worker exited cleanly; removing");
+                                    to_restart.push((account.clone(), true));
+                                }
+                                _ => {}
+                            }
+                        }
+                        for (account, clean_exit) in to_restart {
+                            if clean_exit {
+                                workers.remove(&account);
+                                continue;
+                            }
+                            if let Some(mut handle) = workers.remove(&account) {
+                                let _ = handle.child.start_kill();
+                                let delay = backoff_delay(handle.restart_count);
+                                let new_handle = restart_spawner.spawn_worker(WorkerSpec {
+                                    account: account.clone(),
+                                    database: restart_db.clone(),
+                                    notification_config: restart_config.notification.clone().into(),
+                                    lock_config: restart_config.database.clone().into(),
+                                    queue_size: restart_config.spider.queue_size,
+                                    batch_size: restart_config.spider.batch_size,
+                                    buffer_dir: restart_config.spider.buffer_dir.clone(),
+                                    runtime_dir: restart_config.spider.runtime_dir.clone(),
+                                    websocket_url: restart_config.spider.websocket_url.clone(),
+                                    reconnect_delay_ms: restart_config.spider.reconnect_delay_ms,
+                                });
+                                workers.insert(account, WorkerHandle {
+                                    child: new_handle.child,
+                                    restart_count: handle.restart_count + 1,
+                                    last_restart: Instant::now(),
+                                });
+                                sleep(delay).await;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
         let shutdown = self.shutdown.clone();
         tokio::spawn(async move {
             tokio::signal::ctrl_c().await.ok();
@@ -145,15 +220,8 @@ impl Arbiter {
         .await
     }
 
-    pub async fn start_worker(&self, account_id: &str) -> Result<()> {
-        let mut workers = self.workers.write().await;
-        if workers.contains_key(account_id) {
-            warn!(account = account_id, "Worker already running");
-            return Ok(());
-        }
-
-        let account = account_id.to_string();
-        let handle = self.worker_spawner.spawn_worker(WorkerSpec {
+    fn worker_spec(&self, account: String) -> WorkerSpec {
+        WorkerSpec {
             account,
             database: self.database.clone(),
             notification_config: self.config.notification.clone().into(),
@@ -164,30 +232,96 @@ impl Arbiter {
             runtime_dir: self.config.spider.runtime_dir.clone(),
             websocket_url: self.config.spider.websocket_url.clone(),
             reconnect_delay_ms: self.config.spider.reconnect_delay_ms,
-        });
+        }
+    }
+
+    pub async fn start_worker(&self, account_id: &str) -> Result<()> {
+        let mut workers = self.workers.write().await;
+        if workers.contains_key(account_id) {
+            warn!(account = account_id, "Worker already running");
+            return Ok(());
+        }
+
+        let handle = self.worker_spawner.spawn_worker(self.worker_spec(account_id.to_string()));
 
         workers.insert(account_id.to_string(), handle);
         Ok(())
     }
 
+    const WORKER_STOP_TIMEOUT_SECS: u64 = 10;
+
     pub async fn stop_worker(&self, account_id: &str) -> Result<()> {
         let mut workers = self.workers.write().await;
-        if let Some(mut handle) = workers.remove(account_id) {
-            handle.child.start_kill().ok();
-            info!(account = account_id, "Worker stop requested");
-        } else {
+        let Some(mut handle) = workers.remove(account_id) else {
             warn!(account = account_id, "Worker not running");
+            return Ok(());
+        };
+
+        let socket_path = control::worker_socket_path(&self.config.spider.runtime_dir, account_id);
+
+        let graceful = async {
+            let command = serde_json::json!({
+                "action": "stop",
+                "account_user_id": account_id,
+            })
+            .to_string();
+            match tokio::net::UnixStream::connect(&socket_path).await {
+                Ok(mut stream) => {
+                    let _ = control::write_message(&mut stream, &command).await;
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(Self::WORKER_STOP_TIMEOUT_SECS),
+                        control::read_message(&mut stream),
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    warn!(account = account_id, error = %e, "worker control socket unavailable");
+                }
+            }
+        };
+
+        graceful.await;
+
+        match tokio::time::timeout(
+            Duration::from_secs(Self::WORKER_STOP_TIMEOUT_SECS),
+            handle.child.wait(),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {
+                info!(account = account_id, "worker stopped gracefully");
+            }
+            _ => {
+                warn!(account = account_id, "worker did not stop gracefully; sending SIGTERM");
+                let _ = handle.child.start_kill();
+                match tokio::time::timeout(Duration::from_secs(5), handle.child.wait()).await {
+                    Ok(Ok(_)) => info!(account = account_id, "worker killed"),
+                    _ => warn!(account = account_id, "worker may be a zombie"),
+                }
+            }
         }
+
         Ok(())
     }
 
     async fn stop_all_workers(&self) {
-        let mut workers = self.workers.write().await;
-        for (account_id, mut handle) in workers.drain() {
-            info!(account = %account_id, "Stopping worker");
-            handle.child.start_kill().ok();
+        let workers: HashMap<String, WorkerHandle> = {
+            let mut w = self.workers.write().await;
+            std::mem::take(&mut *w)
+        };
+
+        let accounts: Vec<String> = workers.into_keys().collect();
+        let futures: Vec<_> = accounts
+            .iter()
+            .map(|account_id| self.stop_worker(account_id))
+            .collect();
+
+        let results = futures::future::join_all(futures).await;
+        for (account, result) in accounts.iter().zip(results) {
+            if let Err(e) = result {
+                error!(account = %account, error = %e, "failed to stop worker");
+            }
         }
-        info!("All workers stopped");
     }
 
     async fn run_control_server(self, listener: UnixListener, shutdown: Arc<Notify>) -> Result<()> {
@@ -363,6 +497,8 @@ mod tests {
                 child: tokio::process::Command::new("true")
                     .spawn()
                     .expect("spawn true"),
+                restart_count: 0,
+                last_restart: Instant::now(),
             });
 
         let arbiter = Arbiter::with_worker_spawner(
