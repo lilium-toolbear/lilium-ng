@@ -27,6 +27,7 @@ sentry-tracing.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
 uuid.workspace = true
 rand.workspace = true
 
