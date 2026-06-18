@@ -17,11 +17,11 @@ mod sync_rooms;
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Verb,
 }
 
 #[derive(Subcommand)]
-enum Command {
+enum Verb {
     /// Send commands to the DZMM spider via the database queue
     #[command(name = "send-command")]
     SendCommand {
@@ -47,10 +47,10 @@ async fn async_main() -> Result<u8> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::SendCommand { cmd } => cmd.run(db.orm(), config.notification.into()).await,
-        Command::SyncMembers(args) => args.run(&db).await,
-        Command::SyncRooms(args) => args.run(&db).await,
-        Command::Explore(args) => args.run(&db).await,
+        Verb::SendCommand { cmd } => cmd.run(db.orm(), config.notification.into()).await,
+        Verb::SyncMembers(args) => args.run(&db).await,
+        Verb::SyncRooms(args) => args.run(&db).await,
+        Verb::Explore(args) => args.run(&db).await,
     }
 }
 
