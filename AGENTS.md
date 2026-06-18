@@ -10,7 +10,7 @@ This repository is a Rust workspace for the Lilium NG rewrite. Core code lives u
 - `crates/lilium-core`: pure business logic
 - `crates/lilium-api-client`: external HTTP and Socket.IO transport
 - `crates/lilium-services`: service-layer orchestration
-- `binaries/lilium-spider`, `binaries/lilium-event-processor`, and `binaries/lilium-cli`: executable entry points
+- `binaries/lilium`: unified executable entry point with subcommands (`ws-client`, `event-processor`, `cli`, etc.)
 - `docs/database-layer-plan.md`: current database layer architecture spec
 - `docs/python-to-rust-migration-sop.md`: required Python-to-Rust parity workflow
 - `docs/python-to-rust-migration-progress.md`: current scenario-based migration progress tracker
@@ -20,7 +20,7 @@ Keep tests close to the code they verify. Use `crates/lilium-test-fixtures` for 
 ## Architecture
 
 ```
-Binaries (lilium-spider, lilium-event-processor, lilium-cli)
+Binaries (lilium — unified binary with ws-client, event-processor, cli subcommands)
     → Service Layer (lilium-services)
         → Core Layer (lilium-core) — pure business logic, no async/DB
         → Domain Layer (lilium-models) — SeaORM entities and row mappings
@@ -37,9 +37,9 @@ Data access and API clients are sibling dependencies of services and binaries;
 - `cargo build`: compile the full workspace
 - `cargo test`: run all workspace tests
 - `cargo test -p lilium-database`: run database-layer tests only
-- `cargo run --bin lilium-spider`: start the spider binary locally
-- `cargo run --bin lilium-event-processor`: start the event processor locally
-- `cargo run --bin lilium-cli`: run the operational CLI locally
+- `cargo run --bin lilium ws-client`: start the spider/websocket client
+- `cargo run --bin lilium event-processor`: start the event processor
+- `cargo run --bin lilium cli`: run the operational CLI
 - `cargo fmt --all`: format code with standard Rust formatting
 - `cargo clippy --all-targets --all-features`: run lint checks
 
@@ -50,7 +50,7 @@ Use standard Rust style and `rustfmt` defaults. Prefer small, explicit modules a
 - files and modules: `snake_case`
 - types, traits, enums: `CamelCase`
 - functions, variables, and fields: `snake_case`
-- binaries and workspace crates: descriptive, feature-specific names
+- binaries and workspace crates: descriptive, feature-specific names (lilium for the unified binary, lilium-* for library crates)
 
 ## Critical Rules
 

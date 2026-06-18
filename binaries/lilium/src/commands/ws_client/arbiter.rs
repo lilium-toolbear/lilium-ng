@@ -6,13 +6,17 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::UnixListener;
+use std::process::Stdio;
+use std::time::{Duration, Instant};
+use tokio::process::Child;
 use tokio::sync::{Notify, RwLock};
+use tokio::time::sleep;
 use tracing::{error, info, warn};
 
-use crate::config::Config;
-use crate::control::{
+use crate::commands::ws_client::control::{
     self, ControlAction, ControlCommand, ControlResponse, read_message, write_message,
 };
+use crate::config::Config;
 
 pub struct Arbiter {
     config: Config,
@@ -23,7 +27,9 @@ pub struct Arbiter {
 }
 
 struct WorkerHandle {
-    shutdown: Arc<Notify>,
+    child: Child,
+    restart_count: u32,
+    last_restart: Instant,
 }
 
 #[derive(Clone)]
@@ -40,57 +46,48 @@ struct WorkerSpec {
     reconnect_delay_ms: u64,
 }
 
+fn backoff_delay(restart_count: u32) -> Duration {
+    let base: u64 = 100;
+    let max: u64 = 30_000;
+    let millis = base.saturating_mul(2u64.saturating_pow(restart_count));
+    Duration::from_millis(std::cmp::min(millis, max))
+}
+
 trait WorkerSpawner: Send + Sync {
     fn spawn_worker(&self, spec: WorkerSpec) -> WorkerHandle;
 }
 
-struct TokioWorkerSpawner;
+struct ProcessWorkerSpawner;
 
-impl WorkerSpawner for TokioWorkerSpawner {
+impl WorkerSpawner for ProcessWorkerSpawner {
     fn spawn_worker(&self, spec: WorkerSpec) -> WorkerHandle {
-        let shutdown = Arc::new(Notify::new());
-        let worker_shutdown = shutdown.clone();
+        let account = spec.account;
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("ws-client")
+            .arg("worker")
+            .arg("--account")
+            .arg(&account)
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true);
 
-        tokio::spawn(async move {
-            let WorkerSpec {
-                account,
-                database,
-                notification_config,
-                lock_config,
-                queue_size,
-                batch_size,
-                buffer_dir,
-                runtime_dir,
-                websocket_url,
-                reconnect_delay_ms,
-            } = spec;
-
-            info!(account = %account, "Worker starting");
-            let runtime = super::worker::WorkerRuntimeConfig {
-                notification_config,
-                lock_config,
-                queue_size,
-                batch_size,
-                buffer_dir,
-                runtime_dir,
-                websocket_url,
-                reconnect_delay_ms,
-            };
-            let worker = super::worker::Worker::new(account.clone(), database, runtime);
-            if let Err(e) = worker.run(worker_shutdown).await {
-                error!(account = %account, error = %e, "Worker failed");
-            } else {
-                info!(account = %account, "Worker exited");
-            }
+        let child = command.spawn().unwrap_or_else(|e| {
+            panic!("failed to spawn worker process for account {account}: {e}")
         });
 
-        WorkerHandle { shutdown }
+        WorkerHandle {
+            child,
+            restart_count: 0,
+            last_restart: Instant::now(),
+        }
     }
 }
 
 impl Arbiter {
     pub fn new(config: Config, database: Database) -> Self {
-        Self::with_worker_spawner(config, database, Arc::new(TokioWorkerSpawner))
+        Self::with_worker_spawner(config, database, Arc::new(ProcessWorkerSpawner))
     }
 
     fn with_worker_spawner(
@@ -110,7 +107,7 @@ impl Arbiter {
     pub async fn run(&self) -> Result<()> {
         info!("Arbiter starting");
 
-        let control_socket = control::arbiter_socket_path(&self.config.worker.runtime_dir);
+        let control_socket = control::arbiter_socket_path(&self.config.spider.runtime_dir);
         let (listener, socket_identity) = control::bind_unix_control_socket(&control_socket)
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -130,6 +127,66 @@ impl Arbiter {
         for account_id in &accounts {
             self.start_worker(account_id).await?;
         }
+
+        // Spawn the restart watcher: polls every 1s for crashed workers,
+        // restarts them with exponential backoff.
+        let restart_shutdown = self.shutdown.clone();
+        let restart_workers = self.workers.clone();
+        let restart_spawner = self.worker_spawner.clone();
+        let restart_config = self.config.clone();
+        let restart_db = self.database.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = restart_shutdown.notified() => break,
+                    _ = sleep(Duration::from_secs(1)) => {
+                        let mut workers = restart_workers.write().await;
+                        let mut to_restart = Vec::new();
+                        for (account, handle) in workers.iter_mut() {
+                            match handle.child.try_wait() {
+                                Ok(Some(status)) if !status.success() => {
+                                    warn!(account = %account, status = ?status, "worker exited; will restart");
+                                    to_restart.push((account.clone(), false));
+                                }
+                                Ok(Some(status)) if status.success() => {
+                                    info!(account = %account, "worker exited cleanly; removing");
+                                    to_restart.push((account.clone(), true));
+                                }
+                                _ => {}
+                            }
+                        }
+                        for (account, clean_exit) in to_restart {
+                            if clean_exit {
+                                workers.remove(&account);
+                                continue;
+                            }
+                            if let Some(mut handle) = workers.remove(&account) {
+                                let _ = handle.child.start_kill();
+                                let delay = backoff_delay(handle.restart_count);
+                                let new_handle = restart_spawner.spawn_worker(WorkerSpec {
+                                    account: account.clone(),
+                                    database: restart_db.clone(),
+                                    notification_config: restart_config.notification.clone().into(),
+                                    lock_config: restart_config.database.clone().into(),
+                                    queue_size: restart_config.spider.queue_size,
+                                    batch_size: restart_config.spider.batch_size,
+                                    buffer_dir: restart_config.spider.buffer_dir.clone(),
+                                    runtime_dir: restart_config.spider.runtime_dir.clone(),
+                                    websocket_url: restart_config.spider.websocket_url.clone(),
+                                    reconnect_delay_ms: restart_config.spider.reconnect_delay_ms,
+                                });
+                                workers.insert(account, WorkerHandle {
+                                    child: new_handle.child,
+                                    restart_count: handle.restart_count + 1,
+                                    last_restart: Instant::now(),
+                                });
+                                sleep(delay).await;
+                            }
+                        }
+                    }
+                }
+            }
+        });
 
         let shutdown = self.shutdown.clone();
         tokio::spawn(async move {
@@ -163,6 +220,21 @@ impl Arbiter {
         .await
     }
 
+    fn worker_spec(&self, account: String) -> WorkerSpec {
+        WorkerSpec {
+            account,
+            database: self.database.clone(),
+            notification_config: self.config.notification.clone().into(),
+            lock_config: self.config.database.clone().into(),
+            queue_size: self.config.spider.queue_size,
+            batch_size: self.config.spider.batch_size,
+            buffer_dir: self.config.spider.buffer_dir.clone(),
+            runtime_dir: self.config.spider.runtime_dir.clone(),
+            websocket_url: self.config.spider.websocket_url.clone(),
+            reconnect_delay_ms: self.config.spider.reconnect_delay_ms,
+        }
+    }
+
     pub async fn start_worker(&self, account_id: &str) -> Result<()> {
         let mut workers = self.workers.write().await;
         if workers.contains_key(account_id) {
@@ -170,42 +242,120 @@ impl Arbiter {
             return Ok(());
         }
 
-        let account = account_id.to_string();
-        let handle = self.worker_spawner.spawn_worker(WorkerSpec {
-            account,
-            database: self.database.clone(),
-            notification_config: self.config.notification.clone().into(),
-            lock_config: self.config.database.clone().into(),
-            queue_size: self.config.worker.queue_size,
-            batch_size: self.config.worker.batch_size,
-            buffer_dir: self.config.worker.buffer_dir.clone(),
-            runtime_dir: self.config.worker.runtime_dir.clone(),
-            websocket_url: self.config.worker.websocket_url.clone(),
-            reconnect_delay_ms: self.config.worker.reconnect_delay_ms,
-        });
+        let handle = self.worker_spawner.spawn_worker(self.worker_spec(account_id.to_string()));
 
         workers.insert(account_id.to_string(), handle);
         Ok(())
     }
 
+    const WORKER_STOP_TIMEOUT_SECS: u64 = 10;
+
     pub async fn stop_worker(&self, account_id: &str) -> Result<()> {
         let mut workers = self.workers.write().await;
-        if let Some(handle) = workers.remove(account_id) {
-            handle.shutdown.notify_waiters();
-            info!(account = account_id, "Worker stop requested");
-        } else {
+        let Some(mut handle) = workers.remove(account_id) else {
             warn!(account = account_id, "Worker not running");
+            return Ok(());
+        };
+
+        let socket_path = control::worker_socket_path(&self.config.spider.runtime_dir, account_id);
+
+        let graceful = async {
+            let command = serde_json::json!({
+                "action": "stop",
+                "account_user_id": account_id,
+            })
+            .to_string();
+            match tokio::net::UnixStream::connect(&socket_path).await {
+                Ok(mut stream) => {
+                    let _ = control::write_message(&mut stream, &command).await;
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(Self::WORKER_STOP_TIMEOUT_SECS),
+                        control::read_message(&mut stream),
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    warn!(account = account_id, error = %e, "worker control socket unavailable");
+                }
+            }
+        };
+
+        graceful.await;
+
+        match tokio::time::timeout(
+            Duration::from_secs(Self::WORKER_STOP_TIMEOUT_SECS),
+            handle.child.wait(),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {
+                info!(account = account_id, "worker stopped gracefully");
+            }
+            _ => {
+                warn!(account = account_id, "worker did not stop gracefully; sending SIGTERM");
+                let _ = handle.child.start_kill();
+                match tokio::time::timeout(Duration::from_secs(5), handle.child.wait()).await {
+                    Ok(Ok(_)) => info!(account = account_id, "worker killed"),
+                    _ => warn!(account = account_id, "worker may be a zombie"),
+                }
+            }
         }
+
         Ok(())
     }
 
     async fn stop_all_workers(&self) {
-        let mut workers = self.workers.write().await;
-        for (account_id, handle) in workers.drain() {
-            info!(account = %account_id, "Stopping worker");
-            handle.shutdown.notify_waiters();
+        let workers: HashMap<String, WorkerHandle> = {
+            let mut w = self.workers.write().await;
+            std::mem::take(&mut *w)
+        };
+
+        for (account_id, mut handle) in workers {
+            let socket_path =
+                control::worker_socket_path(&self.config.spider.runtime_dir, &account_id);
+
+            let graceful = async {
+                let command = serde_json::json!({
+                    "action": "stop",
+                    "account_user_id": account_id,
+                })
+                .to_string();
+                match tokio::net::UnixStream::connect(&socket_path).await {
+                    Ok(mut stream) => {
+                        let _ = control::write_message(&mut stream, &command).await;
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(Self::WORKER_STOP_TIMEOUT_SECS),
+                            control::read_message(&mut stream),
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        warn!(account = account_id, error = %e, "worker control socket unavailable");
+                    }
+                }
+            };
+
+            graceful.await;
+
+            match tokio::time::timeout(
+                Duration::from_secs(Self::WORKER_STOP_TIMEOUT_SECS),
+                handle.child.wait(),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    info!(account = %account_id, "worker stopped gracefully");
+                }
+                _ => {
+                    warn!(account = %account_id, "worker did not stop gracefully; sending SIGTERM");
+                    let _ = handle.child.start_kill();
+                    match tokio::time::timeout(Duration::from_secs(5), handle.child.wait()).await {
+                        Ok(Ok(_)) => info!(account = %account_id, "worker killed"),
+                        _ => warn!(account = %account_id, "worker may be a zombie"),
+                    }
+                }
+            }
         }
-        info!("All workers stopped");
     }
 
     async fn run_control_server(self, listener: UnixListener, shutdown: Arc<Notify>) -> Result<()> {
@@ -355,13 +505,20 @@ mod tests {
             notification: crate::config::NotificationConfig {
                 url: "postgres://localhost/lilium_test_notify".to_string(),
             },
-            worker: crate::config::WorkerConfig {
+            spider: crate::config::SpiderConfig {
                 queue_size: 100,
                 batch_size: 10,
                 buffer_dir: PathBuf::from("data/event/buffer"),
                 runtime_dir: PathBuf::from("runtime/spider"),
                 websocket_url: lilium_api_client::config::DZMM_SOCKETIO_URL.to_string(),
                 reconnect_delay_ms: 5_000,
+            },
+            processor: crate::config::ProcessorConfig {
+                polling_interval_secs: 5,
+                batch_size: 100,
+            },
+            cli: crate::config::CliConfig {
+                data_path: "./data".to_string(),
             },
         };
 
@@ -371,7 +528,11 @@ mod tests {
             .withf(|spec| spec.account == "test_user")
             .times(1)
             .returning(|_| WorkerHandle {
-                shutdown: Arc::new(Notify::new()),
+                child: tokio::process::Command::new("true")
+                    .spawn()
+                    .expect("spawn true"),
+                restart_count: 0,
+                last_restart: Instant::now(),
             });
 
         let arbiter = Arbiter::with_worker_spawner(
