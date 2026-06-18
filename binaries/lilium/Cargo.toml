@@ -13,7 +13,9 @@ lilium-models.workspace = true
 lilium-database.workspace = true
 lilium-services.workspace = true
 lilium-api-client.workspace = true
+lilium-core.workspace = true
 sea-orm.workspace = true
+sqlx.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -26,7 +28,10 @@ anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
 uuid.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
+mockall = "0.13"
 lilium-test-fixtures.workspace = true

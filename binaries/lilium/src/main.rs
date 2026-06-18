@@ -3,11 +3,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use lilium_database::Database;
 
+mod commands;
 mod config;
-mod explore;
-mod send_command;
-mod sync_members;
-mod sync_rooms;
 
 #[derive(Parser)]
 #[command(
@@ -26,17 +23,17 @@ enum Verb {
     #[command(name = "send-command")]
     SendCommand {
         #[command(subcommand)]
-        cmd: send_command::SendCommand,
+        cmd: commands::send_command::SendCommand,
     },
     /// Sync room member information from DZMM API to database
     #[command(name = "sync-members")]
-    SyncMembers(sync_members::SyncMembersArgs),
+    SyncMembers(commands::sync_members::SyncMembersArgs),
     /// Sync room list from DZMM API to database
     #[command(name = "sync-rooms")]
-    SyncRooms(sync_rooms::SyncRoomsArgs),
+    SyncRooms(commands::sync_rooms::SyncRoomsArgs),
     /// Fetch DZMM explore feed content (tweets, cards, galleries, etc.)
     #[command(name = "explore")]
-    Explore(explore::ExploreArgs),
+    Explore(commands::explore::ExploreArgs),
 }
 
 async fn async_main() -> Result<u8> {

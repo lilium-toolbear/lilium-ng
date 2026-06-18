@@ -9,10 +9,10 @@ use tokio::net::UnixListener;
 use tokio::sync::{Notify, RwLock};
 use tracing::{error, info, warn};
 
-use crate::config::Config;
-use crate::control::{
+use crate::commands::ws_client::control::{
     self, ControlAction, ControlCommand, ControlResponse, read_message, write_message,
 };
+use crate::config::Config;
 
 pub struct Arbiter {
     config: Config,
@@ -110,7 +110,7 @@ impl Arbiter {
     pub async fn run(&self) -> Result<()> {
         info!("Arbiter starting");
 
-        let control_socket = control::arbiter_socket_path(&self.config.worker.runtime_dir);
+        let control_socket = control::arbiter_socket_path(&self.config.spider.runtime_dir);
         let (listener, socket_identity) = control::bind_unix_control_socket(&control_socket)
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -176,12 +176,12 @@ impl Arbiter {
             database: self.database.clone(),
             notification_config: self.config.notification.clone().into(),
             lock_config: self.config.database.clone().into(),
-            queue_size: self.config.worker.queue_size,
-            batch_size: self.config.worker.batch_size,
-            buffer_dir: self.config.worker.buffer_dir.clone(),
-            runtime_dir: self.config.worker.runtime_dir.clone(),
-            websocket_url: self.config.worker.websocket_url.clone(),
-            reconnect_delay_ms: self.config.worker.reconnect_delay_ms,
+            queue_size: self.config.spider.queue_size,
+            batch_size: self.config.spider.batch_size,
+            buffer_dir: self.config.spider.buffer_dir.clone(),
+            runtime_dir: self.config.spider.runtime_dir.clone(),
+            websocket_url: self.config.spider.websocket_url.clone(),
+            reconnect_delay_ms: self.config.spider.reconnect_delay_ms,
         });
 
         workers.insert(account_id.to_string(), handle);
@@ -355,13 +355,20 @@ mod tests {
             notification: crate::config::NotificationConfig {
                 url: "postgres://localhost/lilium_test_notify".to_string(),
             },
-            worker: crate::config::WorkerConfig {
+            spider: crate::config::SpiderConfig {
                 queue_size: 100,
                 batch_size: 10,
                 buffer_dir: PathBuf::from("data/event/buffer"),
                 runtime_dir: PathBuf::from("runtime/spider"),
                 websocket_url: lilium_api_client::config::DZMM_SOCKETIO_URL.to_string(),
                 reconnect_delay_ms: 5_000,
+            },
+            processor: crate::config::ProcessorConfig {
+                polling_interval_secs: 5,
+                batch_size: 100,
+            },
+            cli: crate::config::CliConfig {
+                data_path: "./data".to_string(),
             },
         };
 
