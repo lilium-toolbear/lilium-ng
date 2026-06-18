@@ -16,10 +16,10 @@ use tokio::net::UnixListener;
 use tokio::sync::Notify;
 use tracing::{error, info, instrument, warn};
 
-use crate::control::{
+use crate::commands::ws_client::control::{
     self, ControlAction, ControlCommand, ControlResponse, read_message, write_message,
 };
-use crate::ingestion::{DiskSpillBuffer, EventIngestor, EventWriter};
+use crate::commands::ws_client::ingestion::{DiskSpillBuffer, EventIngestor, EventWriter};
 
 pub struct Worker {
     account_id: String,
