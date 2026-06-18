@@ -28,6 +28,9 @@ Python sources read (for logic consistency verification):
 - `/Users/bearice/Working/github/dzmm_archive/models/dzmm/tweet.py` — verified `from_api` datetime parsing, media normalization, field extraction
 - `/Users/bearice/Working/github/dzmm_archive/services/explore_content_service.py` — verified upsert pattern (`model_dump(exclude_unset=True)`)
 - `/Users/bearice/Working/github/dzmm_archive/core/explore.py` — verified `_prefetch_book_detail` caching pattern (`item["_detailed_book"]`)
+- `/Users/bearice/Working/github/dzmm_archive/core/user_sync.py` — verified `batch_fetch_and_update_public_users` uses `get_public_user_profile` API
+- `/Users/bearice/Working/github/dzmm_archive/core/sync.py` — verified `MemberSyncer` uses `batch_fetch_and_update_users` with room context
+- `/Users/bearice/Working/github/dzmm_archive/cli/sync_rooms.py` — verified poll mode: sync members + backfill history + reconnect for new rooms
 - `/Users/bearice/Working/github/dzmm_archive/services/room_member_service.py` — verified `batch_upsert_members` and `clear_room_members`
 
 Rust files changed:
@@ -40,7 +43,8 @@ Rust files changed:
 - `crates/lilium-models/src/dzmm/checkpoint.rs` — uses common helpers
 - `crates/lilium-models/src/dzmm/gallery.rs` — uses common helpers
 - `crates/lilium-services/src/room.rs` — delegates to `lilium_models::dzmm::parse_optional_datetime`
-- `crates/lilium-services/src/explore.rs` — fixed book details double-fetch with `book_details_cache`
+- `crates/lilium-services/src/user.rs` — added `batch_fetch_and_update_public_users` using `get_public_user_profile` API
+- `crates/lilium-services/src/explore.rs` — fixed book details double-fetch with `book_details_cache`; fixed user profile fetch to use `batch_fetch_and_update_public_users`
 - `crates/lilium-services/src/explore_content.rs` — documented upsert divergence
 - `binaries/lilium-cli/src/explore.rs` — `fetcher` declared as `mut`
 
@@ -48,7 +52,8 @@ Fixes applied:
 
 1. **Knowledge Duplication**: Extracted common JSON parsing helpers to `lilium-models/src/dzmm/mod.rs`
 2. **Accidental Complexity**: Fixed book details double-fetch by caching prefetched results in `ExploreFetcher.book_details_cache`
-3. **Logic Consistency**: Updated all Python parity source comments to current commit hash
+3. **API Mismatch**: Fixed explore user profile fetch to use `batch_fetch_and_update_public_users` (no room context) instead of `batch_get_user_info` (room-scoped)
+4. **Logic Consistency**: Updated all Python parity source comments to current commit
 
 Divergences documented:
 

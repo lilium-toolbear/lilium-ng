@@ -1,5 +1,5 @@
-// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 services/user_service.py
-// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 services/user_service.py
+// Python parity source: dzmm_archive@18fdefbc0b6979178d7f1eb4ce0624ec4a60a2f2 services/user_service.py
+// Python parity source: dzmm_archive@18fdefbc0b6979178d7f1eb4ce0624ec4a60a2f2 core/user_sync.py
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use lilium_api_client::http::DzmmApi;
@@ -697,6 +697,132 @@ where
         display_name: user.full_name,
         avatar_url: user.avatar_url,
     }))
+}
+
+/// Batch fetch and update public user profiles using `get_public_user_profile`.
+/// Mirrors Python `batch_fetch_and_update_public_users` in `core/user_sync.py`.
+///
+/// This path intentionally does not use `batch_get_user_info()` because that
+/// API is chatroom-scoped. For explore/tweet records without room context,
+/// we use the public profile API instead.
+#[instrument(level = "debug", skip(db, auth, user_ids), fields(user_count = user_ids.len(), cache_hours))]
+pub async fn batch_fetch_and_update_public_users<C>(
+    db: &C,
+    auth: &DzmmApi,
+    user_ids: &[String],
+    cache_hours: i64,
+) -> Result<BatchFetchUsersResult>
+where
+    C: ConnectionTrait,
+{
+    let mut seen = HashSet::new();
+    let mut unique_user_ids = Vec::new();
+    for user_id in user_ids {
+        if seen.insert(user_id.clone()) {
+            unique_user_ids.push(user_id.clone());
+        }
+    }
+
+    if unique_user_ids.is_empty() {
+        return Ok(BatchFetchUsersResult::default());
+    }
+
+    let mut existing_users = Vec::new();
+    for chunk in unique_user_ids.chunks(5000) {
+        existing_users.extend(get_by_ids(db, chunk).await?);
+    }
+    let existing_users_map: HashMap<String, User> = existing_users
+        .into_iter()
+        .map(|user| (user.user_id.clone(), user))
+        .collect();
+
+    let now = Utc::now();
+    let cache_cutoff = chrono::Duration::hours(cache_hours.max(1));
+    let users_to_fetch: Vec<String> = unique_user_ids
+        .into_iter()
+        .filter(|user_id| {
+            existing_users_map
+                .get(user_id)
+                .map(|existing| now - existing.updated_at > cache_cutoff)
+                .unwrap_or(true)
+        })
+        .collect();
+
+    if users_to_fetch.is_empty() {
+        tracing::debug!("All users have recent info, skipping public profile fetch");
+        return Ok(BatchFetchUsersResult::default());
+    }
+
+    tracing::info!(
+        "Fetching public profiles for {} users (out of {} total)",
+        users_to_fetch.len(),
+        user_ids.len()
+    );
+
+    let mut new_count = 0;
+    let mut updated_count = 0;
+
+    for user_id in users_to_fetch {
+        let user_data = match auth.get_public_user_profile(&user_id).await {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::warn!(user_id, "Failed to fetch public user profile: {e}");
+                continue;
+            }
+        };
+
+        let Some(api_user) = ApiUser::from_api(&user_data) else {
+            tracing::warn!(user_id, "Failed to parse public user profile");
+            continue;
+        };
+
+        let user_data = UpsertUserData {
+            user_id: api_user.user_id.clone(),
+            full_name: api_user.full_name.clone(),
+            avatar_url: api_user.avatar_url.clone(),
+            avatar_file: None,
+            bio: api_user.bio.clone(),
+            birthday: api_user.birthday.clone(),
+            birthday_public: api_user.birthday_public,
+            quirk: api_user.quirk.clone(),
+            is_bot: api_user.is_bot,
+            gender: api_user.gender.clone(),
+            metadata: api_user.metadata.clone(),
+            raw_data: api_user.raw_data.clone(),
+            last_seen: None,
+        };
+
+        let existing = get_by_id(db, &user_data.user_id).await?;
+        let is_new = existing.is_none();
+        upsert_user(db, &user_data).await?;
+        if is_new {
+            new_count += 1;
+            tracing::info!(
+                user_id,
+                "New public user discovered: {}",
+                api_user.full_name.as_deref().unwrap_or(&user_id)
+            );
+        } else {
+            updated_count += 1;
+            tracing::debug!(
+                user_id,
+                "Updated public user info: {}",
+                api_user.full_name.as_deref().unwrap_or(&user_id)
+            );
+        }
+    }
+
+    tracing::info!(
+        "Public profile fetch complete: {} new, {} updated",
+        new_count,
+        updated_count
+    );
+
+    Ok(BatchFetchUsersResult {
+        new_count,
+        updated_count,
+        avatar_downloads: Vec::new(), // Avatar downloads handled separately if needed
+    })
 }
 
 #[cfg(test)]
