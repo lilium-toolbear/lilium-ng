@@ -11,7 +11,7 @@ mod sync_rooms;
 
 #[derive(Parser)]
 #[command(
-    name = "lilium-cli",
+    name = "lilium",
     about = "Lilium administration CLI (port of dzmm_archive cli/*)",
     long_about = None
 )]
@@ -41,7 +41,7 @@ enum Verb {
 
 async fn async_main() -> Result<u8> {
     let config = config::Config::load()?;
-    tracing::info!("Starting lilium-cli");
+    tracing::info!("Starting lilium");
 
     let db = Database::create(config.database.clone().into()).await?;
 

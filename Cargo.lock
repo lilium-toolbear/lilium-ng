@@ -1850,28 +1850,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "lilium-api-client"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "chrono",
- "futures",
- "lilium-common",
- "lilium-models",
- "rand 0.10.1",
- "reqwest 0.13.4",
- "rust_socketio",
- "serde",
- "serde_json",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "lilium-cli"
+name = "lilium"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1893,6 +1872,27 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "lilium-api-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "chrono",
+ "futures",
+ "lilium-common",
+ "lilium-models",
+ "rand 0.10.1",
+ "reqwest 0.13.4",
+ "rust_socketio",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "url",
 ]
 
 [[package]]
