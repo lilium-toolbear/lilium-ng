@@ -4,10 +4,10 @@ use lilium_database::Database;
 use lilium_services::account;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::net::UnixListener;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::net::UnixListener;
 use tokio::process::Child;
 use tokio::sync::{Notify, RwLock};
 use tokio::time::sleep;
@@ -242,7 +242,9 @@ impl Arbiter {
             return Ok(());
         }
 
-        let handle = self.worker_spawner.spawn_worker(self.worker_spec(account_id.to_string()));
+        let handle = self
+            .worker_spawner
+            .spawn_worker(self.worker_spec(account_id.to_string()));
 
         workers.insert(account_id.to_string(), handle);
         Ok(())
@@ -292,7 +294,10 @@ impl Arbiter {
                 info!(account = account_id, "worker stopped gracefully");
             }
             _ => {
-                warn!(account = account_id, "worker did not stop gracefully; sending SIGTERM");
+                warn!(
+                    account = account_id,
+                    "worker did not stop gracefully; sending SIGTERM"
+                );
                 let _ = handle.child.start_kill();
                 match tokio::time::timeout(Duration::from_secs(5), handle.child.wait()).await {
                     Ok(Ok(_)) => info!(account = account_id, "worker killed"),

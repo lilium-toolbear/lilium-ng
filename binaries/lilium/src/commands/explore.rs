@@ -17,9 +17,6 @@ pub struct ExploreArgs {
     /// Maximum pages to fetch (default: unlimited until known content)
     #[arg(long = "max-pages")]
     pub max_pages: Option<u32>,
-    /// Data directory path (default: ./data or DATA_PATH env var)
-    #[arg(long = "data-path")]
-    pub data_path: Option<String>,
     /// Poll mode: run fetch every 5 minutes continuously
     #[arg(long)]
     pub poll: bool,
@@ -43,13 +40,11 @@ pub struct ExploreArgs {
 
 impl ExploreArgs {
     /// Execute the explore subcommand. Returns a process exit code.
-    pub async fn run(self, db: &Database) -> Result<u8> {
-        let data_path = PathBuf::from(
-            self.data_path
-                .clone()
-                .or_else(|| std::env::var("DATA_PATH").ok())
-                .unwrap_or_else(|| "./data".to_string()),
-        );
+    ///
+    /// `data_path` is the global data directory from `Config.cli.data_path`
+    /// (sourced from the `DATA_PATH` env var).
+    pub async fn run(self, db: &Database, data_path: &str) -> Result<u8> {
+        let data_path = PathBuf::from(data_path);
         std::fs::create_dir_all(&data_path).ok();
 
         // Python: --backfill store_false → backfill = not args.backfill.
