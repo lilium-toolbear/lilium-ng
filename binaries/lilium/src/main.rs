@@ -45,8 +45,8 @@ enum Verb {
     SyncRooms(commands::sync_rooms::SyncRoomsArgs),
 
     /// Fetch DZMM explore feed content
-    #[command(name = "explore")]
-    Explore(commands::explore::ExploreArgs),
+    #[command(name = "sync-explore")]
+    SyncExplore(commands::sync_explore::SyncExploreArgs),
 
     /// Generate shell completion scripts
     #[command(name = "completion")]
@@ -73,7 +73,7 @@ fn sentry_name(verb: &Verb) -> &'static str {
         Verb::SendCommand { .. }
         | Verb::SyncMembers(_)
         | Verb::SyncRooms(_)
-        | Verb::Explore(_)
+        | Verb::SyncExplore(_)
         | Verb::Completion { .. } => "lilium_cli",
     }
 }
@@ -114,7 +114,7 @@ async fn async_main() -> Result<u8> {
         Verb::SyncRooms(args) => {
             args.run(&db).await?;
         }
-        Verb::Explore(args) => {
+        Verb::SyncExplore(args) => {
             args.run(&db, &config.cli.data_path).await?;
         }
         Verb::Completion { .. } => unreachable!(),
