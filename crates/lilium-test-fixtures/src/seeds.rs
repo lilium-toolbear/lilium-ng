@@ -1,9 +1,11 @@
 // Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 tests/conftest.py
 
+use crate::test_uuid;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use lilium_models::dzmm::{account as dzmm_account, room as rooms, user as users};
 use sea_orm::{ConnectionTrait, EntityTrait, Set};
+use uuid::Uuid;
 
 #[derive(Copy, Clone, Debug)]
 struct UserSeed {
@@ -49,7 +51,7 @@ impl UserSeed {
 
 #[derive(Copy, Clone, Debug)]
 struct RoomSeed {
-    room_id: &'static str,
+    room_id: Uuid,
     title: &'static str,
     history_complete: bool,
     message_count: i32,
@@ -101,17 +103,19 @@ const WEBSOCKET_SERVICE_ACCOUNT_USER_IDS: &[&str] = &[
     "user_test_stale",
 ];
 
-const MESSAGE_SERVICE_TEST_ROOMS: &[RoomSeed] = &[RoomSeed {
-    room_id: "room1",
-    title: "Room 1",
-    history_complete: true,
-    message_count: 0,
-    deleted_count: 0,
-    recalled_count: 0,
-    edited_count: 0,
-    image_count: 0,
-    is_active: true,
-}];
+fn message_service_test_rooms() -> Vec<RoomSeed> {
+    vec![RoomSeed {
+        room_id: test_uuid("room1"),
+        title: "Room 1",
+        history_complete: true,
+        message_count: 0,
+        deleted_count: 0,
+        recalled_count: 0,
+        edited_count: 0,
+        image_count: 0,
+        is_active: true,
+    }]
+}
 
 pub async fn seed_shared_profile<C: ConnectionTrait>(db: &C) -> Result<()> {
     seed_users(db, DEFAULT_TEST_USERS).await
@@ -123,7 +127,7 @@ pub async fn seed_user_profile<C: ConnectionTrait>(db: &C) -> Result<()> {
 
 pub async fn seed_message_profile<C: ConnectionTrait>(db: &C) -> Result<()> {
     seed_users(db, MESSAGE_SERVICE_TEST_USERS).await?;
-    seed_rooms(db, MESSAGE_SERVICE_TEST_ROOMS).await
+    seed_rooms(db, &message_service_test_rooms()).await
 }
 
 pub async fn seed_websocket_profile<C: ConnectionTrait>(db: &C) -> Result<()> {
@@ -138,7 +142,7 @@ pub async fn seed_test_users<C: ConnectionTrait>(db: &C, user_ids: &[&str]) -> R
 
     let now = Utc::now();
     users::Entity::insert_many(user_ids.iter().map(|user_id| users::ActiveModel {
-        user_id: Set((*user_id).to_owned()),
+        user_id: Set(test_uuid(user_id)),
         full_name: Set(None),
         message_count: Set(0),
         deleted_count: Set(0),
@@ -161,7 +165,7 @@ async fn seed_users<C: ConnectionTrait>(db: &C, users_to_seed: &[UserSeed]) -> R
 
     let now = Utc::now();
     users::Entity::insert_many(users_to_seed.iter().map(|user| users::ActiveModel {
-        user_id: Set(user.user_id.to_owned()),
+        user_id: Set(test_uuid(user.user_id)),
         full_name: Set(user.full_name.map(str::to_owned)),
         message_count: Set(user.message_count),
         deleted_count: Set(user.deleted_count),
@@ -184,7 +188,7 @@ async fn seed_rooms<C: ConnectionTrait>(db: &C, rooms_to_seed: &[RoomSeed]) -> R
 
     let now = Utc::now();
     rooms::Entity::insert_many(rooms_to_seed.iter().map(|room| rooms::ActiveModel {
-        room_id: Set(room.room_id.to_owned()),
+        room_id: Set(room.room_id),
         title: Set(room.title.to_owned()),
         history_complete: Set(room.history_complete),
         message_count: Set(room.message_count),
@@ -211,7 +215,7 @@ async fn seed_dzmm_accounts<C: ConnectionTrait>(db: &C, user_ids: &[&str]) -> Re
 
     let now = Utc::now();
     dzmm_account::Entity::insert_many(user_ids.iter().map(|user_id| dzmm_account::ActiveModel {
-        user_id: Set((*user_id).to_owned()),
+        user_id: Set(test_uuid(user_id)),
         user_profile: Set(serde_json::json!({})),
         is_enabled: Set(true),
         created_at: Set(now),

@@ -15,6 +15,7 @@ use lilium_models::dzmm::room::Model as Room;
 use sea_orm::ConnectionTrait;
 use std::path::PathBuf;
 use tracing::instrument;
+use uuid::Uuid;
 
 /// Map an `anyhow` API error into a `LiliumError` service error.
 fn api_err<T>(result: AnyhowResult<T>) -> crate::Result<T> {
@@ -55,7 +56,7 @@ impl HistoryFetcher {
 
     /// Select an authenticated API client for a room from `room.account_ids`
     /// (first enabled account, else any). Mirrors Python `_get_auth_for_room`.
-    pub async fn auth_for_room<C>(db: &C, room_id: &str) -> crate::Result<DzmmApi>
+    pub async fn auth_for_room<C>(db: &C, room_id: Uuid) -> crate::Result<DzmmApi>
     where
         C: ConnectionTrait,
     {
@@ -73,18 +74,18 @@ impl HistoryFetcher {
             ));
         }
 
-        for acc_id in &account_ids {
-            if let Some(account) = account::get_account(db, acc_id).await?
+        for acc_uid in &account_ids {
+            if let Some(account) = account::get_account(db, *acc_uid).await?
                 && account.is_enabled
             {
                 return account::create_auth_client(account);
             }
         }
         // Fall back to any account with access.
-        if let Some(acc_id) = account_ids.first()
-            && let Some(account) = account::get_account(db, acc_id).await?
-        {
-            return account::create_auth_client(account);
+        for acc_uid in &account_ids {
+            if let Some(account) = account::get_account(db, *acc_uid).await? {
+                return account::create_auth_client(account);
+            }
         }
         Err(lilium_common::LiliumError::domain_service_with_code(
             "HISTORY_NO_ACCOUNT_ACCESS",
@@ -95,7 +96,7 @@ impl HistoryFetcher {
     /// Ensure a room record exists; fetch from API and upsert if missing.
     /// Mirrors Python `ensure_room_info`.
     #[instrument(level = "debug", skip(db), fields(room_id = %room_id))]
-    pub async fn ensure_room_info<C>(db: &C, room_id: &str) -> crate::Result<Option<Room>>
+    pub async fn ensure_room_info<C>(db: &C, room_id: Uuid) -> crate::Result<Option<Room>>
     where
         C: ConnectionTrait,
     {
@@ -103,7 +104,7 @@ impl HistoryFetcher {
             return Ok(Some(existing));
         }
         let api = Self::auth_for_room(db, room_id).await?;
-        let room_info = api_err(api.get_room_info(room_id).await)?;
+        let room_info = api_err(api.get_room_info(&room_id.to_string()).await)?;
         let Some(room_info) = room_info else {
             tracing::warn!(room_id = %room_id, "Could not fetch room info");
             return Ok(None);
@@ -122,7 +123,7 @@ impl HistoryFetcher {
             let rid = obj
                 .get("roomId")
                 .and_then(|v| v.as_str())
-                .unwrap_or(room_id)
+                .unwrap_or(&room_id.to_string())
                 .to_owned();
             obj.insert("chatroomId".to_string(), serde_json::json!(rid));
         }
@@ -135,7 +136,7 @@ impl HistoryFetcher {
     #[instrument(level = "debug", skip(db, messages), fields(room_id = %room_id, count = messages.len()))]
     pub async fn save_messages<C>(
         db: &C,
-        room_id: &str,
+        room_id: Uuid,
         messages: &[serde_json::Value],
     ) -> crate::Result<(usize, usize)>
     where
@@ -170,7 +171,7 @@ impl HistoryFetcher {
     /// and marking `history_complete` on completion. Mirrors Python
     /// `backfill_to_start`.
     #[instrument(level = "debug", skip(db), fields(room_id = %room_id))]
-    pub async fn backfill_to_start<C>(db: &C, room_id: &str) -> crate::Result<()>
+    pub async fn backfill_to_start<C>(db: &C, room_id: Uuid) -> crate::Result<()>
     where
         C: ConnectionTrait,
     {
@@ -204,8 +205,12 @@ impl HistoryFetcher {
             batch_count += 1;
             tracing::info!(room_id = %room_id, batch = batch_count, "Fetching batch");
             let messages = api_err(
-                api.fetch_room_messages(room_id, before.as_deref(), Some(fetcher.batch_size))
-                    .await,
+                api.fetch_room_messages(
+                    &room_id.to_string(),
+                    before.as_deref(),
+                    Some(fetcher.batch_size),
+                )
+                .await,
             )?;
             if messages.is_empty() {
                 tracing::info!(room_id = %room_id, "No more messages. Reached beginning.");
@@ -256,7 +261,7 @@ impl HistoryFetcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lilium_test_fixtures::FixtureProfile;
+    use lilium_test_fixtures::{FixtureProfile, test_uuid};
 
     #[tokio::test]
     async fn ensure_room_info_no_account_errors() {
@@ -265,7 +270,7 @@ mod tests {
             .expect("acquire room db");
         let db = test_db.database().orm();
         // Room doesn't exist and no accounts seeded → should error cleanly.
-        let err = HistoryFetcher::auth_for_room(db, "nonexistent-room").await;
+        let err = HistoryFetcher::auth_for_room(db, test_uuid("nonexistent-room")).await;
         assert!(err.is_err());
     }
 }

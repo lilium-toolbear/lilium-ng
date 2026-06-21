@@ -15,11 +15,12 @@ use sea_orm::{
 
 use lilium_common::error::LiliumError;
 use tracing::instrument;
+use uuid::Uuid;
 
 type WebsocketConnection = websocket_connections::Model;
 
-pub fn calculate_lock_id(account_user_id: &str) -> i64 {
-    let hash = Md5::digest(account_user_id.as_bytes());
+pub fn calculate_lock_id(account_user_id: Uuid) -> i64 {
+    let hash = Md5::digest(account_user_id.to_string().as_bytes());
     let mut first_eight = [0u8; 8];
     first_eight.copy_from_slice(&hash[..8]);
     let lock_id = u64::from_be_bytes(first_eight) & 0x7FFFFFFFFFFFFFFF;
@@ -76,7 +77,7 @@ async fn dedicated_query_bool(
 #[instrument(level = "debug" skip(conn), fields(user_id = %user_id))]
 pub async fn acquire_dedicated_connection_lock(
     conn: &mut DedicatedDbConnection,
-    user_id: &str,
+    user_id: Uuid,
 ) -> Result<i64> {
     let lock_id = calculate_lock_id(user_id);
     acquire_dedicated_connection_lock_inner(conn, lock_id, user_id).await
@@ -86,7 +87,7 @@ pub async fn acquire_dedicated_connection_lock(
 async fn acquire_dedicated_connection_lock_inner(
     conn: &mut DedicatedDbConnection,
     lock_id: i64,
-    user_id: &str,
+    user_id: Uuid,
 ) -> Result<i64> {
     let lock_acquired =
         dedicated_query_bool(conn, "SELECT pg_try_advisory_lock($1) AS value", lock_id).await?;
@@ -105,7 +106,7 @@ async fn acquire_dedicated_connection_lock_inner(
 #[instrument(level = "debug" skip(conn), fields(user_id = %user_id, has_expected_lock_id = expected_lock_id.is_some()))]
 pub async fn ensure_dedicated_connection_lock(
     conn: &mut DedicatedDbConnection,
-    user_id: &str,
+    user_id: Uuid,
     expected_lock_id: Option<i64>,
 ) -> Result<i64> {
     let lock_id = calculate_lock_id(user_id);
@@ -158,7 +159,7 @@ async fn current_dedicated_connection_holds_lock(
 async fn replace_dedicated_connection_record(
     conn: &mut DedicatedDbConnection,
     lock_id: i64,
-    user_id: &str,
+    user_id: Uuid,
 ) -> Result<()> {
     sqlx::query("DELETE FROM websocket_connections WHERE lock_id = $1")
         .bind(lock_id)
@@ -210,7 +211,7 @@ pub async fn update_dedicated_heartbeat(
 }
 
 #[instrument(level = "debug" skip(db), fields(user_id = %user_id))]
-pub async fn acquire_connection_lock(db: &impl ConnectionTrait, user_id: &str) -> Result<i64> {
+pub async fn acquire_connection_lock(db: &impl ConnectionTrait, user_id: Uuid) -> Result<i64> {
     let lock_id = calculate_lock_id(user_id);
     acquire_connection_lock_inner(db, lock_id, user_id).await
 }
@@ -219,7 +220,7 @@ pub async fn acquire_connection_lock(db: &impl ConnectionTrait, user_id: &str) -
 async fn acquire_connection_lock_inner(
     db: &impl ConnectionTrait,
     lock_id: i64,
-    user_id: &str,
+    user_id: Uuid,
 ) -> Result<i64> {
     let lock_acquired = query_bool(
         db,
@@ -244,7 +245,7 @@ async fn acquire_connection_lock_inner(
 async fn replace_connection_record(
     db: &impl ConnectionTrait,
     lock_id: i64,
-    user_id: &str,
+    user_id: Uuid,
 ) -> Result<()> {
     websocket_connections::Entity::delete_many()
         .filter(websocket_connections::Column::LockId.eq(lock_id))
@@ -254,7 +255,7 @@ async fn replace_connection_record(
     let now = Utc::now();
     websocket_connections::ActiveModel {
         lock_id: Set(lock_id),
-        account_user_id: Set(user_id.to_owned()),
+        account_user_id: Set(user_id),
         connected_at: Set(now),
         last_heartbeat: Set(now),
     }
@@ -266,7 +267,7 @@ async fn replace_connection_record(
 #[instrument(level = "debug" skip(db), fields(user_id = %user_id, has_expected_lock_id = expected_lock_id.is_some()))]
 pub async fn ensure_connection_lock(
     db: &impl ConnectionTrait,
-    user_id: &str,
+    user_id: Uuid,
     expected_lock_id: Option<i64>,
 ) -> Result<i64> {
     let lock_id = calculate_lock_id(user_id);
@@ -348,7 +349,7 @@ pub async fn update_heartbeat(db: &impl ConnectionTrait, lock_id: i64) -> Result
 #[instrument(level = "debug" skip(db), fields(account_user_id = ?account_user_id))]
 pub async fn get_active_connections(
     db: &impl ConnectionTrait,
-    account_user_id: Option<&str>,
+    account_user_id: Option<Uuid>,
 ) -> Result<Vec<WebsocketConnection>> {
     let lock_is_held = Expr::cust(
         r#"EXISTS(
@@ -376,7 +377,7 @@ pub async fn get_active_connections(
 #[instrument(level = "debug" skip(db), fields(account_user_id = %account_user_id))]
 pub async fn is_credential_in_use(
     db: &impl ConnectionTrait,
-    account_user_id: &str,
+    account_user_id: Uuid,
 ) -> Result<bool> {
     let lock_id = calculate_lock_id(account_user_id);
 
@@ -447,36 +448,38 @@ pub async fn cleanup_stale_connections(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lilium_test_fixtures::test_uuid;
 
     #[test]
     fn test_calculate_lock_id_is_deterministic() {
-        let id1 = calculate_lock_id("user_test_deterministic");
-        let id2 = calculate_lock_id("user_test_deterministic");
+        let id1 = calculate_lock_id(test_uuid("user_test_deterministic"));
+        let id2 = calculate_lock_id(test_uuid("user_test_deterministic"));
         assert_eq!(id1, id2);
     }
 
     #[test]
     fn test_calculate_lock_id_matches_python_md5_algorithm() {
-        let id = calculate_lock_id("f9791c4c-6103-4fbb-8910-c11ae47772b3");
+        let id =
+            calculate_lock_id(Uuid::parse_str("f9791c4c-6103-4fbb-8910-c11ae47772b3").unwrap());
         assert_eq!(id, 1746043848041696062);
     }
 
     #[test]
     fn test_calculate_lock_id_different_users_produce_different_ids() {
-        let id1 = calculate_lock_id("user_a");
-        let id2 = calculate_lock_id("user_b");
+        let id1 = calculate_lock_id(test_uuid("user_a"));
+        let id2 = calculate_lock_id(test_uuid("user_b"));
         assert_ne!(id1, id2);
     }
 
     #[test]
     fn test_calculate_lock_id_is_non_negative() {
-        let id = calculate_lock_id("user_any");
+        let id = calculate_lock_id(test_uuid("user_any"));
         assert!(id >= 0);
     }
 
     #[test]
     fn test_advisory_lock_parts_reconstruct_lock_id() {
-        let lock_id = calculate_lock_id("user_test_split");
+        let lock_id = calculate_lock_id(test_uuid("user_test_split"));
         let (classid, objid) = split_advisory_lock_id(lock_id);
         assert_eq!((classid << 32) | objid, lock_id);
     }
@@ -490,7 +493,7 @@ mod tests {
         .expect("init websocket db");
 
         lilium_database::transaction!(test_db.database(), |session| {
-            let lock_id = acquire_connection_lock(session, "user_test_acquire")
+            let lock_id = acquire_connection_lock(session, test_uuid("user_test_acquire"))
                 .await
                 .unwrap();
             assert!(lock_id >= 0);
@@ -509,7 +512,7 @@ mod tests {
         .expect("init websocket db");
 
         lilium_database::transaction!(test_db.database(), |session| {
-            let lock_id = acquire_connection_lock(session, "user_test_release")
+            let lock_id = acquire_connection_lock(session, test_uuid("user_test_release"))
                 .await
                 .unwrap();
             release_connection_lock(session, lock_id).await.unwrap();
@@ -528,7 +531,7 @@ mod tests {
         .expect("init websocket db");
 
         lilium_database::transaction!(test_db.database(), |session| {
-            let lock_id = acquire_connection_lock(session, "user_test_heartbeat")
+            let lock_id = acquire_connection_lock(session, test_uuid("user_test_heartbeat"))
                 .await
                 .unwrap();
             update_heartbeat(session, lock_id).await.unwrap();
@@ -551,19 +554,24 @@ mod tests {
                 .await
                 .expect("connect dedicated lock db");
 
-        let lock_id = acquire_dedicated_connection_lock(&mut lock_connection, "user_test_acquire")
-            .await
-            .expect("acquire dedicated lock");
-        ensure_dedicated_connection_lock(&mut lock_connection, "user_test_acquire", Some(lock_id))
-            .await
-            .expect("ensure dedicated lock");
+        let lock_id =
+            acquire_dedicated_connection_lock(&mut lock_connection, test_uuid("user_test_acquire"))
+                .await
+                .expect("acquire dedicated lock");
+        ensure_dedicated_connection_lock(
+            &mut lock_connection,
+            test_uuid("user_test_acquire"),
+            Some(lock_id),
+        )
+        .await
+        .expect("ensure dedicated lock");
         update_dedicated_heartbeat(&mut lock_connection, lock_id)
             .await
             .expect("update dedicated heartbeat");
 
         lilium_database::transaction!(test_db.database(), |session| {
             assert!(
-                is_credential_in_use(session, "user_test_acquire")
+                is_credential_in_use(session, test_uuid("user_test_acquire"))
                     .await
                     .unwrap()
             );
@@ -586,10 +594,10 @@ mod tests {
         .expect("init websocket db");
 
         lilium_database::transaction!(test_db.database(), |session| {
-            let lock1 = acquire_connection_lock(session, "user_test_active1")
+            let lock1 = acquire_connection_lock(session, test_uuid("user_test_active1"))
                 .await
                 .unwrap();
-            let lock2 = acquire_connection_lock(session, "user_test_active2")
+            let lock2 = acquire_connection_lock(session, test_uuid("user_test_active2"))
                 .await
                 .unwrap();
             let connections = get_active_connections(session, None).await.unwrap();
@@ -612,17 +620,20 @@ mod tests {
         .expect("init websocket db");
 
         lilium_database::transaction!(test_db.database(), |session| {
-            acquire_connection_lock(session, "user_test_filter1")
+            acquire_connection_lock(session, test_uuid("user_test_filter1"))
                 .await
                 .unwrap();
-            acquire_connection_lock(session, "user_test_filter2")
+            acquire_connection_lock(session, test_uuid("user_test_filter2"))
                 .await
                 .unwrap();
-            let connections = get_active_connections(session, Some("user_test_filter1"))
+            let connections = get_active_connections(session, Some(test_uuid("user_test_filter1")))
                 .await
                 .unwrap();
             assert_eq!(connections.len(), 1);
-            assert_eq!(connections[0].account_user_id, "user_test_filter1");
+            assert_eq!(
+                connections[0].account_user_id,
+                test_uuid("user_test_filter1")
+            );
             Ok(())
         })
         .await
@@ -639,15 +650,15 @@ mod tests {
 
         lilium_database::transaction!(test_db.database(), |session| {
             assert!(
-                !is_credential_in_use(session, "user_test_in_use")
+                !is_credential_in_use(session, test_uuid("user_test_in_use"))
                     .await
                     .unwrap()
             );
-            acquire_connection_lock(session, "user_test_in_use")
+            acquire_connection_lock(session, test_uuid("user_test_in_use"))
                 .await
                 .unwrap();
             assert!(
-                is_credential_in_use(session, "user_test_in_use")
+                is_credential_in_use(session, test_uuid("user_test_in_use"))
                     .await
                     .unwrap()
             );
@@ -667,7 +678,7 @@ mod tests {
 
         lilium_database::transaction!(test_db.database(), |session| {
             assert!(
-                !is_credential_in_use(session, "user_test_not_in_use")
+                !is_credential_in_use(session, test_uuid("user_test_not_in_use"))
                     .await
                     .unwrap()
             );
@@ -703,7 +714,7 @@ mod tests {
         .expect("init websocket db");
 
         lilium_database::transaction!(test_db.database(), |session| {
-            let _lock_id = acquire_connection_lock(session, "user_test_fresh")
+            let _lock_id = acquire_connection_lock(session, test_uuid("user_test_fresh"))
                 .await
                 .unwrap();
             let cleaned = cleanup_stale_connections(session, 60).await.unwrap();
@@ -716,8 +727,8 @@ mod tests {
 
     #[test]
     fn test_lock_id_calculation_is_deterministic() {
-        let id1 = calculate_lock_id("user_test_deterministic");
-        let id2 = calculate_lock_id("user_test_deterministic");
+        let id1 = calculate_lock_id(test_uuid("user_test_deterministic"));
+        let id2 = calculate_lock_id(test_uuid("user_test_deterministic"));
         assert_eq!(id1, id2);
     }
 
@@ -730,7 +741,7 @@ mod tests {
         .expect("init websocket db");
 
         lilium_database::transaction!(test_db.database(), |session| {
-            let _lock_id = acquire_connection_lock(session, "user_test_stale")
+            let _lock_id = acquire_connection_lock(session, test_uuid("user_test_stale"))
                 .await
                 .unwrap();
             assert!(_lock_id >= 0);

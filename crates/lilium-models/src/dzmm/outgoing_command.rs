@@ -11,7 +11,7 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
     pub created_at: DateTime<Utc>,
-    pub account_user_id: String,
+    pub account_user_id: Uuid,
     pub event: String,
     pub data: serde_json::Value,
     pub require_ack: bool,

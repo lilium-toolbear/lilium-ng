@@ -14,6 +14,7 @@ use sea_orm::ConnectionTrait;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tracing::instrument;
+use uuid::Uuid;
 
 /// Configuration for [`ExploreFetcher`]. Mirrors Python `ExploreFetchConfig`.
 #[derive(Debug, Clone)]
@@ -74,7 +75,7 @@ pub struct ExploreFetcher<'a> {
     data_path: PathBuf,
     /// Cache for prefetched book details (book_id -> detailed JSON).
     /// Mirrors Python's `item["_detailed_book"]` pattern.
-    book_details_cache: HashMap<String, serde_json::Value>,
+    book_details_cache: HashMap<Uuid, serde_json::Value>,
 }
 
 impl<'a> ExploreFetcher<'a> {
@@ -176,11 +177,11 @@ impl<'a> ExploreFetcher<'a> {
         db: &C,
         items: &[serde_json::Value],
         stats: &mut ExploreFetchStats,
-    ) -> crate::Result<(bool, Vec<String>)>
+    ) -> crate::Result<(bool, Vec<Uuid>)>
     where
         C: ConnectionTrait,
     {
-        let mut user_ids: Vec<String> = Vec::new();
+        let mut user_ids: Vec<Uuid> = Vec::new();
 
         if !self.backfill {
             self.prefetch_book_details(items, stats).await;
@@ -224,21 +225,23 @@ impl<'a> ExploreFetcher<'a> {
             return;
         }
         let payload = merge_item_payload(item);
-        let Some(book_id) = payload.get("id").and_then(|v| v.as_str()) else {
+        let Some(book_id_str) = payload.get("id").and_then(|v| v.as_str()) else {
             return;
         };
-        match self.auth.fetch_novel_book(book_id).await {
+        let Some(book_id) = Uuid::parse_str(book_id_str).ok() else {
+            return;
+        };
+        match self.auth.fetch_novel_book(book_id_str).await {
             Ok(detailed) if detailed.is_object() => {
                 // Cache the detailed book info for later use in save_content.
                 // Mirrors Python's `item["_detailed_book"] = detailed_book`.
-                self.book_details_cache
-                    .insert(book_id.to_string(), detailed);
-                tracing::debug!(book_id, "Prefetched book details");
+                self.book_details_cache.insert(book_id, detailed);
+                tracing::debug!(book_id = %book_id, "Prefetched book details");
             }
             Ok(_) => {}
             Err(e) => {
                 stats.errors += 1;
-                tracing::warn!(book_id, "Could not fetch novel details: {e}");
+                tracing::warn!(book_id = %book_id, "Could not fetch novel details: {e}");
             }
         }
     }
@@ -253,23 +256,56 @@ impl<'a> ExploreFetcher<'a> {
         C: ConnectionTrait,
     {
         let data = item.get("data").unwrap_or(&serde_json::Value::Null);
-        let Some(id) = data.get("id").and_then(|v| v.as_str()) else {
-            return Ok(false);
-        };
         let known = match content_type {
-            "tweet" => explore_content::get_tweet(db, id).await?.is_some(),
+            "tweet" => match data
+                .get("id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+            {
+                Some(id) => explore_content::get_tweet(db, id).await?.is_some(),
+                None => false,
+            },
             "card" | "gamefy" => match data.get("id").and_then(|v| v.as_i64()) {
                 Some(n) => explore_content::get_card(db, n as i32).await?.is_some(),
                 None => false,
             },
-            "gallery" => explore_content::get_gallery(db, id).await?.is_some(),
-            "checkpoint" => explore_content::get_checkpoint(db, id).await?.is_some(),
-            "book" => explore_content::get_book(db, id).await?.is_some(),
-            "chapter" => explore_content::get_chapter(db, id).await?.is_some(),
+            "gallery" => match data
+                .get("id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+            {
+                Some(id) => explore_content::get_gallery(db, id).await?.is_some(),
+                None => false,
+            },
+            "checkpoint" => match data
+                .get("id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+            {
+                Some(id) => explore_content::get_checkpoint(db, id).await?.is_some(),
+                None => false,
+            },
+            "book" => match data
+                .get("id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+            {
+                Some(id) => explore_content::get_book(db, id).await?.is_some(),
+                None => false,
+            },
+            "chapter" => match data
+                .get("id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+            {
+                Some(id) => explore_content::get_chapter(db, id).await?.is_some(),
+                None => false,
+            },
             _ => false,
         };
         if known {
-            tracing::info!("✓ Reached known {content_type} {id}, stopping fetch");
+            let id_display = data.get("id").map(|v| v.to_string()).unwrap_or_default();
+            tracing::info!("✓ Reached known {content_type} {id_display}, stopping fetch");
         }
         Ok(known)
     }
@@ -281,7 +317,7 @@ impl<'a> ExploreFetcher<'a> {
         item: &serde_json::Value,
         content_type: &str,
         stats: &mut ExploreFetchStats,
-    ) -> crate::Result<Option<String>>
+    ) -> crate::Result<Option<Uuid>>
     where
         C: ConnectionTrait,
     {
@@ -297,9 +333,9 @@ impl<'a> ExploreFetcher<'a> {
                     stats.errors += 1;
                     return Ok(None);
                 };
-                let id = tweet_model.tweet_id.clone();
-                let uid = tweet_model.user_id.clone();
-                let existed = explore_content::get_tweet(db, &id).await?.is_some();
+                let id = tweet_model.tweet_id;
+                let uid = tweet_model.user_id;
+                let existed = explore_content::get_tweet(db, id).await?.is_some();
                 let _ = explore_content::upsert_tweet(db, tweet_model).await?;
                 if existed {
                     stats.tweets_updated += 1;
@@ -314,7 +350,7 @@ impl<'a> ExploreFetcher<'a> {
                     stats.errors += 1;
                     return Ok(None);
                 };
-                let uid = card_model.user_id.clone();
+                let uid = card_model.user_id;
                 let _ = explore_content::upsert_card(db, card_model).await?;
                 stats.cards_saved += 1;
                 Ok(uid)
@@ -324,7 +360,7 @@ impl<'a> ExploreFetcher<'a> {
                     stats.errors += 1;
                     return Ok(None);
                 };
-                let uid = gallery_model.user_id.clone();
+                let uid = gallery_model.user_id;
                 let _ = explore_content::upsert_gallery(db, gallery_model).await?;
                 stats.galleries_saved += 1;
                 Ok(uid)
@@ -334,7 +370,7 @@ impl<'a> ExploreFetcher<'a> {
                     stats.errors += 1;
                     return Ok(None);
                 };
-                let uid = checkpoint_model.user_id.clone();
+                let uid = checkpoint_model.user_id;
                 let _ = explore_content::upsert_checkpoint(db, checkpoint_model).await?;
                 stats.checkpoints_saved += 1;
                 Ok(uid)
@@ -342,9 +378,14 @@ impl<'a> ExploreFetcher<'a> {
             "book" => {
                 // Merge detailed book info from cache if available.
                 // Mirrors Python's `item.get("_detailed_book")` pattern.
-                let book_id = payload.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                let book_payload = if let Some(detailed) = self.book_details_cache.remove(book_id) {
-                    merge_payloads(&payload, &detailed)
+                let book_id_str = payload.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let book_id_uuid = Uuid::parse_str(book_id_str).ok();
+                let book_payload = if let Some(book_uuid) = book_id_uuid {
+                    if let Some(detailed) = self.book_details_cache.remove(&book_uuid) {
+                        merge_payloads(&payload, &detailed)
+                    } else {
+                        payload.clone()
+                    }
                 } else {
                     payload.clone()
                 };
@@ -352,9 +393,9 @@ impl<'a> ExploreFetcher<'a> {
                     stats.errors += 1;
                     return Ok(None);
                 };
-                let uid = book_model.user_id.clone();
+                let uid = book_model.user_id;
                 let author = book_model.author.clone();
-                let book_id = book_model.book_id.clone();
+                let book_id = book_model.book_id;
                 let _ = explore_content::upsert_book(db, book_model).await?;
                 stats.books_saved += 1;
 
@@ -389,10 +430,7 @@ impl<'a> ExploreFetcher<'a> {
                     stats.errors += 1;
                     return Ok(None);
                 };
-                let uid = payload
-                    .get("user_id")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned);
+                let uid = chapter_model.user_id;
                 let _ = explore_content::upsert_chapter(db, chapter_model).await?;
                 stats.chapters_saved += 1;
                 Ok(uid)

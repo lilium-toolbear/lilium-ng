@@ -24,6 +24,7 @@ use tokio::sync::Semaphore;
 use tokio::time::{Duration as TokioDuration, sleep};
 use tracing::instrument;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 /// Service for downloading media.
 ///
@@ -42,7 +43,7 @@ pub struct MediaService {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaDownload {
-    pub message_id: String,
+    pub message_id: Uuid,
     pub sent_at: DateTime<Utc>,
     pub content_type: String,
     pub attachment_url: String,
@@ -52,7 +53,7 @@ pub struct MediaDownload {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MediaFileUpdate {
-    pub message_id: String,
+    pub message_id: Uuid,
     pub attachment_file: String,
     pub gps: Option<ImageGpsData>,
     pub metadata_patch: Option<serde_json::Value>,
@@ -68,7 +69,7 @@ pub struct ImageGpsData {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvatarFileUpdate {
-    pub user_id: String,
+    pub user_id: Uuid,
     pub avatar_file: String,
 }
 
@@ -107,8 +108,7 @@ impl MediaService {
 
         let semaphore = Arc::new(Semaphore::new(10));
         let mut failure_count: i64 = 0;
-        let mut handles: Vec<tokio::task::JoinHandle<(String, Result<MediaFileUpdate>)>> =
-            Vec::new();
+        let mut handles: Vec<tokio::task::JoinHandle<(Uuid, Result<MediaFileUpdate>)>> = Vec::new();
         let mut updates = Vec::new();
 
         for download in downloads.iter().cloned() {
@@ -164,12 +164,12 @@ impl MediaService {
         let mut failure_count = 0;
 
         for download in downloads {
-            match download_user_avatar(&self.data_path, &download.avatar_url, &download.user_id)
+            match download_user_avatar(&self.data_path, &download.avatar_url, download.user_id)
                 .await
             {
                 Ok(Some(avatar_file)) => {
                     updates.push(AvatarFileUpdate {
-                        user_id: download.user_id.clone(),
+                        user_id: download.user_id,
                         avatar_file: avatar_file.clone(),
                     });
                     info!(
@@ -199,7 +199,7 @@ impl MediaService {
 #[instrument(level = "debug" skip(db, message_ids), fields(message_count = message_ids.len()))]
 pub async fn collect_message_media_downloads<C>(
     db: &C,
-    message_ids: &[String],
+    message_ids: &[Uuid],
 ) -> Result<Vec<MediaDownload>>
 where
     C: ConnectionTrait,
@@ -209,7 +209,7 @@ where
     }
 
     let downloads = messages::Entity::find()
-        .filter(messages::Column::MessageId.is_in(message_ids.iter().cloned()))
+        .filter(messages::Column::MessageId.is_in(message_ids.iter().copied()))
         .all(db)
         .await?
         .into_iter()
@@ -246,7 +246,7 @@ where
                 attachment_file: Set(Some(update.attachment_file.clone())),
                 ..Default::default()
             })
-            .filter(messages::Column::MessageId.eq(update.message_id.clone()))
+            .filter(messages::Column::MessageId.eq(update.message_id))
             .exec(db)
             .await?;
         updated_count += result.rows_affected as i64;
@@ -258,14 +258,15 @@ where
                     Expr::cust("COALESCE(metadata, '{}'::jsonb)")
                         .concat(Expr::value(metadata_patch.clone()).cast_as(Alias::new("jsonb"))),
                 )
-                .filter(messages::Column::MessageId.eq(update.message_id.clone()))
+                .filter(messages::Column::MessageId.eq(update.message_id))
                 .exec(db)
                 .await?;
         }
 
         if let Some(gps) = &update.gps {
             image_gps::Entity::insert(image_gps::ActiveModel {
-                message_id: Set(update.message_id.clone()),
+                source_type: Set("message".to_string()),
+                source_id: Set(update.message_id),
                 latitude: Set(gps.latitude),
                 longitude: Set(gps.longitude),
                 altitude: Set(gps.altitude),
@@ -298,7 +299,7 @@ where
                 updated_at: Set(Utc::now()),
                 ..Default::default()
             })
-            .filter(users::Column::UserId.eq(update.user_id.clone()))
+            .filter(users::Column::UserId.eq(update.user_id))
             .exec(db)
             .await?;
         updated_count += result.rows_affected as i64;
@@ -435,7 +436,7 @@ pub fn content_type_ext(content_type: &str) -> &'static str {
 
 pub fn message_attachment_path(
     data_path: &Path,
-    message_id: &str,
+    message_id: Uuid,
     sent_at: DateTime<Utc>,
     ext: &str,
 ) -> PathBuf {
@@ -455,7 +456,7 @@ pub fn sticker_attachment_path(data_path: &Path, sticker_id: &str, ext: &str) ->
 
 pub fn avatar_attachment_path(
     data_path: &Path,
-    user_id: &str,
+    user_id: Uuid,
     avatar_id: &str,
     ext: &str,
 ) -> PathBuf {
@@ -501,7 +502,7 @@ pub fn extract_avatar_id(url: &str) -> Option<String> {
 pub async fn download_user_avatar(
     data_path: &Path,
     url: &str,
-    user_id: &str,
+    user_id: Uuid,
 ) -> Result<Option<String>> {
     let result: Result<Option<String>> = async {
         let download_url = match transform_avatar_url(url) {
@@ -583,7 +584,7 @@ fn media_attachment_path(data_path: &Path, download: &MediaDownload, ext: &str) 
 
     Ok(message_attachment_path(
         data_path,
-        &download.message_id,
+        download.message_id,
         download.sent_at,
         ext,
     ))
@@ -614,7 +615,7 @@ fn media_file_update(
     };
 
     MediaFileUpdate {
-        message_id: download.message_id.clone(),
+        message_id: download.message_id,
         attachment_file,
         gps,
         metadata_patch,
@@ -878,6 +879,7 @@ fn relative_data_path(data_path: &Path, file_path: &Path) -> Result<String> {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use lilium_test_fixtures::test_uuid;
 
     #[test]
     fn normalize_url_strips_whitespace_and_hidden_separators() {
@@ -898,10 +900,14 @@ mod tests {
     #[test]
     fn media_attachment_path_uses_date_partition() {
         let sent_at = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
-        let path = message_attachment_path(Path::new("/tmp/data"), "message-1", sent_at, "jpg");
+        let message_id = test_uuid("message-1");
+        let path = message_attachment_path(Path::new("/tmp/data"), message_id, sent_at, "jpg");
         assert_eq!(
             path,
-            Path::new("/tmp/data/attachments/messages/2026/01/02/message-1.jpg")
+            Path::new(&format!(
+                "/tmp/data/attachments/messages/2026/01/02/{}.jpg",
+                message_id
+            ))
         );
     }
 
@@ -918,7 +924,7 @@ mod tests {
     fn media_download_path_uses_sticker_identity_for_stickers() {
         let sent_at = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
         let download = MediaDownload {
-            message_id: "message-1".into(),
+            message_id: test_uuid("message-1"),
             sent_at,
             content_type: "sticker".into(),
             attachment_url: "https://example.com/sticker.webp".into(),
@@ -937,7 +943,7 @@ mod tests {
     fn media_download_path_keeps_message_partition_for_images() {
         let sent_at = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
         let download = MediaDownload {
-            message_id: "message-1".into(),
+            message_id: test_uuid("message-1"),
             sent_at,
             content_type: "image".into(),
             attachment_url: "https://example.com/image.jpg".into(),
@@ -948,16 +954,27 @@ mod tests {
         let path = media_attachment_path(Path::new("/tmp/data"), &download, "jpg").unwrap();
         assert_eq!(
             path,
-            Path::new("/tmp/data/attachments/messages/2026/01/02/message-1.jpg")
+            Path::new(&format!(
+                "/tmp/data/attachments/messages/2026/01/02/{}.jpg",
+                test_uuid("message-1")
+            ))
         );
     }
 
     #[test]
     fn avatar_path_keeps_avatar_history_identity() {
-        let path = avatar_attachment_path(Path::new("/tmp/data"), "user-1", "avatar-uuid", "png");
+        let path = avatar_attachment_path(
+            Path::new("/tmp/data"),
+            test_uuid("user-1"),
+            "avatar-uuid",
+            "png",
+        );
         assert_eq!(
             path,
-            Path::new("/tmp/data/attachments/avatars/user-1_avatar-uuid.png")
+            Path::new(&format!(
+                "/tmp/data/attachments/avatars/{}_avatar-uuid.png",
+                test_uuid("user-1")
+            ))
         );
     }
 
@@ -987,10 +1004,10 @@ mod tests {
         lilium_database::transaction!(test_db.database(), |session| {
             let sent_at = Utc.with_ymd_and_hms(2024, 1, 2, 3, 4, 5).unwrap();
             let message = lilium_models::dzmm::message::Message {
-                message_id: "sticker-message-1".into(),
-                room_id: "room-1".into(),
+                message_id: test_uuid("sticker-message-1"),
+                room_id: test_uuid("room-1"),
                 sent_at,
-                sent_by: "user-1".into(),
+                sent_by: test_uuid("user-1"),
                 content_type: "sticker".into(),
                 content_text: None,
                 attachment_url: Some("https://example.com/sticker.webp".into()),
@@ -1048,15 +1065,14 @@ mod tests {
 
         lilium_database::transaction!(test_db.database(), |session| {
             let sent_at = Utc.with_ymd_and_hms(2024, 1, 2, 3, 4, 5).unwrap();
-            for (message_id, content_type) in [
-                ("image-with-gps", "image"),
-                ("voice-with-duration", "voice"),
-            ] {
+            let image_id = test_uuid("image-with-gps");
+            let voice_id = test_uuid("voice-with-duration");
+            for (message_id, content_type) in [(image_id, "image"), (voice_id, "voice")] {
                 let message = lilium_models::dzmm::message::Message {
-                    message_id: message_id.into(),
-                    room_id: "room-1".into(),
+                    message_id,
+                    room_id: test_uuid("room-1"),
                     sent_at,
-                    sent_by: "user-1".into(),
+                    sent_by: test_uuid("user-1"),
                     content_type: content_type.into(),
                     content_text: None,
                     attachment_url: Some(format!("https://example.com/{message_id}")),
@@ -1086,7 +1102,7 @@ mod tests {
                 session,
                 &[
                     MediaFileUpdate {
-                        message_id: "image-with-gps".into(),
+                        message_id: image_id,
                         attachment_file: "attachments/messages/2024/01/02/image-with-gps.jpg"
                             .into(),
                         gps: Some(ImageGpsData {
@@ -1098,7 +1114,7 @@ mod tests {
                         metadata_patch: None,
                     },
                     MediaFileUpdate {
-                        message_id: "voice-with-duration".into(),
+                        message_id: voice_id,
                         attachment_file: "attachments/messages/2024/01/02/voice-with-duration.m4a"
                             .into(),
                         gps: None,
@@ -1109,7 +1125,9 @@ mod tests {
             .await
             .expect("persist media side effects");
 
-            let gps = image_gps::Entity::find_by_id("image-with-gps".to_owned())
+            let gps = image_gps::Entity::find()
+                .filter(image_gps::Column::SourceType.eq("message"))
+                .filter(image_gps::Column::SourceId.eq(image_id))
                 .one(session)
                 .await?
                 .expect("gps row");
@@ -1119,7 +1137,7 @@ mod tests {
             assert_eq!(gps.timestamp, Some(sent_at));
 
             let metadata_message = messages::Entity::find()
-                .filter(messages::Column::MessageId.eq("voice-with-duration"))
+                .filter(messages::Column::MessageId.eq(voice_id))
                 .one(session)
                 .await?
                 .expect("metadata row");

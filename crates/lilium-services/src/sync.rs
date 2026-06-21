@@ -9,6 +9,7 @@ use sea_orm::ConnectionTrait;
 use serde_json::Value;
 use std::time::Duration;
 use tracing::instrument;
+use uuid::Uuid;
 
 /// Map an `anyhow` API error into a `LiliumError` service error.
 fn api_err<T, E: std::fmt::Display>(result: std::result::Result<T, E>) -> crate::Result<T> {
@@ -31,11 +32,11 @@ pub struct RoomSyncStats {
 /// Mirrors Python `core.sync.RoomSyncer`.
 pub struct RoomSyncer<'a> {
     auth: &'a DzmmApi,
-    account_user_id: Option<&'a str>,
+    account_user_id: Option<Uuid>,
 }
 
 impl<'a> RoomSyncer<'a> {
-    pub fn new(auth: &'a DzmmApi, account_user_id: Option<&'a str>) -> Self {
+    pub fn new(auth: &'a DzmmApi, account_user_id: Option<Uuid>) -> Self {
         Self {
             auth,
             account_user_id,
@@ -57,15 +58,21 @@ impl<'a> RoomSyncer<'a> {
         }
         stats.user_chats = user_chats.clone();
 
-        let mut active_room_ids: Vec<String> = Vec::new();
+        let mut active_room_ids: Vec<Uuid> = Vec::new();
         for chat in &user_chats {
             let chat_data = chat.get("data").unwrap_or(&Value::Null);
-            let room_id = chat
+            let room_id_str = chat
                 .get("id")
                 .and_then(|v| v.as_str())
                 .or_else(|| chat_data.get("chatroomId").and_then(|v| v.as_str()));
-            let Some(room_id) = room_id else { continue };
-            active_room_ids.push(room_id.to_owned());
+            let Some(room_id_str) = room_id_str else {
+                continue;
+            };
+            let Ok(room_id) = Uuid::parse_str(room_id_str) else {
+                tracing::warn!(room_id = %room_id_str, "chat has non-UUID id, skipping");
+                continue;
+            };
+            active_room_ids.push(room_id);
 
             if !chat_data.is_object() {
                 tracing::warn!(room_id = %room_id, "chat has no 'data' object, skipping upsert");
@@ -99,7 +106,7 @@ impl<'a> RoomSyncer<'a> {
 #[derive(Debug, Clone)]
 pub struct MemberSyncConfig {
     /// Specific room to sync; `None` syncs all rooms visible to the account.
-    pub room_id: Option<String>,
+    pub room_id: Option<Uuid>,
     /// Force re-sync by clearing existing members first.
     pub force: bool,
     /// Delay between API calls when syncing all rooms.
@@ -148,7 +155,7 @@ impl<'a> MemberSyncer<'a> {
     {
         if let Some(room_id) = &self.config.room_id {
             let mut stats = MemberSyncStats::default();
-            self.sync_room_members(db, room_id, &mut stats).await?;
+            self.sync_room_members(db, *room_id, &mut stats).await?;
             Ok(stats)
         } else {
             self.sync_all_rooms(db).await
@@ -163,11 +170,17 @@ impl<'a> MemberSyncer<'a> {
         let user_chats = api_err(self.auth.fetch_user_chats().await)?;
         for chat in &user_chats {
             let chat_data = chat.get("data").unwrap_or(&Value::Null);
-            let room_id = chat
+            let room_id_str = chat
                 .get("id")
                 .and_then(|v| v.as_str())
                 .or_else(|| chat_data.get("chatroomId").and_then(|v| v.as_str()));
-            let Some(room_id) = room_id else { continue };
+            let Some(room_id_str) = room_id_str else {
+                continue;
+            };
+            let Ok(room_id) = Uuid::parse_str(room_id_str) else {
+                tracing::warn!(room_id = %room_id_str, "chat has non-UUID id, skipping member sync");
+                continue;
+            };
 
             self.sync_room_members(db, room_id, &mut stats).await?;
             tokio::time::sleep(self.config.rate_limit_delay).await;
@@ -178,7 +191,7 @@ impl<'a> MemberSyncer<'a> {
     async fn sync_room_members<C>(
         &self,
         db: &C,
-        room_id: &str,
+        room_id: Uuid,
         stats: &mut MemberSyncStats,
     ) -> crate::Result<()>
     where
@@ -188,7 +201,11 @@ impl<'a> MemberSyncer<'a> {
             room_member::clear_room_members(db, room_id).await?;
         }
 
-        let members = api_err(self.auth.fetch_all_room_members(room_id, Some(500)).await)?;
+        let members = api_err(
+            self.auth
+                .fetch_all_room_members(&room_id.to_string(), Some(500))
+                .await,
+        )?;
         let result = room_member::batch_upsert_members(db, room_id, &members).await?;
 
         stats.rooms_processed += 1;
@@ -198,10 +215,10 @@ impl<'a> MemberSyncer<'a> {
 
         // Fetch full profiles for newly-seen users (1-hour cache).
         if !result.new_user_ids.is_empty() {
-            let pairs: Vec<(String, String)> = result
+            let pairs: Vec<(Uuid, Uuid)> = result
                 .new_user_ids
                 .iter()
-                .map(|uid| (uid.clone(), room_id.to_owned()))
+                .map(|uid| (*uid, room_id))
                 .collect();
             let fetched =
                 api_err(user::batch_fetch_and_update_with_auth(db, self.auth, &pairs, 1).await)?;

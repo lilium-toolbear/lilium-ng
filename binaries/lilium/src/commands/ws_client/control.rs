@@ -1,12 +1,13 @@
 // Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 spider/ws_control.py
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 pub fn arbiter_socket_path(runtime_dir: &Path) -> PathBuf {
     runtime_dir.join("ws_arbiter.sock")
 }
 
-pub fn worker_socket_path(runtime_dir: &Path, account_user_id: &str) -> PathBuf {
+pub fn worker_socket_path(runtime_dir: &Path, account_user_id: &Uuid) -> PathBuf {
     runtime_dir.join(format!("ws_worker_{}.sock", account_user_id))
 }
 
@@ -250,13 +251,15 @@ mod tests {
     #[test]
     fn test_control_socket_paths_match_python_runtime_names() {
         let runtime_dir = Path::new("/tmp/lilium-ws");
+        let account_user_id =
+            Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").expect("valid uuid");
 
         assert_eq!(
             arbiter_socket_path(runtime_dir),
             PathBuf::from("/tmp/lilium-ws/ws_arbiter.sock")
         );
         assert_eq!(
-            worker_socket_path(runtime_dir, "550e8400-e29b-41d4-a716-446655440000"),
+            worker_socket_path(runtime_dir, &account_user_id),
             PathBuf::from("/tmp/lilium-ws/ws_worker_550e8400-e29b-41d4-a716-446655440000.sock")
         );
     }

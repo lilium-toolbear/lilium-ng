@@ -1,27 +1,28 @@
 use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-// Python parity source: dzmm_archive@18fdefbc0b6979178d7f1eb4ce0624ec4a60a2f2 models/dzmm/tweet.py
+// Python parity source: dzmm_archive@227bc1179 models/dzmm/tweet.py
 pub type Tweet = Model;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "tweets")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
-    pub tweet_id: String,
-    pub user_id: Option<String>,
+    pub tweet_id: Uuid,
+    pub user_id: Option<Uuid>,
     pub content: Option<String>,
     pub media_urls: Option<Vec<String>>,
     pub local_media_paths: Option<Vec<String>>,
     pub source: Option<String>,
     pub tweet_type: Option<String>,
-    pub parent_tweet_id: Option<String>,
-    pub reply_to_tweet_id: Option<String>,
+    pub parent_tweet_id: Option<Uuid>,
+    pub reply_to_tweet_id: Option<Uuid>,
     pub reply_to_username: Option<String>,
     pub is_edited: bool,
     pub edit_history: Option<serde_json::Value>,
-    pub post_id: Option<String>,
+    pub post_id: Option<Uuid>,
     pub draw_id: Option<String>,
     pub likes_count: i32,
     pub comments_count: i32,
@@ -41,7 +42,10 @@ impl Model {
     /// Create a Tweet from an explore-feed API dict. Mirrors Python
     /// `Tweet.from_api`. Requires `id` and `created_at`/`createdAt`.
     pub fn from_api(data: &serde_json::Value) -> Option<Self> {
-        let tweet_id = data.get("id")?.as_str()?.to_string();
+        let tweet_id = data
+            .get("id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok())?;
         let created_at_str = data
             .get("created_at")
             .and_then(|v| v.as_str())
@@ -76,12 +80,12 @@ impl Model {
                 .get("parent_tweet_id")
                 .and_then(|v| v.as_str())
                 .or_else(|| data.get("parentTweetId").and_then(|v| v.as_str()))
-                .map(str::to_owned),
+                .and_then(|s| Uuid::parse_str(s).ok()),
             reply_to_tweet_id: data
                 .get("reply_to_tweet_id")
                 .and_then(|v| v.as_str())
                 .or_else(|| data.get("replyToTweetId").and_then(|v| v.as_str()))
-                .map(str::to_owned),
+                .and_then(|s| Uuid::parse_str(s).ok()),
             reply_to_username: data
                 .get("reply_to_username")
                 .and_then(|v| v.as_str())
@@ -97,7 +101,7 @@ impl Model {
                 .and_then(|v| v.as_str())
                 .or_else(|| data.get("postId").and_then(|v| v.as_str()))
                 .or_else(|| data.get("chatroomId").and_then(|v| v.as_str()))
-                .map(str::to_owned),
+                .and_then(|s| Uuid::parse_str(s).ok()),
             draw_id: data
                 .get("draw_id")
                 .and_then(|v| v.as_str())
@@ -118,25 +122,22 @@ impl Model {
     }
 }
 
-fn extract_user_id(data: &serde_json::Value) -> Option<String> {
-    if let Some(v) = data.get("user_id").and_then(|v| v.as_str()) {
-        return Some(v.to_owned());
-    }
-    if let Some(v) = data.get("authorId").and_then(|v| v.as_str()) {
-        return Some(v.to_owned());
-    }
-    if let Some(v) = data.get("author_id").and_then(|v| v.as_str()) {
-        return Some(v.to_owned());
-    }
-    data.get("user")
-        .and_then(|v| v.get("id"))
+fn extract_user_id(data: &serde_json::Value) -> Option<Uuid> {
+    data.get("user_id")
         .and_then(|v| v.as_str())
+        .or_else(|| data.get("authorId").and_then(|v| v.as_str()))
+        .or_else(|| data.get("author_id").and_then(|v| v.as_str()))
+        .or_else(|| {
+            data.get("user")
+                .and_then(|v| v.get("id"))
+                .and_then(|v| v.as_str())
+        })
         .or_else(|| {
             data.get("author")
                 .and_then(|v| v.get("id"))
                 .and_then(|v| v.as_str())
         })
-        .map(str::to_owned)
+        .and_then(|s| Uuid::parse_str(s).ok())
 }
 
 fn normalize_media_urls(data: &serde_json::Value) -> Option<Vec<String>> {

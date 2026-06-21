@@ -13,17 +13,16 @@ use crate::Result;
 use lilium_models::dzmm::{book, card, chapter, checkpoint, gallery, tweet};
 use sea_orm::{ActiveModelTrait, ConnectionTrait, EntityTrait, Set};
 use tracing::instrument;
+use uuid::Uuid;
 
 // ---------------- tweet ----------------
 
 #[instrument(level = "debug", skip(db), fields(tweet_id = %tweet_id))]
-pub async fn get_tweet<C>(db: &C, tweet_id: &str) -> Result<Option<tweet::Model>>
+pub async fn get_tweet<C>(db: &C, tweet_id: Uuid) -> Result<Option<tweet::Model>>
 where
     C: ConnectionTrait,
 {
-    Ok(tweet::Entity::find_by_id(tweet_id.to_owned())
-        .one(db)
-        .await?)
+    Ok(tweet::Entity::find_by_id(tweet_id).one(db).await?)
 }
 
 /// Insert a new tweet. Mirrors Python `TweetService.create_tweet`.
@@ -43,7 +42,7 @@ pub async fn upsert_tweet<C>(db: &C, model: tweet::Model) -> Result<bool>
 where
     C: ConnectionTrait,
 {
-    if get_tweet(db, &model.tweet_id).await?.is_some() {
+    if get_tweet(db, model.tweet_id).await?.is_some() {
         let active: tweet::ActiveModel = model.into();
         active.reset_all().update(db).await?;
         Ok(false)
@@ -57,7 +56,7 @@ where
 #[instrument(level = "debug", skip(db, paths), fields(tweet_id = %tweet_id, path_count = paths.len()))]
 pub async fn set_tweet_local_media_paths<C>(
     db: &C,
-    tweet_id: &str,
+    tweet_id: Uuid,
     paths: Vec<String>,
 ) -> Result<()>
 where
@@ -105,13 +104,11 @@ where
 // ---------------- gallery ----------------
 
 #[instrument(level = "debug", skip(db), fields(gallery_id = %gallery_id))]
-pub async fn get_gallery<C>(db: &C, gallery_id: &str) -> Result<Option<gallery::Model>>
+pub async fn get_gallery<C>(db: &C, gallery_id: Uuid) -> Result<Option<gallery::Model>>
 where
     C: ConnectionTrait,
 {
-    Ok(gallery::Entity::find_by_id(gallery_id.to_owned())
-        .one(db)
-        .await?)
+    Ok(gallery::Entity::find_by_id(gallery_id).one(db).await?)
 }
 
 #[instrument(level = "debug", skip(db, model), fields(gallery_id = %model.gallery_id))]
@@ -119,7 +116,7 @@ pub async fn upsert_gallery<C>(db: &C, model: gallery::Model) -> Result<bool>
 where
     C: ConnectionTrait,
 {
-    if get_gallery(db, &model.gallery_id).await?.is_some() {
+    if get_gallery(db, model.gallery_id).await?.is_some() {
         let active: gallery::ActiveModel = model.into();
         active.reset_all().update(db).await?;
         Ok(false)
@@ -133,11 +130,11 @@ where
 // ---------------- checkpoint ----------------
 
 #[instrument(level = "debug", skip(db), fields(checkpoint_id = %checkpoint_id))]
-pub async fn get_checkpoint<C>(db: &C, checkpoint_id: &str) -> Result<Option<checkpoint::Model>>
+pub async fn get_checkpoint<C>(db: &C, checkpoint_id: Uuid) -> Result<Option<checkpoint::Model>>
 where
     C: ConnectionTrait,
 {
-    Ok(checkpoint::Entity::find_by_id(checkpoint_id.to_owned())
+    Ok(checkpoint::Entity::find_by_id(checkpoint_id)
         .one(db)
         .await?)
 }
@@ -147,7 +144,7 @@ pub async fn upsert_checkpoint<C>(db: &C, model: checkpoint::Model) -> Result<bo
 where
     C: ConnectionTrait,
 {
-    if get_checkpoint(db, &model.checkpoint_id).await?.is_some() {
+    if get_checkpoint(db, model.checkpoint_id).await?.is_some() {
         let active: checkpoint::ActiveModel = model.into();
         active.reset_all().update(db).await?;
         Ok(false)
@@ -161,11 +158,11 @@ where
 // ---------------- book ----------------
 
 #[instrument(level = "debug", skip(db), fields(book_id = %book_id))]
-pub async fn get_book<C>(db: &C, book_id: &str) -> Result<Option<book::Model>>
+pub async fn get_book<C>(db: &C, book_id: Uuid) -> Result<Option<book::Model>>
 where
     C: ConnectionTrait,
 {
-    Ok(book::Entity::find_by_id(book_id.to_owned()).one(db).await?)
+    Ok(book::Entity::find_by_id(book_id).one(db).await?)
 }
 
 #[instrument(level = "debug", skip(db, model), fields(book_id = %model.book_id))]
@@ -173,7 +170,7 @@ pub async fn upsert_book<C>(db: &C, model: book::Model) -> Result<bool>
 where
     C: ConnectionTrait,
 {
-    if get_book(db, &model.book_id).await?.is_some() {
+    if get_book(db, model.book_id).await?.is_some() {
         let active: book::ActiveModel = model.into();
         active.reset_all().update(db).await?;
         Ok(false)
@@ -187,13 +184,11 @@ where
 // ---------------- chapter ----------------
 
 #[instrument(level = "debug", skip(db), fields(chapter_id = %chapter_id))]
-pub async fn get_chapter<C>(db: &C, chapter_id: &str) -> Result<Option<chapter::Model>>
+pub async fn get_chapter<C>(db: &C, chapter_id: Uuid) -> Result<Option<chapter::Model>>
 where
     C: ConnectionTrait,
 {
-    Ok(chapter::Entity::find_by_id(chapter_id.to_owned())
-        .one(db)
-        .await?)
+    Ok(chapter::Entity::find_by_id(chapter_id).one(db).await?)
 }
 
 #[instrument(level = "debug", skip(db, model), fields(chapter_id = %model.chapter_id))]
@@ -201,7 +196,7 @@ pub async fn upsert_chapter<C>(db: &C, model: chapter::Model) -> Result<bool>
 where
     C: ConnectionTrait,
 {
-    if get_chapter(db, &model.chapter_id).await?.is_some() {
+    if get_chapter(db, model.chapter_id).await?.is_some() {
         let active: chapter::ActiveModel = model.into();
         active.reset_all().update(db).await?;
         Ok(false)
@@ -215,7 +210,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lilium_test_fixtures::FixtureProfile;
+    use lilium_test_fixtures::{FixtureProfile, test_uuid};
     use serde_json::json;
 
     #[tokio::test]
@@ -224,8 +219,9 @@ mod tests {
             .await
             .expect("acquire explore db");
         let db = test_db.database().orm();
+        let tweet_id = test_uuid("tw-1");
         let data = json!({
-            "id": "tw-1",
+            "id": tweet_id.to_string(),
             "created_at": "2024-11-16T04:27:00.123Z",
             "content": "hello",
             "userId": "u1",
@@ -235,7 +231,7 @@ mod tests {
         let created = upsert_tweet(db, tweet).await.expect("insert");
         assert!(created);
         let data2 = json!({
-            "id": "tw-1",
+            "id": tweet_id.to_string(),
             "created_at": "2024-11-16T04:27:00.123Z",
             "content": "updated",
             "userId": "u1",
@@ -244,7 +240,7 @@ mod tests {
         let tweet2 = tweet::Model::from_api(&data2).expect("parse");
         let created2 = upsert_tweet(db, tweet2).await.expect("update");
         assert!(!created2);
-        let row = get_tweet(db, "tw-1").await.unwrap().unwrap();
+        let row = get_tweet(db, tweet_id).await.unwrap().unwrap();
         assert_eq!(row.content.as_deref(), Some("updated"));
         assert_eq!(row.likes_count, 5);
     }
@@ -272,8 +268,10 @@ mod tests {
             .await
             .expect("acquire explore db");
         let db = test_db.database().orm();
+        let book_id = test_uuid("book-1");
+        let chap_id = test_uuid("chap-1");
         let book_data = json!({
-            "id": "book-1",
+            "id": book_id.to_string(),
             "title": "My Novel",
             "userId": "u-author",
             "createdAt": "2024-01-01T00:00:00Z",
@@ -282,17 +280,17 @@ mod tests {
         let book = book::Model::from_api(&book_data).expect("parse");
         assert!(upsert_book(db, book).await.unwrap());
         let chap_data = json!({
-            "id": "chap-1",
-            "bookId": "book-1",
+            "id": chap_id.to_string(),
+            "bookId": book_id.to_string(),
             "userId": "u-author",
             "title": "Chapter 1",
             "createdAt": "2024-01-02T00:00:00Z",
         });
         let chap = chapter::Model::from_api(&chap_data).expect("parse");
         assert!(upsert_chapter(db, chap).await.unwrap());
-        let row = get_book(db, "book-1").await.unwrap().unwrap();
+        let row = get_book(db, book_id).await.unwrap().unwrap();
         assert_eq!(row.title.as_deref(), Some("My Novel"));
-        let chap_row = get_chapter(db, "chap-1").await.unwrap().unwrap();
+        let chap_row = get_chapter(db, chap_id).await.unwrap().unwrap();
         assert_eq!(chap_row.title.as_deref(), Some("Chapter 1"));
     }
 }

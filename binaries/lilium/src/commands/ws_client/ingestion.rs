@@ -13,11 +13,12 @@ use lilium_common::LiliumError;
 use lilium_database::Database;
 use lilium_models::ingestion::EventEnvelope;
 use lilium_services::event::{self, WebSocketEventInsert};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpillRecord {
     pub schema_version: u32,
-    pub account_user_id: String,
+    pub account_user_id: Uuid,
     pub event_type: String,
     pub payload: serde_json::Value,
     pub received_at: DateTime<Utc>,
@@ -28,7 +29,7 @@ impl From<&EventEnvelope> for SpillRecord {
     fn from(e: &EventEnvelope) -> Self {
         Self {
             schema_version: 2,
-            account_user_id: e.account_user_id.clone(),
+            account_user_id: e.account_user_id,
             event_type: e.event_type.clone(),
             payload: e.payload.clone(),
             received_at: e.received_at,
@@ -40,7 +41,7 @@ impl From<&EventEnvelope> for SpillRecord {
 impl SpillRecord {
     pub fn to_event_envelope(&self) -> EventEnvelope {
         EventEnvelope {
-            account_user_id: self.account_user_id.clone(),
+            account_user_id: self.account_user_id,
             event_type: self.event_type.clone(),
             payload: self.payload.clone(),
             received_at: self.received_at,
@@ -155,7 +156,7 @@ impl DiskSpillBuffer {
 }
 
 pub struct EventIngestor {
-    account_user_id: String,
+    account_user_id: Uuid,
     queue: mpsc::Sender<EventEnvelope>,
     spill: DiskSpillBuffer,
     accepted_count: AtomicU64,
@@ -174,7 +175,7 @@ pub struct EventIngestorMetrics {
 
 impl EventIngestor {
     pub fn new(
-        account_user_id: String,
+        account_user_id: Uuid,
         max_queue_size: usize,
         spill: DiskSpillBuffer,
     ) -> (Self, mpsc::Receiver<EventEnvelope>) {
@@ -359,7 +360,7 @@ impl EventWriter {
         let insert_rows: Vec<WebSocketEventInsert> = events
             .iter()
             .map(|event| WebSocketEventInsert {
-                user_id: event.account_user_id.clone(),
+                user_id: event.account_user_id,
                 event: event.event_type.clone(),
                 data: event.payload.clone(),
                 timestamp: event.received_at,
@@ -415,11 +416,12 @@ impl EventWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lilium_test_fixtures::test_uuid;
     use tempfile::TempDir;
 
     fn make_event(i: i32) -> EventEnvelope {
         EventEnvelope {
-            account_user_id: "user_a".to_string(),
+            account_user_id: test_uuid("user_a"),
             event_type: "message:new".to_string(),
             payload: serde_json::json!({"i": i}),
             received_at: chrono::DateTime::parse_from_rfc3339("2026-04-30T01:01:00Z")
@@ -433,7 +435,7 @@ mod tests {
     async fn test_accept_event_enqueues_without_db() {
         let tmp = TempDir::new().unwrap();
         let spill = DiskSpillBuffer::new(tmp.path().join("ws_buffer_user_a.jsonl"));
-        let (ingestor, _rx) = EventIngestor::new("user_a".to_string(), 2, spill);
+        let (ingestor, _rx) = EventIngestor::new(test_uuid("user_a"), 2, spill);
 
         let accepted = ingestor.accept_event(make_event(1)).await;
         let metrics = ingestor.metrics();
@@ -447,7 +449,7 @@ mod tests {
     async fn test_accept_event_spills_when_queue_full() {
         let tmp = TempDir::new().unwrap();
         let spill = DiskSpillBuffer::new(tmp.path().join("ws_buffer_user_a.jsonl"));
-        let (ingestor, _rx) = EventIngestor::new("user_a".to_string(), 1, spill);
+        let (ingestor, _rx) = EventIngestor::new(test_uuid("user_a"), 1, spill);
 
         assert!(ingestor.accept_event(make_event(1)).await);
         assert!(!ingestor.accept_event(make_event(2)).await);
@@ -478,7 +480,11 @@ mod tests {
     async fn test_spill_buffer_rejects_legacy_records() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("ws_buffer_user_a.jsonl");
-        tokio::fs::write(&path, r#"{"schema_version":1,"account_user_id":"user_a","event_type":"test","payload":{},"received_at":"2026-01-01T00:00:00Z","source":"socket"}"#).await.unwrap();
+        let legacy = format!(
+            r#"{{"schema_version":1,"account_user_id":"{}","event_type":"test","payload":{{}},"received_at":"2026-01-01T00:00:00Z","source":"socket"}}"#,
+            test_uuid("user_a")
+        );
+        tokio::fs::write(&path, legacy).await.unwrap();
         let spill = DiskSpillBuffer::new(path);
 
         let result = spill.read_replay_batch(10).await;
@@ -516,7 +522,7 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let spill = DiskSpillBuffer::new(tmp.path().join("ws_buffer_user_a.jsonl"));
-        let (ingestor, rx) = EventIngestor::new("user_a".to_string(), 10, spill);
+        let (ingestor, rx) = EventIngestor::new(test_uuid("user_a"), 10, spill);
         let ingestor = Arc::new(ingestor);
 
         // Write events to disk
@@ -532,7 +538,7 @@ mod tests {
     async fn test_stop_accepting_sends_to_disk() {
         let tmp = TempDir::new().unwrap();
         let spill = DiskSpillBuffer::new(tmp.path().join("ws_buffer_user_a.jsonl"));
-        let (ingestor, _rx) = EventIngestor::new("user_a".to_string(), 10, spill);
+        let (ingestor, _rx) = EventIngestor::new(test_uuid("user_a"), 10, spill);
 
         ingestor.stop_accepting();
         assert!(!ingestor.metrics().is_accepting);

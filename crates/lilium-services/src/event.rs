@@ -12,13 +12,14 @@ use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
 };
 use tracing::instrument;
+use uuid::Uuid;
 
 type EventProcessorOffset = event_processor_offsets::Model;
 type WebSocketEvent = websocket_events::Model;
 
 #[derive(Debug, Clone)]
 pub struct WebSocketEventInsert {
-    pub user_id: String,
+    pub user_id: Uuid,
     pub event: String,
     pub data: serde_json::Value,
     pub timestamp: DateTime<Utc>,
@@ -27,7 +28,7 @@ pub struct WebSocketEventInsert {
 #[instrument(level = "debug" skip(db, data), fields(user_id = %user_id, event = %event, timestamp = %timestamp))]
 pub async fn insert_event(
     db: &impl ConnectionTrait,
-    user_id: &str,
+    user_id: Uuid,
     event: &str,
     data: serde_json::Value,
     timestamp: DateTime<Utc>,
@@ -35,7 +36,7 @@ pub async fn insert_event(
     let record = websocket_events::Entity::insert(websocket_events::ActiveModel {
         id: Default::default(),
         timestamp: Set(timestamp),
-        user_id: Set(user_id.to_owned()),
+        user_id: Set(user_id),
         event: Set(event.to_owned()),
         data: Set(data),
     })
@@ -72,7 +73,7 @@ pub async fn insert_events(
 pub async fn get_pending_events(
     db: &impl ConnectionTrait,
     limit: i64,
-    user_id: Option<&str>,
+    user_id: Option<Uuid>,
     event_type: Option<&str>,
 ) -> Result<Vec<WebSocketEvent>> {
     let mut query = websocket_events::Entity::find();
@@ -100,7 +101,7 @@ pub async fn get_events_after_offset(
     last_processed_id: i64,
     last_processed_timestamp: Option<DateTime<Utc>>,
     limit: i64,
-    user_id: Option<&str>,
+    user_id: Option<Uuid>,
     event_type: Option<&str>,
 ) -> Result<Vec<WebSocketEvent>> {
     let mut query = websocket_events::Entity::find();
@@ -210,7 +211,7 @@ pub async fn get_latest_event_cursor(
 #[instrument(level = "debug" skip(db), fields(user_id = ?user_id, event_type = ?event_type))]
 pub async fn get_latest_event(
     db: &impl ConnectionTrait,
-    user_id: Option<&str>,
+    user_id: Option<Uuid>,
     event_type: Option<&str>,
 ) -> Result<Option<WebSocketEvent>> {
     let mut query = websocket_events::Entity::find();
@@ -336,6 +337,7 @@ pub async fn delete_offset(db: &impl ConnectionTrait, processor_id: &str) -> Res
 mod tests {
     use super::*;
     use chrono::Utc;
+    use lilium_test_fixtures::test_uuid;
     use serde_json::json;
 
     fn unique_event_id() -> String {
@@ -355,11 +357,11 @@ mod tests {
         let db = test_db.database().orm();
 
         let now = Utc::now();
-        let user_id = unique_event_id();
-        insert_event(db, &user_id, "test", json!({"hello": "world"}), now)
+        let user_id = test_uuid("user_test_event");
+        insert_event(db, user_id, "test", json!({"hello": "world"}), now)
             .await
             .expect("insert event");
-        let events = get_pending_events(db, 10, Some(&user_id), Some("test"))
+        let events = get_pending_events(db, 10, Some(user_id), Some("test"))
             .await
             .expect("pending events");
         assert!(!events.is_empty());

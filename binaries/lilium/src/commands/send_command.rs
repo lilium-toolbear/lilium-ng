@@ -234,10 +234,12 @@ impl SendCommand {
             SendCommand::Send(a) => {
                 let data: Value = serde_json::from_str(&a.data)
                     .with_context(|| format!("Invalid JSON data: {}", a.data))?;
+                let account = Uuid::parse_str(&a.account)
+                    .with_context(|| format!("invalid account user id: {}", a.account))?;
                 send(
                     db,
                     notification_config,
-                    &a.account,
+                    account,
                     &a.event,
                     data,
                     !a.no_ack,
@@ -258,10 +260,12 @@ impl SendCommand {
                 Ok(0)
             }
             SendCommand::JoinRoom(a) => {
+                let account = Uuid::parse_str(&a.account)
+                    .with_context(|| format!("invalid account user id: {}", a.account))?;
                 send(
                     db,
                     notification_config,
-                    &a.account,
+                    account,
                     "message:join-room",
                     json!({"chatroomId": a.room_id}),
                     true,
@@ -272,10 +276,12 @@ impl SendCommand {
             }
             SendCommand::Heartbeat(a) => {
                 let ts = now_millis();
+                let account = Uuid::parse_str(&a.account)
+                    .with_context(|| format!("invalid account user id: {}", a.account))?;
                 send(
                     db,
                     notification_config,
-                    &a.account,
+                    account,
                     "heartbeat",
                     json!({"timestamp": ts}),
                     false,
@@ -285,10 +291,12 @@ impl SendCommand {
                 .await
             }
             SendCommand::Reconnect(a) => {
+                let account = Uuid::parse_str(&a.account)
+                    .with_context(|| format!("invalid account user id: {}", a.account))?;
                 send(
                     db,
                     notification_config,
-                    &a.account,
+                    account,
                     "system:reconnect",
                     json!({"reason": a.reason}),
                     false,
@@ -297,14 +305,25 @@ impl SendCommand {
                 )
                 .await
             }
-            SendCommand::ListPending(a) => list_pending(db, a.account, a.limit).await,
+            SendCommand::ListPending(a) => {
+                let account = match a.account {
+                    Some(s) => Some(
+                        Uuid::parse_str(&s)
+                            .with_context(|| format!("invalid account user id: {s}"))?,
+                    ),
+                    None => None,
+                };
+                list_pending(db, account, a.limit).await
+            }
             SendCommand::SendMessage(a) => {
+                let account = Uuid::parse_str(&a.account)
+                    .with_context(|| format!("invalid account user id: {}", a.account))?;
                 let message_id = Uuid::new_v4().to_string();
                 let sent_at = now_iso();
                 send(
                     db,
                     notification_config,
-                    &a.account,
+                    account,
                     "message:send",
                     json!({
                         "chatroomId": a.room,
@@ -322,12 +341,14 @@ impl SendCommand {
                 .await
             }
             SendCommand::SendReply(a) => {
+                let account = Uuid::parse_str(&a.account)
+                    .with_context(|| format!("invalid account user id: {}", a.account))?;
                 let new_message_id = Uuid::new_v4().to_string();
                 let sent_at = now_iso();
                 send(
                     db,
                     notification_config,
-                    &a.account,
+                    account,
                     "message:send",
                     json!({
                         "chatroomId": a.room,
@@ -353,10 +374,12 @@ impl SendCommand {
                 .await
             }
             SendCommand::LeaveRoom(a) => {
+                let account = Uuid::parse_str(&a.account)
+                    .with_context(|| format!("invalid account user id: {}", a.account))?;
                 send(
                     db,
                     notification_config,
-                    &a.account,
+                    account,
                     "message:leave-room",
                     json!({"chatroomId": a.room_id}),
                     true,
@@ -366,10 +389,12 @@ impl SendCommand {
                 .await
             }
             SendCommand::StartMatch(a) => {
+                let account = Uuid::parse_str(&a.account)
+                    .with_context(|| format!("invalid account user id: {}", a.account))?;
                 send(
                     db,
                     notification_config,
-                    &a.account,
+                    account,
                     "match:start",
                     json!({"type": a.match_type}),
                     false,
@@ -381,10 +406,12 @@ impl SendCommand {
                 Ok(0)
             }
             SendCommand::CancelMatch(a) => {
+                let account = Uuid::parse_str(&a.account)
+                    .with_context(|| format!("invalid account user id: {}", a.account))?;
                 send(
                     db,
                     notification_config,
-                    &a.account,
+                    account,
                     "match:cancel",
                     json!({}),
                     false,
@@ -396,10 +423,12 @@ impl SendCommand {
                 Ok(0)
             }
             SendCommand::FetchMatchLimit(a) => {
+                let account = Uuid::parse_str(&a.account)
+                    .with_context(|| format!("invalid account user id: {}", a.account))?;
                 send(
                     db,
                     notification_config,
-                    &a.account,
+                    account,
                     "match:fetch-limit",
                     json!({}),
                     false,
@@ -411,10 +440,12 @@ impl SendCommand {
                 Ok(0)
             }
             SendCommand::EditMessage(a) => {
+                let account = Uuid::parse_str(&a.account)
+                    .with_context(|| format!("invalid account user id: {}", a.account))?;
                 send(
                     db,
                     notification_config,
-                    &a.account,
+                    account,
                     "message:edit",
                     json!({
                         "chatroomId": a.room_id,
@@ -430,10 +461,12 @@ impl SendCommand {
                 .await
             }
             SendCommand::RecallMessage(a) => {
+                let account = Uuid::parse_str(&a.account)
+                    .with_context(|| format!("invalid account user id: {}", a.account))?;
                 send(
                     db,
                     notification_config,
-                    &a.account,
+                    account,
                     "message:recall",
                     json!({"chatroomId": a.room_id, "messageId": a.message_id}),
                     true,
@@ -443,10 +476,12 @@ impl SendCommand {
                 .await
             }
             SendCommand::DeleteMessage(a) => {
+                let account = Uuid::parse_str(&a.account)
+                    .with_context(|| format!("invalid account user id: {}", a.account))?;
                 send(
                     db,
                     notification_config,
-                    &a.account,
+                    account,
                     "message:delete",
                     json!({"chatroomId": a.room_id, "messageId": a.message_id}),
                     true,
@@ -456,10 +491,12 @@ impl SendCommand {
                 .await
             }
             SendCommand::MarkRead(a) => {
+                let account = Uuid::parse_str(&a.account)
+                    .with_context(|| format!("invalid account user id: {}", a.account))?;
                 send(
                     db,
                     notification_config,
-                    &a.account,
+                    account,
                     "message:read",
                     json!({"chatroomId": a.room_id, "messageId": a.message_id}),
                     true,
@@ -480,7 +517,7 @@ impl SendCommand {
 async fn send(
     db: &impl ConnectionTrait,
     notification_config: NotificationDatabaseConfig,
-    account: &str,
+    account: Uuid,
     event: &str,
     data: Value,
     require_ack: bool,
@@ -622,13 +659,13 @@ fn parse_notify_payload(payload: &str) -> Option<(i32, String)> {
 
 async fn list_pending(
     db: &impl ConnectionTrait,
-    account_filter: Option<String>,
+    account_filter: Option<Uuid>,
     limit: i64,
 ) -> Result<u8> {
     let mut query = outgoing_commands::Entity::find()
         .filter(outgoing_commands::Column::Status.eq(status::PENDING))
         .order_by_asc(outgoing_commands::Column::Id);
-    if let Some(account_id) = account_filter.as_deref() {
+    if let Some(account_id) = account_filter {
         query = query.filter(outgoing_commands::Column::AccountUserId.eq(account_id));
     }
     let commands = query.limit(limit as u64).all(db).await?;
@@ -667,7 +704,9 @@ async fn send_image(
         a.alt
     };
 
-    let api = get_api_client(db, &a.account).await?;
+    let account = Uuid::parse_str(&a.account)
+        .with_context(|| format!("invalid account user id: {}", a.account))?;
+    let api = get_api_client(db, account).await?;
     tracing::info!("Uploading image: {}", path.display());
     let image_url = api
         .upload_chat_image(&a.image_file)
@@ -680,7 +719,7 @@ async fn send_image(
     send(
         db,
         notification_config,
-        &a.account,
+        account,
         "message:send",
         json!({
             "chatroomId": a.room_id,
@@ -715,7 +754,9 @@ async fn send_voice(
     };
     tracing::info!("Detected duration: {:.2}s", duration);
 
-    let api = get_api_client(db, &a.account).await?;
+    let account = Uuid::parse_str(&a.account)
+        .with_context(|| format!("invalid account user id: {}", a.account))?;
+    let api = get_api_client(db, account).await?;
     tracing::info!("Uploading voice: {}", path.display());
     let result = api
         .upload_voice_message(&a.voice_file, Some(duration))
@@ -733,7 +774,7 @@ async fn send_voice(
     send(
         db,
         notification_config,
-        &a.account,
+        account,
         "message:send",
         json!({
             "chatroomId": a.room_id,
@@ -753,7 +794,7 @@ async fn send_voice(
 
 /// Build an authenticated DZMM API client for the given account.
 /// Mirrors Python `get_api_client`.
-async fn get_api_client(db: &impl ConnectionTrait, account_user_id: &str) -> Result<DzmmApi> {
+async fn get_api_client(db: &impl ConnectionTrait, account_user_id: Uuid) -> Result<DzmmApi> {
     let account = account::get_account(db, account_user_id)
         .await
         .context("fetch account")?
@@ -794,6 +835,7 @@ fn now_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lilium_test_fixtures::test_uuid;
 
     #[test]
     fn parse_notify_payload_decodes_id_and_status() {
@@ -813,7 +855,7 @@ mod tests {
         let make = |status_str: &str| outgoing_commands::Model {
             id: 1,
             created_at: chrono::Utc::now(),
-            account_user_id: "u".into(),
+            account_user_id: test_uuid("u"),
             event: "e".into(),
             data: json!({}),
             require_ack: true,

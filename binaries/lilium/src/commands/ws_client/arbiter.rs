@@ -11,6 +11,7 @@ use tokio::process::Child;
 use tokio::sync::{Notify, RwLock};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 use crate::commands::ws_client::control::{
     self, ControlAction, ControlCommand, ControlResponse, read_message, write_message,
@@ -20,7 +21,7 @@ use crate::config::Config;
 pub struct Arbiter {
     config: Config,
     database: Database,
-    workers: Arc<RwLock<HashMap<String, WorkerHandle>>>,
+    workers: Arc<RwLock<HashMap<Uuid, WorkerHandle>>>,
     worker_spawner: Arc<dyn WorkerSpawner>,
     shutdown: Arc<tokio::sync::Notify>,
 }
@@ -126,11 +127,11 @@ impl Arbiter {
                             match handle.child.try_wait() {
                                 Ok(Some(status)) if !status.success() => {
                                     warn!(account = %account, status = ?status, "worker exited; will restart");
-                                    to_restart.push((account.clone(), false));
+                                    to_restart.push((*account, false));
                                 }
                                 Ok(Some(status)) if status.success() => {
                                     info!(account = %account, "worker exited cleanly; removing");
-                                    to_restart.push((account.clone(), true));
+                                    to_restart.push((*account, true));
                                 }
                                 _ => {}
                             }
@@ -143,7 +144,7 @@ impl Arbiter {
                             if let Some(mut handle) = workers.remove(&account) {
                                 let _ = handle.child.start_kill();
                                 let delay = backoff_delay(handle.restart_count);
-                                let new_handle = restart_spawner.spawn_worker(account.clone());
+                                let new_handle = restart_spawner.spawn_worker(account.to_string());
                                 workers.insert(account, WorkerHandle {
                                     child: new_handle.child,
                                     restart_count: handle.restart_count + 1,
@@ -177,7 +178,7 @@ impl Arbiter {
         Ok(())
     }
 
-    async fn load_enabled_accounts(&self) -> Result<Vec<String>> {
+    async fn load_enabled_accounts(&self) -> Result<Vec<Uuid>> {
         lilium_database::transaction!(self.database, |session| {
             let accounts = account::list_accounts(session, true).await?;
             Ok(accounts
@@ -188,25 +189,25 @@ impl Arbiter {
         .await
     }
 
-    pub async fn start_worker(&self, account_id: &str) -> Result<()> {
+    pub async fn start_worker(&self, account_id: &Uuid) -> Result<()> {
         let mut workers = self.workers.write().await;
         if workers.contains_key(account_id) {
-            warn!(account = account_id, "Worker already running");
+            warn!(account = %account_id, "Worker already running");
             return Ok(());
         }
 
         let handle = self.worker_spawner.spawn_worker(account_id.to_string());
 
-        workers.insert(account_id.to_string(), handle);
+        workers.insert(*account_id, handle);
         Ok(())
     }
 
     const WORKER_STOP_TIMEOUT_SECS: u64 = 10;
 
-    pub async fn stop_worker(&self, account_id: &str) -> Result<()> {
+    pub async fn stop_worker(&self, account_id: &Uuid) -> Result<()> {
         let mut workers = self.workers.write().await;
         let Some(mut handle) = workers.remove(account_id) else {
-            warn!(account = account_id, "Worker not running");
+            warn!(account = %account_id, "Worker not running");
             return Ok(());
         };
 
@@ -228,7 +229,7 @@ impl Arbiter {
                     .await;
                 }
                 Err(e) => {
-                    warn!(account = account_id, error = %e, "worker control socket unavailable");
+                    warn!(account = %account_id, error = %e, "worker control socket unavailable");
                 }
             }
         };
@@ -242,17 +243,17 @@ impl Arbiter {
         .await
         {
             Ok(Ok(_)) => {
-                info!(account = account_id, "worker stopped gracefully");
+                info!(account = %account_id, "worker stopped gracefully");
             }
             _ => {
                 warn!(
-                    account = account_id,
+                    account = %account_id,
                     "worker did not stop gracefully; sending SIGTERM"
                 );
                 let _ = handle.child.start_kill();
                 match tokio::time::timeout(Duration::from_secs(5), handle.child.wait()).await {
-                    Ok(Ok(_)) => info!(account = account_id, "worker killed"),
-                    _ => warn!(account = account_id, "worker may be a zombie"),
+                    Ok(Ok(_)) => info!(account = %account_id, "worker killed"),
+                    _ => warn!(account = %account_id, "worker may be a zombie"),
                 }
             }
         }
@@ -261,7 +262,7 @@ impl Arbiter {
     }
 
     async fn stop_all_workers(&self) {
-        let workers: HashMap<String, WorkerHandle> = {
+        let workers: HashMap<Uuid, WorkerHandle> = {
             let mut w = self.workers.write().await;
             std::mem::take(&mut *w)
         };
@@ -286,7 +287,7 @@ impl Arbiter {
                         .await;
                     }
                     Err(e) => {
-                        warn!(account = account_id, error = %e, "worker control socket unavailable");
+                        warn!(account = %account_id, error = %e, "worker control socket unavailable");
                     }
                 }
             };
@@ -350,7 +351,7 @@ impl Arbiter {
         match command.action {
             ControlAction::Status => {
                 let workers = self.workers.read().await;
-                let accounts: Vec<String> = workers.keys().cloned().collect();
+                let accounts: Vec<String> = workers.keys().map(|id| id.to_string()).collect();
                 ControlResponse::success("arbiter status").with_data(serde_json::json!({
                     "worker_count": accounts.len(),
                     "worker_ids": accounts,
@@ -361,31 +362,31 @@ impl Arbiter {
                 Err(e) => ControlResponse::error(format!("{e}")),
             },
             ControlAction::Stop => {
-                let Some(account_user_id) = command.account_user_id.as_deref() else {
+                let Some(account_user_id) = parse_account_user_id(&command.account_user_id) else {
                     return ControlResponse::error("account_user_id is required for this action");
                 };
-                match self.stop_worker(account_user_id).await {
+                match self.stop_worker(&account_user_id).await {
                     Ok(()) => ControlResponse::success("worker stopped"),
                     Err(e) => ControlResponse::error(format!("{e}")),
                 }
             }
             ControlAction::Start => {
-                let Some(account_user_id) = command.account_user_id.as_deref() else {
+                let Some(account_user_id) = parse_account_user_id(&command.account_user_id) else {
                     return ControlResponse::error("account_user_id is required for this action");
                 };
-                match self.start_worker(account_user_id).await {
+                match self.start_worker(&account_user_id).await {
                     Ok(()) => ControlResponse::success("worker started"),
                     Err(e) => ControlResponse::error(format!("{e}")),
                 }
             }
             ControlAction::Reconnect | ControlAction::Reload | ControlAction::Restart => {
-                let Some(account_user_id) = command.account_user_id.as_deref() else {
+                let Some(account_user_id) = parse_account_user_id(&command.account_user_id) else {
                     return ControlResponse::error("account_user_id is required for this action");
                 };
-                if let Err(e) = self.stop_worker(account_user_id).await {
+                if let Err(e) = self.stop_worker(&account_user_id).await {
                     return ControlResponse::error(format!("{e}"));
                 }
-                match self.start_worker(account_user_id).await {
+                match self.start_worker(&account_user_id).await {
                     Ok(()) => ControlResponse::success("worker restarted"),
                     Err(e) => ControlResponse::error(format!("{e}")),
                 }
@@ -395,11 +396,11 @@ impl Arbiter {
 
     async fn rescan_workers(&self) -> Result<serde_json::Value> {
         let enabled_accounts = self.load_enabled_accounts().await?;
-        let enabled_set: std::collections::HashSet<String> =
-            enabled_accounts.iter().cloned().collect();
-        let current_accounts: Vec<String> = {
+        let enabled_set: std::collections::HashSet<Uuid> =
+            enabled_accounts.iter().copied().collect();
+        let current_accounts: Vec<Uuid> = {
             let workers = self.workers.read().await;
-            workers.keys().cloned().collect()
+            workers.keys().copied().collect()
         };
 
         for account_id in &enabled_accounts {
@@ -419,7 +420,7 @@ impl Arbiter {
         }
 
         Ok(serde_json::json!({
-            "enabled_accounts": enabled_accounts,
+            "enabled_accounts": enabled_accounts.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
         }))
     }
 
@@ -434,9 +435,18 @@ impl Arbiter {
     }
 }
 
+/// Parse the JSON control command's `account_user_id` (an `Option<String>`)
+/// into a `Uuid`, returning `None` if absent or malformed.
+fn parse_account_user_id(account_user_id: &Option<String>) -> Option<Uuid> {
+    account_user_id
+        .as_ref()
+        .and_then(|s| Uuid::parse_str(s).ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lilium_test_fixtures::test_uuid;
     use std::path::PathBuf;
 
     mockall::mock! {
@@ -480,9 +490,10 @@ mod tests {
         };
 
         let mut worker_spawner = MockWorkerSpawner::new();
+        let test_user = test_uuid("test_user");
         worker_spawner
             .expect_spawn_worker()
-            .withf(|account| account == "test_user")
+            .withf(move |account| account == &test_user.to_string())
             .times(1)
             .returning(|_| WorkerHandle {
                 child: tokio::process::Command::new("true")
@@ -496,10 +507,10 @@ mod tests {
             test_db.database().clone(),
             Arc::new(worker_spawner),
         );
-        arbiter.start_worker("test_user").await.unwrap();
-        assert!(arbiter.workers.read().await.contains_key("test_user"));
+        arbiter.start_worker(&test_user).await.unwrap();
+        assert!(arbiter.workers.read().await.contains_key(&test_user));
 
-        let _ = arbiter.stop_worker("test_user").await;
-        assert!(!arbiter.workers.read().await.contains_key("test_user"));
+        let _ = arbiter.stop_worker(&test_user).await;
+        assert!(!arbiter.workers.read().await.contains_key(&test_user));
     }
 }

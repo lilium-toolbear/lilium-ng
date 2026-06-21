@@ -1,8 +1,9 @@
 use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-// Python parity source: dzmm_archive@18fdefbc0b6979178d7f1eb4ce0624ec4a60a2f2 models/dzmm/card.py
+// Python parity source: dzmm_archive@227bc1179 models/dzmm/card.py
 pub type Card = Model;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
@@ -15,7 +16,7 @@ pub struct Model {
     pub original_filename: Option<String>,
     pub creator: Option<String>,
     pub creator_notes: Option<String>,
-    pub user_id: Option<String>,
+    pub user_id: Option<Uuid>,
     pub creator_full_name: Option<String>,
     pub creator_avatar_url: Option<String>,
     pub tags: Option<Vec<String>>,
@@ -69,7 +70,7 @@ impl Model {
             user_id: data
                 .get("userId")
                 .and_then(|v| v.as_str())
-                .map(str::to_owned),
+                .and_then(|s| Uuid::parse_str(s).ok()),
             creator_full_name: data
                 .get("creatorFullName")
                 .and_then(|v| v.as_str())

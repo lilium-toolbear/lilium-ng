@@ -21,6 +21,7 @@ reqwest.workspace = true
 kamadak-exif.workspace = true
 lofty.workspace = true
 md-5 = "0.10"
+uuid.workspace = true
 
 [dev-dependencies]
 lilium-test-fixtures.workspace = true

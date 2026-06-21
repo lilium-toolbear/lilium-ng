@@ -1,23 +1,26 @@
 use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 models/dzmm/room.py
+// Python parity source: dzmm_archive@227bc1179 models/dzmm/room.py
+// Parity note: `room_id`/`creator_id`/`account_ids` are UUID after the
+// room-chain migration (Python c4e5f6a7b8c9); `tags` stays text[].
 pub type Room = Model;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "rooms")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
-    pub room_id: String,
+    pub room_id: Uuid,
     pub title: String,
     pub chat_type: Option<String>,
     pub avatar_url: Option<String>,
     pub member_count: Option<i32>,
     pub tags: Option<Vec<String>>,
     pub is_public: Option<bool>,
-    pub creator_id: Option<String>,
-    pub account_ids: Vec<String>,
+    pub creator_id: Option<Uuid>,
+    pub account_ids: Vec<Uuid>,
     pub last_message_at: Option<DateTime<Utc>>,
     pub first_message_at: Option<DateTime<Utc>>,
     pub backfill_until: Option<DateTime<Utc>>,

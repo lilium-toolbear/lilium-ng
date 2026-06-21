@@ -12,6 +12,7 @@ use sea_orm::{
     QuerySelect, Select, Set,
 };
 use tracing::instrument;
+use uuid::Uuid;
 
 type MessageRow = messages::Model;
 
@@ -50,16 +51,22 @@ struct CountPairRow {
     count: i64,
 }
 
+#[derive(Debug, Clone, FromQueryResult)]
+struct RoomCountPairRow {
+    key: Uuid,
+    count: i64,
+}
+
 fn db_error(error: impl std::fmt::Display) -> LiliumError {
     LiliumError::database(error.to_string())
 }
 
 fn message_active_model(message: &Message) -> messages::ActiveModel {
     messages::ActiveModel {
-        message_id: Set(message.message_id.clone()),
-        room_id: Set(message.room_id.clone()),
+        message_id: Set(message.message_id),
+        room_id: Set(message.room_id),
         sent_at: Set(message.sent_at),
-        sent_by: Set(message.sent_by.clone()),
+        sent_by: Set(message.sent_by),
         content_type: Set(message.content_type.clone()),
         content_text: Set(message.content_text.clone()),
         attachment_url: Set(message.attachment_url.clone()),
@@ -73,11 +80,11 @@ fn message_active_model(message: &Message) -> messages::ActiveModel {
         updated_at: Set(message.updated_at),
         is_deleted: Set(message.is_deleted),
         deleted_at: Set(message.deleted_at),
-        deleted_by: Set(message.deleted_by.clone()),
+        deleted_by: Set(message.deleted_by),
         is_recalled: Set(message.is_recalled),
         is_edited: Set(message.is_edited),
         history: Set(message.history.clone()),
-        reference_message_id: Set(message.reference_message_id.clone()),
+        reference_message_id: Set(message.reference_message_id),
         reference_data: Set(message.reference_data.clone()),
     }
 }
@@ -142,7 +149,7 @@ fn before_anchor_condition(anchor: &EnrichedMessage) -> Condition {
         .add(
             Condition::all()
                 .add(messages::Column::SentAt.eq(anchor.sent_at))
-                .add(messages::Column::MessageId.lt(anchor.message_id.clone())),
+                .add(messages::Column::MessageId.lt(anchor.message_id)),
         )
 }
 
@@ -152,7 +159,7 @@ fn after_anchor_condition(anchor: &EnrichedMessage) -> Condition {
         .add(
             Condition::all()
                 .add(messages::Column::SentAt.eq(anchor.sent_at))
-                .add(messages::Column::MessageId.gt(anchor.message_id.clone())),
+                .add(messages::Column::MessageId.gt(anchor.message_id)),
         )
 }
 
@@ -177,11 +184,16 @@ fn join_message_rooms(query: Select<messages::Entity>) -> Select<messages::Entit
 }
 
 fn join_message_gps(query: Select<messages::Entity>) -> Select<messages::Entity> {
+    // image_gps now has a composite (source_type, source_id) PK; a message's GPS
+    // row is the one with source_type = 'message' and source_id = message_id.
     query.join(
         JoinType::InnerJoin,
         messages::Entity::belongs_to(image_gps::Entity)
             .from(messages::Column::MessageId)
-            .to(image_gps::Column::MessageId)
+            .to(image_gps::Column::SourceId)
+            .on_condition(|_from, _to| {
+                Condition::all().add(image_gps::Column::SourceType.eq("message"))
+            })
             .into(),
     )
 }
@@ -210,7 +222,7 @@ fn two_part_cursor_condition(
     sort_column: messages::Column,
     reverse: bool,
     value: DateTime<Utc>,
-    message_id: String,
+    message_id: Uuid,
 ) -> Condition {
     if reverse {
         Condition::any().add(sort_column.gt(value)).add(
@@ -231,7 +243,7 @@ fn three_part_cursor_condition(
     reverse: bool,
     sent_at: DateTime<Utc>,
     created_at: DateTime<Utc>,
-    message_id: String,
+    message_id: Uuid,
 ) -> Condition {
     if reverse {
         Condition::any()
@@ -310,39 +322,37 @@ fn build_query_parts(filters: &MessageFilters, include_visible_only: bool) -> Qu
         }};
     }
 
-    if let Some(ref v) = filters.room_id {
-        add_condition!(messages::Column::RoomId.eq(v.clone()));
+    if let Some(v) = filters.room_id {
+        add_condition!(messages::Column::RoomId.eq(v));
     }
 
     if let Some(ref ids) = filters.room_ids
         && !ids.is_empty()
     {
-        add_condition!(messages::Column::RoomId.is_in(ids.iter().cloned()));
+        add_condition!(messages::Column::RoomId.is_in(ids.iter().copied()));
     }
 
     if let Some(ref v) = filters.account_id {
         p.join_rooms = true;
         add_condition!(Expr::cust_with_values(
-            r#""rooms"."account_ids" @> ARRAY[$1]::varchar[]"#,
-            [v.as_str()],
+            r#""rooms"."account_ids" @> ARRAY[$1]::uuid[]"#,
+            [v.to_string()],
         ));
     } else if filters.user_or_account_id.is_some() {
         let Some(id) = filters.user_or_account_id.as_ref() else {
             unreachable!("checked is_some above")
         };
         p.join_rooms = true;
-        add_condition!(
-            Condition::any()
-                .add(messages::Column::SentBy.eq(id.clone()))
-                .add(Expr::cust_with_values(
-                    r#""rooms"."account_ids" @> ARRAY[$1]::varchar[]"#,
-                    [id.as_str()],
-                ))
-        );
+        add_condition!(Condition::any().add(messages::Column::SentBy.eq(*id)).add(
+            Expr::cust_with_values(
+                r#""rooms"."account_ids" @> ARRAY[$1]::uuid[]"#,
+                [id.to_string()],
+            )
+        ));
     }
 
     if let Some(ref v) = filters.user_id {
-        add_condition!(messages::Column::SentBy.eq(v.clone()));
+        add_condition!(messages::Column::SentBy.eq(*v));
     }
 
     if let Some(ref types) = filters.content_types
@@ -374,7 +384,9 @@ fn build_query_parts(filters: &MessageFilters, include_visible_only: bool) -> Qu
     if let Some(ref q) = filters.search_query {
         let is_uuid = q.contains('-') && q.len() >= 36 && q.matches('-').count() >= 4;
         if is_uuid {
-            add_condition!(messages::Column::MessageId.eq(q.clone()));
+            if let Ok(uuid) = Uuid::parse_str(q.as_str()) {
+                add_condition!(messages::Column::MessageId.eq(uuid));
+            }
         } else {
             // `content_tsv` is a DB-maintained search vector intentionally
             // omitted from `lilium_models::dzmm::message::Model`.
@@ -455,7 +467,7 @@ async fn insert_message_if_missing<C: ConnectionTrait>(
     Ok(result > 0)
 }
 
-async fn set_message_recalled<C: ConnectionTrait>(db: &C, message_id: &str) -> crate::Result<()> {
+async fn set_message_recalled<C: ConnectionTrait>(db: &C, message_id: Uuid) -> crate::Result<()> {
     let now = Utc::now();
     let active = messages::ActiveModel {
         is_recalled: Set(true),
@@ -473,7 +485,7 @@ async fn set_message_recalled<C: ConnectionTrait>(db: &C, message_id: &str) -> c
 
 async fn update_message_content<C: ConnectionTrait>(
     db: &C,
-    message_id: &str,
+    message_id: Uuid,
     text: &str,
 ) -> crate::Result<()> {
     messages::Entity::update_many()
@@ -495,11 +507,11 @@ async fn update_message_content<C: ConnectionTrait>(
 
 #[derive(Debug, Clone, Default)]
 pub struct MessageFilters {
-    pub room_id: Option<String>,
-    pub room_ids: Option<Vec<String>>,
-    pub account_id: Option<String>,
-    pub user_or_account_id: Option<String>,
-    pub user_id: Option<String>,
+    pub room_id: Option<Uuid>,
+    pub room_ids: Option<Vec<Uuid>>,
+    pub account_id: Option<Uuid>,
+    pub user_or_account_id: Option<Uuid>,
+    pub user_id: Option<Uuid>,
     pub content_types: Option<Vec<String>>,
     pub message_types: Option<Vec<String>>,
     pub search_query: Option<String>,
@@ -526,10 +538,10 @@ pub struct PaginationParams {
 
 #[derive(Debug, Clone, FromQueryResult, serde::Serialize, serde::Deserialize)]
 pub struct EnrichedMessage {
-    pub message_id: String,
-    pub room_id: String,
+    pub message_id: Uuid,
+    pub room_id: Uuid,
     pub sent_at: DateTime<Utc>,
-    pub sent_by: String,
+    pub sent_by: Uuid,
     pub content_type: String,
     pub content_text: Option<String>,
     pub attachment_url: Option<String>,
@@ -543,11 +555,11 @@ pub struct EnrichedMessage {
     pub updated_at: Option<DateTime<Utc>>,
     pub is_deleted: bool,
     pub deleted_at: Option<DateTime<Utc>>,
-    pub deleted_by: Option<String>,
+    pub deleted_by: Option<Uuid>,
     pub is_recalled: bool,
     pub is_edited: bool,
     pub history: Option<serde_json::Value>,
-    pub reference_message_id: Option<String>,
+    pub reference_message_id: Option<Uuid>,
     pub reference_data: Option<serde_json::Value>,
     pub user_display_name: Option<String>,
     pub user_avatar_url: Option<String>,
@@ -583,13 +595,13 @@ pub struct MessageStats {
     pub recalled: i64,
     pub edited: i64,
     pub by_content_type: HashMap<String, i64>,
-    pub by_room: Option<HashMap<String, i64>>,
+    pub by_room: Option<HashMap<Uuid, i64>>,
 }
 
 #[derive(Debug)]
 enum Cursor {
-    TwoPart(DateTime<Utc>, String),
-    ThreePart(DateTime<Utc>, DateTime<Utc>, String),
+    TwoPart(DateTime<Utc>, Uuid),
+    ThreePart(DateTime<Utc>, DateTime<Utc>, Uuid),
 }
 
 fn decode_cursor(cursor: &str) -> std::result::Result<Cursor, LiliumError> {
@@ -602,7 +614,13 @@ fn decode_cursor(cursor: &str) -> std::result::Result<Cursor, LiliumError> {
                     "Invalid cursor timestamp",
                 )
             })?;
-            Ok(Cursor::TwoPart(sent_at, parts[1].to_string()))
+            let message_id: Uuid = Uuid::parse_str(parts[1]).map_err(|_| {
+                LiliumError::domain_service_with_code(
+                    "MESSAGE_INVALID_CURSOR",
+                    "Invalid cursor message_id",
+                )
+            })?;
+            Ok(Cursor::TwoPart(sent_at, message_id))
         }
         3 => {
             let sent_at: DateTime<Utc> = parts[0].parse().map_err(|_| {
@@ -617,7 +635,13 @@ fn decode_cursor(cursor: &str) -> std::result::Result<Cursor, LiliumError> {
                     "Invalid cursor created_at",
                 )
             })?;
-            Ok(Cursor::ThreePart(sent_at, created_at, parts[2].to_string()))
+            let message_id: Uuid = Uuid::parse_str(parts[2]).map_err(|_| {
+                LiliumError::domain_service_with_code(
+                    "MESSAGE_INVALID_CURSOR",
+                    "Invalid cursor message_id",
+                )
+            })?;
+            Ok(Cursor::ThreePart(sent_at, created_at, message_id))
         }
         _ => Err(LiliumError::domain_service_with_code(
             "MESSAGE_INVALID_CURSOR",
@@ -626,14 +650,14 @@ fn decode_cursor(cursor: &str) -> std::result::Result<Cursor, LiliumError> {
     }
 }
 
-fn encode_cursor_two(sent_at: DateTime<Utc>, message_id: &str) -> String {
+fn encode_cursor_two(sent_at: DateTime<Utc>, message_id: Uuid) -> String {
     format!("{}|{}", sent_at.to_rfc3339(), message_id)
 }
 
 fn encode_cursor_three(
     sent_at: DateTime<Utc>,
     created_at: DateTime<Utc>,
-    message_id: &str,
+    message_id: Uuid,
 ) -> String {
     format!(
         "{}|{}|{}",
@@ -737,10 +761,10 @@ pub async fn get_messages<C: ConnectionTrait>(
             Some(encode_cursor_three(
                 last.sent_at,
                 last.created_at,
-                &last.message_id,
+                last.message_id,
             ))
         } else {
-            Some(encode_cursor_two(last.sent_at, &last.message_id))
+            Some(encode_cursor_two(last.sent_at, last.message_id))
         }
     } else {
         None
@@ -756,7 +780,7 @@ pub async fn get_messages<C: ConnectionTrait>(
 #[instrument(level = "debug" skip(db), fields(message_id = %message_id, enriched))]
 pub async fn get_by_id<C: ConnectionTrait>(
     db: &C,
-    message_id: &str,
+    message_id: Uuid,
     enriched: bool,
 ) -> crate::Result<Option<EnrichedMessage>> {
     enriched_message_query(enriched)
@@ -772,7 +796,7 @@ pub async fn get_by_id<C: ConnectionTrait>(
 #[instrument(level = "debug" skip(db), fields(message_id = %message_id, sent_at = %sent_at, enriched))]
 pub async fn get_by_id_at<C: ConnectionTrait>(
     db: &C,
-    message_id: &str,
+    message_id: Uuid,
     sent_at: DateTime<Utc>,
     enriched: bool,
 ) -> crate::Result<Option<EnrichedMessage>> {
@@ -788,7 +812,7 @@ pub async fn get_by_id_at<C: ConnectionTrait>(
 #[instrument(level = "debug" skip(db), fields(message_id = %message_id, before_count, after_count))]
 pub async fn get_context<C: ConnectionTrait>(
     db: &C,
-    message_id: &str,
+    message_id: Uuid,
     before_count: i64,
     after_count: i64,
 ) -> crate::Result<Option<MessageContextResult>> {
@@ -801,7 +825,7 @@ pub async fn get_context<C: ConnectionTrait>(
     let after_limit = after_count.min(50);
 
     let before = enriched_message_query(true)
-        .filter(messages::Column::RoomId.eq(anchor.room_id.clone()))
+        .filter(messages::Column::RoomId.eq(anchor.room_id))
         .filter(before_anchor_condition(&anchor))
         .order_by_desc(messages::Column::SentAt)
         .order_by_desc(messages::Column::MessageId)
@@ -812,7 +836,7 @@ pub async fn get_context<C: ConnectionTrait>(
         .map_err(db_error)?;
 
     let after = enriched_message_query(true)
-        .filter(messages::Column::RoomId.eq(anchor.room_id.clone()))
+        .filter(messages::Column::RoomId.eq(anchor.room_id))
         .filter(after_anchor_condition(&anchor))
         .order_by_asc(messages::Column::SentAt)
         .order_by_asc(messages::Column::MessageId)
@@ -822,7 +846,7 @@ pub async fn get_context<C: ConnectionTrait>(
         .await
         .map_err(db_error)?;
 
-    let anchor_enriched = get_by_id_at(db, &anchor.message_id, anchor.sent_at, true)
+    let anchor_enriched = get_by_id_at(db, anchor.message_id, anchor.sent_at, true)
         .await?
         .ok_or_else(|| LiliumError::database("anchor message disappeared during context fetch"))?;
     let before_count_actual = before.len() as i64;
@@ -845,7 +869,7 @@ pub async fn get_context<C: ConnectionTrait>(
 #[instrument(level = "debug" skip(db), fields(message_id = %message_id, count))]
 pub async fn get_before<C: ConnectionTrait>(
     db: &C,
-    message_id: &str,
+    message_id: Uuid,
     count: i64,
 ) -> crate::Result<Vec<EnrichedMessage>> {
     let target = get_by_id(db, message_id, false).await?;
@@ -857,7 +881,7 @@ pub async fn get_before<C: ConnectionTrait>(
     let limit = count.min(50);
 
     let mut messages = enriched_message_query(true)
-        .filter(messages::Column::RoomId.eq(target.room_id.clone()))
+        .filter(messages::Column::RoomId.eq(target.room_id))
         .filter(before_anchor_condition(&target))
         .order_by_desc(messages::Column::SentAt)
         .order_by_desc(messages::Column::MessageId)
@@ -874,7 +898,7 @@ pub async fn get_before<C: ConnectionTrait>(
 #[instrument(level = "debug" skip(db), fields(message_id = %message_id, count))]
 pub async fn get_after<C: ConnectionTrait>(
     db: &C,
-    message_id: &str,
+    message_id: Uuid,
     count: i64,
 ) -> crate::Result<Vec<EnrichedMessage>> {
     let target = get_by_id(db, message_id, false).await?;
@@ -886,7 +910,7 @@ pub async fn get_after<C: ConnectionTrait>(
     let limit = count.min(50);
 
     enriched_message_query(true)
-        .filter(messages::Column::RoomId.eq(target.room_id.clone()))
+        .filter(messages::Column::RoomId.eq(target.room_id))
         .filter(after_anchor_condition(&target))
         .order_by_asc(messages::Column::SentAt)
         .order_by_asc(messages::Column::MessageId)
@@ -910,12 +934,12 @@ pub async fn enrich_batch<C: ConnectionTrait>(
     for msg in messages {
         identity_condition = identity_condition.add(
             Condition::all()
-                .add(messages::Column::MessageId.eq(msg.message_id.clone()))
+                .add(messages::Column::MessageId.eq(msg.message_id))
                 .add(messages::Column::SentAt.eq(msg.sent_at)),
         );
     }
 
-    let enriched_by_id: HashMap<(String, DateTime<Utc>), EnrichedMessage> =
+    let enriched_by_id: HashMap<(Uuid, DateTime<Utc>), EnrichedMessage> =
         enriched_message_query(true)
             .filter(identity_condition)
             .into_model::<EnrichedMessage>()
@@ -923,16 +947,12 @@ pub async fn enrich_batch<C: ConnectionTrait>(
             .await
             .map_err(db_error)?
             .into_iter()
-            .map(|msg| ((msg.message_id.clone(), msg.sent_at), msg))
+            .map(|msg| ((msg.message_id, msg.sent_at), msg))
             .collect();
 
     let enriched = messages
         .iter()
-        .filter_map(|msg| {
-            enriched_by_id
-                .get(&(msg.message_id.clone(), msg.sent_at))
-                .cloned()
-        })
+        .filter_map(|msg| enriched_by_id.get(&(msg.message_id, msg.sent_at)).cloned())
         .collect();
 
     Ok(enriched)
@@ -941,7 +961,7 @@ pub async fn enrich_batch<C: ConnectionTrait>(
 #[instrument(level = "debug" skip(db), fields(room_id = ?room_id, limit))]
 pub async fn get_deleted_messages<C: ConnectionTrait>(
     db: &C,
-    room_id: Option<&str>,
+    room_id: Option<Uuid>,
     limit: i64,
 ) -> crate::Result<Vec<MessageRow>> {
     let mut query = messages::Entity::find().filter(
@@ -966,7 +986,7 @@ pub async fn get_deleted_messages<C: ConnectionTrait>(
 #[instrument(level = "debug" skip(db), fields(room_id = %room_id))]
 pub async fn get_room_stats<C: ConnectionTrait>(
     db: &C,
-    room_id: &str,
+    room_id: Uuid,
 ) -> crate::Result<MessageStats> {
     let row = messages::Entity::find()
         .select_only()
@@ -1028,7 +1048,7 @@ pub async fn get_room_stats<C: ConnectionTrait>(
 #[instrument(level = "debug" skip(db), fields(user_id = %user_id))]
 pub async fn get_user_stats<C: ConnectionTrait>(
     db: &C,
-    user_id: &str,
+    user_id: Uuid,
 ) -> crate::Result<MessageStats> {
     let row = messages::Entity::find()
         .select_only()
@@ -1082,7 +1102,7 @@ pub async fn get_user_stats<C: ConnectionTrait>(
         .group_by(messages::Column::RoomId)
         .order_by_desc(Expr::cust("COUNT(*)"))
         .limit(10)
-        .into_model::<CountPairRow>()
+        .into_model::<RoomCountPairRow>()
         .all(db)
         .await
         .map_err(db_error)?;
@@ -1106,12 +1126,12 @@ pub async fn get_user_stats<C: ConnectionTrait>(
 }
 
 #[instrument(level = "debug" skip(db), fields(message_id = %message_id))]
-pub async fn message_exists<C: ConnectionTrait>(db: &C, message_id: &str) -> crate::Result<bool> {
+pub async fn message_exists<C: ConnectionTrait>(db: &C, message_id: Uuid) -> crate::Result<bool> {
     let exists = messages::Entity::find()
         .select_only()
         .column(messages::Column::MessageId)
         .filter(messages::Column::MessageId.eq(message_id))
-        .into_tuple::<(String,)>()
+        .into_tuple::<(Uuid,)>()
         .one(db)
         .await
         .map_err(db_error)?
@@ -1140,7 +1160,7 @@ pub async fn create_message_if_missing<C: ConnectionTrait>(
 pub async fn batch_create_if_missing<C: ConnectionTrait>(
     db: &C,
     items: &[Message],
-) -> crate::Result<Vec<(String, DateTime<Utc>)>> {
+) -> crate::Result<Vec<(Uuid, DateTime<Utc>)>> {
     if items.is_empty() {
         return Ok(Vec::new());
     }
@@ -1176,7 +1196,7 @@ pub async fn update_message<C: ConnectionTrait>(db: &C, message: &Message) -> cr
             history: Set(message.history.clone()),
             ..Default::default()
         })
-        .filter(messages::Column::MessageId.eq(message.message_id.clone()))
+        .filter(messages::Column::MessageId.eq(message.message_id))
         .filter(messages::Column::SentAt.eq(message.sent_at))
         .exec(db)
         .await
@@ -1187,7 +1207,7 @@ pub async fn update_message<C: ConnectionTrait>(db: &C, message: &Message) -> cr
 #[instrument(level = "debug" skip(db, payload), fields(message_id = %message_id))]
 pub async fn update_message_from_payload<C: ConnectionTrait>(
     db: &C,
-    message_id: &str,
+    message_id: Uuid,
     payload: &serde_json::Value,
 ) -> crate::Result<()> {
     if let Some(content) = payload.get("message").and_then(|m| m.get("content")) {
@@ -1223,14 +1243,14 @@ pub async fn update_message_from_payload<C: ConnectionTrait>(
 #[instrument(level = "debug" skip(db), fields(message_id = %message_id, has_deleted_by = deleted_by.is_some()))]
 pub async fn mark_deleted<C: ConnectionTrait>(
     db: &C,
-    message_id: &str,
-    deleted_by: Option<&str>,
+    message_id: Uuid,
+    deleted_by: Option<Uuid>,
 ) -> crate::Result<()> {
     let now = Utc::now();
     let active = messages::ActiveModel {
         is_deleted: Set(true),
         deleted_at: Set(Some(now)),
-        deleted_by: Set(deleted_by.map(|v| v.to_owned())),
+        deleted_by: Set(deleted_by),
         updated_at: Set(Some(now)),
         ..Default::default()
     };
@@ -1246,8 +1266,8 @@ pub async fn mark_deleted<C: ConnectionTrait>(
 #[instrument(level = "debug" skip(db, message_ids), fields(message_count = message_ids.len(), has_deleted_by = deleted_by.is_some()))]
 pub async fn mark_deleted_batch<C: ConnectionTrait>(
     db: &C,
-    message_ids: &[String],
-    deleted_by: Option<&str>,
+    message_ids: &[Uuid],
+    deleted_by: Option<Uuid>,
 ) -> crate::Result<i64> {
     if message_ids.is_empty() {
         return Ok(0);
@@ -1256,13 +1276,13 @@ pub async fn mark_deleted_batch<C: ConnectionTrait>(
     let active = messages::ActiveModel {
         is_deleted: Set(true),
         deleted_at: Set(Some(now)),
-        deleted_by: Set(deleted_by.map(|v| v.to_owned())),
+        deleted_by: Set(deleted_by),
         updated_at: Set(Some(now)),
         ..Default::default()
     };
     let result = messages::Entity::update_many()
         .set(active)
-        .filter(messages::Column::MessageId.is_in(message_ids.iter().cloned()))
+        .filter(messages::Column::MessageId.is_in(message_ids.iter().copied()))
         .exec(db)
         .await
         .map_err(db_error)?;
@@ -1270,7 +1290,7 @@ pub async fn mark_deleted_batch<C: ConnectionTrait>(
 }
 
 #[instrument(level = "debug" skip(db), fields(message_id = %message_id))]
-pub async fn mark_recalled<C: ConnectionTrait>(db: &C, message_id: &str) -> crate::Result<()> {
+pub async fn mark_recalled<C: ConnectionTrait>(db: &C, message_id: Uuid) -> crate::Result<()> {
     let now = Utc::now();
     let active = messages::ActiveModel {
         is_recalled: Set(true),
@@ -1289,7 +1309,7 @@ pub async fn mark_recalled<C: ConnectionTrait>(db: &C, message_id: &str) -> crat
 #[instrument(level = "debug" skip(db, message_ids), fields(message_count = message_ids.len()))]
 pub async fn mark_recalled_batch<C: ConnectionTrait>(
     db: &C,
-    message_ids: &[String],
+    message_ids: &[Uuid],
 ) -> crate::Result<i64> {
     if message_ids.is_empty() {
         return Ok(0);
@@ -1302,7 +1322,7 @@ pub async fn mark_recalled_batch<C: ConnectionTrait>(
     };
     let result = messages::Entity::update_many()
         .set(active)
-        .filter(messages::Column::MessageId.is_in(message_ids.iter().cloned()))
+        .filter(messages::Column::MessageId.is_in(message_ids.iter().copied()))
         .exec(db)
         .await
         .map_err(db_error)?;
@@ -1325,7 +1345,7 @@ pub async fn batch_create<C: ConnectionTrait>(db: &C, items: &[Message]) -> crat
 #[instrument(level = "debug" skip(db), fields(room_id = %room_id))]
 pub async fn get_latest_message_time<C: ConnectionTrait>(
     db: &C,
-    room_id: &str,
+    room_id: Uuid,
 ) -> crate::Result<Option<DateTime<Utc>>> {
     messages::Entity::find()
         .select_only()
@@ -1341,7 +1361,7 @@ pub async fn get_latest_message_time<C: ConnectionTrait>(
 #[instrument(level = "debug" skip(db), fields(room_id = %room_id))]
 pub async fn get_earliest_message_time<C: ConnectionTrait>(
     db: &C,
-    room_id: &str,
+    room_id: Uuid,
 ) -> crate::Result<Option<DateTime<Utc>>> {
     messages::Entity::find()
         .select_only()
@@ -1447,6 +1467,7 @@ pub async fn count_messages<C: ConnectionTrait>(
 mod tests {
     use super::*;
     use chrono::Utc;
+    use lilium_test_fixtures::test_uuid;
 
     mod message_filters {
         use super::*;
@@ -1486,8 +1507,8 @@ mod tests {
         fn build_query_simple_filters_add_conditions_without_joins() {
             let t = Utc::now();
             let f = MessageFilters {
-                room_id: Some("room1".into()),
-                user_id: Some("user1".into()),
+                room_id: Some(test_uuid("room1")),
+                user_id: Some(test_uuid("user1")),
                 content_types: Some(vec!["text".into()]),
                 start_time: Some(t),
                 end_time: Some(t),
@@ -1507,7 +1528,7 @@ mod tests {
         #[test]
         fn build_query_join_filters_set_join_flags() {
             let f = MessageFilters {
-                account_id: Some("acct1".into()),
+                account_id: Some(test_uuid("acct1")),
                 sender_name: Some("Test".into()),
                 gps_only: Some(true),
                 ..Default::default()
@@ -1623,34 +1644,37 @@ mod tests {
         #[test]
         fn encode_cursor_two_produces_expected_format() {
             let sent_at = Utc.with_ymd_and_hms(2024, 1, 1, 10, 0, 0).unwrap();
-            let cursor = encode_cursor_two(sent_at, "msg1");
-            assert!(cursor.contains("msg1"));
+            let msg_id = test_uuid("msg1");
+            let cursor = encode_cursor_two(sent_at, msg_id);
+            assert!(cursor.contains(&msg_id.to_string()));
             assert!(cursor.contains("2024-01-01T10:00:00"));
             let parts: Vec<&str> = cursor.split('|').collect();
             assert_eq!(parts.len(), 2);
-            assert_eq!(parts[1], "msg1");
+            assert_eq!(parts[1], msg_id.to_string());
         }
 
         #[test]
         fn encode_cursor_three_produces_expected_format() {
             let sent_at = Utc.with_ymd_and_hms(2024, 1, 1, 10, 0, 0).unwrap();
             let created_at = Utc.with_ymd_and_hms(2024, 1, 1, 12, 0, 0).unwrap();
-            let cursor = encode_cursor_three(sent_at, created_at, "msg1");
-            assert!(cursor.contains("msg1"));
+            let msg_id = test_uuid("msg1");
+            let cursor = encode_cursor_three(sent_at, created_at, msg_id);
+            assert!(cursor.contains(&msg_id.to_string()));
             assert!(cursor.contains("2024-01-01T10:00:00"));
             assert!(cursor.contains("2024-01-01T12:00:00"));
             let parts: Vec<&str> = cursor.split('|').collect();
             assert_eq!(parts.len(), 3);
-            assert_eq!(parts[2], "msg1");
+            assert_eq!(parts[2], msg_id.to_string());
         }
 
         #[test]
         fn decode_cursor_two_part() {
-            let cursor = "2024-01-01T10:00:00+00:00|msg1";
-            let decoded = decode_cursor(cursor).expect("should decode");
+            let msg_id = test_uuid("msg1");
+            let cursor = format!("2024-01-01T10:00:00+00:00|{}", msg_id);
+            let decoded = decode_cursor(&cursor).expect("should decode");
             match decoded {
-                Cursor::TwoPart(sent_at, msg_id) => {
-                    assert_eq!(msg_id, "msg1");
+                Cursor::TwoPart(sent_at, msg_id_decoded) => {
+                    assert_eq!(msg_id_decoded, msg_id);
                     assert_eq!(sent_at.to_rfc3339(), "2024-01-01T10:00:00+00:00");
                 }
                 _ => panic!("expected TwoPart cursor"),
@@ -1659,11 +1683,15 @@ mod tests {
 
         #[test]
         fn decode_cursor_three_part() {
-            let cursor = "2024-01-01T10:00:00+00:00|2024-01-01T12:00:00+00:00|msg1";
-            let decoded = decode_cursor(cursor).expect("should decode");
+            let msg_id = test_uuid("msg1");
+            let cursor = format!(
+                "2024-01-01T10:00:00+00:00|2024-01-01T12:00:00+00:00|{}",
+                msg_id
+            );
+            let decoded = decode_cursor(&cursor).expect("should decode");
             match decoded {
-                Cursor::ThreePart(sent_at, created_at, msg_id) => {
-                    assert_eq!(msg_id, "msg1");
+                Cursor::ThreePart(sent_at, created_at, msg_id_decoded) => {
+                    assert_eq!(msg_id_decoded, msg_id);
                     assert_eq!(sent_at.to_rfc3339(), "2024-01-01T10:00:00+00:00");
                     assert_eq!(created_at.to_rfc3339(), "2024-01-01T12:00:00+00:00");
                 }
@@ -1681,20 +1709,29 @@ mod tests {
 
         #[test]
         fn decode_cursor_invalid_timestamp() {
-            let cursor = "not-a-date|msg1";
+            let cursor = "not-a-date|00000000-0000-0000-0000-000000000000";
             let result = decode_cursor(cursor);
             let err = result.expect_err("should reject invalid timestamp");
             assert_eq!(err.code(), Some("MESSAGE_INVALID_CURSOR"));
         }
 
         #[test]
+        fn decode_cursor_invalid_message_id() {
+            let cursor = "2024-01-01T10:00:00+00:00|not-a-uuid";
+            let result = decode_cursor(cursor);
+            let err = result.expect_err("should reject invalid message_id");
+            assert_eq!(err.code(), Some("MESSAGE_INVALID_CURSOR"));
+        }
+
+        #[test]
         fn encode_then_decode_cursor_two_is_roundtrip() {
             let sent_at = Utc.with_ymd_and_hms(2024, 6, 15, 8, 30, 0).unwrap();
-            let cursor = encode_cursor_two(sent_at, "roundtrip_id");
+            let msg_id = test_uuid("roundtrip_id");
+            let cursor = encode_cursor_two(sent_at, msg_id);
             let decoded = decode_cursor(&cursor).expect("should decode");
             match decoded {
-                Cursor::TwoPart(decoded_sent_at, msg_id) => {
-                    assert_eq!(msg_id, "roundtrip_id");
+                Cursor::TwoPart(decoded_sent_at, msg_id_decoded) => {
+                    assert_eq!(msg_id_decoded, msg_id);
                     assert_eq!(decoded_sent_at, sent_at);
                 }
                 _ => panic!("expected TwoPart"),
@@ -1705,11 +1742,12 @@ mod tests {
         fn encode_then_decode_cursor_three_is_roundtrip() {
             let sent_at = Utc.with_ymd_and_hms(2024, 6, 15, 8, 30, 0).unwrap();
             let created_at = Utc.with_ymd_and_hms(2024, 6, 15, 9, 0, 0).unwrap();
-            let cursor = encode_cursor_three(sent_at, created_at, "roundtrip_id");
+            let msg_id = test_uuid("roundtrip_id");
+            let cursor = encode_cursor_three(sent_at, created_at, msg_id);
             let decoded = decode_cursor(&cursor).expect("should decode");
             match decoded {
-                Cursor::ThreePart(decoded_sent_at, decoded_created_at, msg_id) => {
-                    assert_eq!(msg_id, "roundtrip_id");
+                Cursor::ThreePart(decoded_sent_at, decoded_created_at, msg_id_decoded) => {
+                    assert_eq!(msg_id_decoded, msg_id);
                     assert_eq!(decoded_sent_at, sent_at);
                     assert_eq!(decoded_created_at, created_at);
                 }
@@ -1830,10 +1868,10 @@ mod tests {
 
         fn test_message() -> lilium_models::dzmm::message::Message {
             lilium_models::dzmm::message::Message {
-                message_id: "test_msg_1".into(),
-                room_id: "test_room".into(),
+                message_id: test_uuid("test_msg_1"),
+                room_id: test_uuid("test_room"),
                 sent_at: Utc.with_ymd_and_hms(2024, 1, 1, 10, 0, 0).unwrap(),
-                sent_by: "test_user".into(),
+                sent_by: test_uuid("test_user"),
                 content_type: "text".into(),
                 content_text: Some("Hello".into()),
                 attachment_url: None,
@@ -1874,7 +1912,7 @@ mod tests {
         }
 
         message_db_test!(message_exists_can_be_called_directly, session, {
-            let exists = message_exists(session, "__nonexistent__")
+            let exists = message_exists(session, test_uuid("__nonexistent__"))
                 .await
                 .expect("query");
             assert!(!exists);
@@ -1938,7 +1976,7 @@ mod tests {
 
         message_db_test!(filter_by_room, session, {
             let filters = MessageFilters {
-                room_id: Some("room1".into()),
+                room_id: Some(test_uuid("room1")),
                 ..Default::default()
             };
             let pagination = PaginationParams {
@@ -1952,13 +1990,13 @@ mod tests {
             let result = get_messages(session, &filters, &pagination, true)
                 .await
                 .expect("query");
-            assert!(result.data.iter().all(|m| m.room_id == "room1"));
+            assert!(result.data.iter().all(|m| m.room_id == test_uuid("room1")));
             Ok(())
         });
 
         message_db_test!(filter_by_user, session, {
             let filters = MessageFilters {
-                user_id: Some("user1".into()),
+                user_id: Some(test_uuid("user1")),
                 ..Default::default()
             };
             let pagination = PaginationParams {
@@ -1972,7 +2010,7 @@ mod tests {
             let result = get_messages(session, &filters, &pagination, true)
                 .await
                 .expect("query");
-            assert!(result.data.iter().all(|m| m.sent_by == "user1"));
+            assert!(result.data.iter().all(|m| m.sent_by == test_uuid("user1")));
             Ok(())
         });
 
@@ -2104,8 +2142,8 @@ mod tests {
 
         message_db_test!(filter_combined, session, {
             let filters = MessageFilters {
-                room_id: Some("room1".into()),
-                user_id: Some("user1".into()),
+                room_id: Some(test_uuid("room1")),
+                user_id: Some(test_uuid("user1")),
                 content_types: Some(vec!["text".into()]),
                 ..Default::default()
             };
@@ -2121,8 +2159,8 @@ mod tests {
                 .await
                 .expect("query");
             for m in &result.data {
-                assert_eq!(m.room_id, "room1");
-                assert_eq!(m.sent_by, "user1");
+                assert_eq!(m.room_id, test_uuid("room1"));
+                assert_eq!(m.sent_by, test_uuid("user1"));
                 assert_eq!(m.content_type, "text");
             }
             Ok(())
@@ -2171,9 +2209,9 @@ mod tests {
                     .await
                     .expect("page2");
                 let ids1: std::collections::HashSet<_> =
-                    page1.data.iter().map(|m| m.message_id.clone()).collect();
+                    page1.data.iter().map(|m| m.message_id).collect();
                 let ids2: std::collections::HashSet<_> =
-                    page2.data.iter().map(|m| m.message_id.clone()).collect();
+                    page2.data.iter().map(|m| m.message_id).collect();
                 assert!(ids1.intersection(&ids2).next().is_none());
             }
             Ok(())
@@ -2181,7 +2219,7 @@ mod tests {
 
         message_db_test!(empty_database_returns_none, session, {
             let filters = MessageFilters {
-                room_id: Some("__nonexistent_room__".into()),
+                room_id: Some(test_uuid("__nonexistent_room__")),
                 ..Default::default()
             };
             let pagination = PaginationParams {
@@ -2201,7 +2239,7 @@ mod tests {
         });
 
         message_db_test!(get_by_id_nonexistent, session, {
-            let result = get_by_id(session, "__nonexistent__", true)
+            let result = get_by_id(session, test_uuid("__nonexistent__"), true)
                 .await
                 .expect("query");
             assert!(result.is_none());
@@ -2209,7 +2247,7 @@ mod tests {
         });
 
         message_db_test!(message_exists_false, session, {
-            let exists = message_exists(session, "__nonexistent__")
+            let exists = message_exists(session, test_uuid("__nonexistent__"))
                 .await
                 .expect("query");
             assert!(!exists);
@@ -2217,7 +2255,7 @@ mod tests {
         });
 
         message_db_test!(get_before_nonexistent_returns_empty, session, {
-            let messages = get_before(session, "__nonexistent__", 5)
+            let messages = get_before(session, test_uuid("__nonexistent__"), 5)
                 .await
                 .expect("query");
             assert!(messages.is_empty());
@@ -2225,7 +2263,7 @@ mod tests {
         });
 
         message_db_test!(get_after_nonexistent_returns_empty, session, {
-            let messages = get_after(session, "__nonexistent__", 5)
+            let messages = get_after(session, test_uuid("__nonexistent__"), 5)
                 .await
                 .expect("query");
             assert!(messages.is_empty());
@@ -2233,7 +2271,7 @@ mod tests {
         });
 
         message_db_test!(get_context_nonexistent_returns_none, session, {
-            let result = get_context(session, "__nonexistent__", 2, 2)
+            let result = get_context(session, test_uuid("__nonexistent__"), 2, 2)
                 .await
                 .expect("query");
             assert!(result.is_none());
@@ -2241,7 +2279,7 @@ mod tests {
         });
 
         message_db_test!(get_latest_message_time_empty_room, session, {
-            let result = get_latest_message_time(session, "__nonexistent__")
+            let result = get_latest_message_time(session, test_uuid("__nonexistent__"))
                 .await
                 .expect("query");
             assert!(result.is_none());
@@ -2249,7 +2287,7 @@ mod tests {
         });
 
         message_db_test!(get_earliest_message_time_empty_room, session, {
-            let result = get_earliest_message_time(session, "__nonexistent__")
+            let result = get_earliest_message_time(session, test_uuid("__nonexistent__"))
                 .await
                 .expect("query");
             assert!(result.is_none());
@@ -2301,7 +2339,7 @@ mod tests {
         });
 
         message_db_test!(get_deleted_messages_with_room, session, {
-            let messages = super::get_deleted_messages(session, Some("room1"), 10)
+            let messages = super::get_deleted_messages(session, Some(test_uuid("room1")), 10)
                 .await
                 .expect("query");
             for m in &messages {
@@ -2311,20 +2349,24 @@ mod tests {
         });
 
         message_db_test!(get_room_stats_returns_stats, session, {
-            let stats = get_room_stats(session, "room1").await.expect("query");
+            let stats = get_room_stats(session, test_uuid("room1"))
+                .await
+                .expect("query");
             assert!(stats.total >= 0);
             Ok(())
         });
 
         message_db_test!(get_user_stats_returns_stats, session, {
-            let stats = get_user_stats(session, "user1").await.expect("query");
+            let stats = get_user_stats(session, test_uuid("user1"))
+                .await
+                .expect("query");
             assert!(stats.total >= 0);
             Ok(())
         });
 
         message_db_test!(count_messages_with_filters, session, {
             let filters = MessageFilters {
-                room_id: Some("room1".into()),
+                room_id: Some(test_uuid("room1")),
                 ..Default::default()
             };
             let counts = count_messages(session, &filters).await.expect("count");
@@ -2358,13 +2400,13 @@ mod tests {
             session,
             {
                 let mut msg = test_message();
-                msg.message_id = "attachment_msg".into();
+                msg.message_id = test_uuid("attachment_msg");
                 msg.content_type = "image".into();
                 msg.attachment_url = Some("https://example.com/image.png".into());
                 msg.sticker_id = Some("sticker_1".into());
                 msg.alt_text = Some("image alt".into());
                 msg.metadata = Some(serde_json::json!({"video": {"width": 640}}));
-                msg.reference_message_id = Some("referenced_msg".into());
+                msg.reference_message_id = Some(test_uuid("referenced_msg"));
                 msg.reference_data =
                     Some(serde_json::json!({"id": "referenced_msg", "text": "quoted"}));
                 msg.history = Some(serde_json::json!([{"content": "old"}]));
@@ -2374,7 +2416,7 @@ mod tests {
                     .expect("create");
                 assert!(created);
 
-                let saved = get_by_id(session, "attachment_msg", false)
+                let saved = get_by_id(session, test_uuid("attachment_msg"), false)
                     .await
                     .expect("load")
                     .expect("message exists");
@@ -2386,8 +2428,8 @@ mod tests {
                 assert_eq!(saved.alt_text.as_deref(), Some("image alt"));
                 assert_eq!(saved.metadata, msg.metadata);
                 assert_eq!(
-                    saved.reference_message_id.as_deref(),
-                    Some("referenced_msg")
+                    saved.reference_message_id,
+                    Some(test_uuid("referenced_msg"))
                 );
                 assert_eq!(saved.reference_data, msg.reference_data);
                 assert_eq!(saved.history, msg.history);

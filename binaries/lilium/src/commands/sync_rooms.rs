@@ -14,6 +14,7 @@ use lilium_services::{account, history, outgoing_command as cmd_service, room, s
 use sea_orm::ConnectionTrait;
 use tokio::signal;
 use tokio::time::{Duration, sleep};
+use uuid::Uuid;
 
 #[derive(Args)]
 pub struct SyncRoomsArgs {
@@ -34,14 +35,18 @@ pub struct SyncRoomsArgs {
 impl SyncRoomsArgs {
     /// Execute the sync-rooms subcommand. Returns a process exit code.
     pub async fn run(self, db: &Database) -> Result<u8> {
+        let account = match self.account {
+            Some(s) => Some(Uuid::parse_str(&s).context(format!("invalid account user id: {s}"))?),
+            None => None,
+        };
         if self.list_accounts {
             list_accounts(db).await?;
             return Ok(0);
         }
         if self.poll {
-            return poll_mode(db, self.account, self.poll_interval).await;
+            return poll_mode(db, account, self.poll_interval).await;
         }
-        match sync_once(db, self.account).await? {
+        match sync_once(db, account).await? {
             Some(_) => Ok(0),
             None => Ok(1),
         }
@@ -92,7 +97,7 @@ async fn list_accounts(db: &Database) -> Result<()> {
 
 async fn get_accounts(
     db: &Database,
-    account_id: Option<&str>,
+    account_id: Option<Uuid>,
 ) -> Result<Option<Vec<lilium_models::dzmm::account::Model>>> {
     if let Some(account_id) = account_id {
         let account = account::get_account(db.orm(), account_id)
@@ -120,14 +125,14 @@ async fn get_accounts(
 /// Perform a single room sync iteration across the selected account(s).
 /// Returns the set of room IDs synced, or `None` on failure. Mirrors Python
 /// `sync_once`.
-async fn sync_once(db: &Database, account_id: Option<String>) -> Result<Option<HashSet<String>>> {
-    let accounts = match get_accounts(db, account_id.as_deref()).await? {
+async fn sync_once(db: &Database, account_id: Option<Uuid>) -> Result<Option<HashSet<Uuid>>> {
+    let accounts = match get_accounts(db, account_id).await? {
         Some(a) => a,
         None => return Ok(None),
     };
 
     tracing::info!("🔄 Syncing {} account(s)...", accounts.len());
-    let mut all_room_ids: HashSet<String> = HashSet::new();
+    let mut all_room_ids: HashSet<Uuid> = HashSet::new();
     let mut failed_accounts: Vec<String> = Vec::new();
     let mut total_new: usize = 0;
     let mut total_updated: usize = 0;
@@ -156,21 +161,23 @@ async fn sync_once(db: &Database, account_id: Option<String>) -> Result<Option<H
             Ok(a) => a,
             Err(e) => {
                 tracing::error!("   ❌ Failed to build auth client for {user_id}: {e}");
-                failed_accounts.push(user_id.clone());
+                failed_accounts.push(user_id.to_string());
                 continue;
             }
         };
-        let syncer = sync::RoomSyncer::new(&auth, Some(user_id.as_str()));
+        let syncer = sync::RoomSyncer::new(&auth, Some(*user_id));
         match syncer.sync_rooms(db.orm()).await {
             Ok(stats) => {
                 for chat in &stats.user_chats {
-                    let room_id = chat.get("id").and_then(|v| v.as_str()).or_else(|| {
+                    let room_id_str = chat.get("id").and_then(|v| v.as_str()).or_else(|| {
                         chat.get("data")
                             .and_then(|d| d.get("chatroomId"))
                             .and_then(|v| v.as_str())
                     });
-                    if let Some(rid) = room_id {
-                        all_room_ids.insert(rid.to_owned());
+                    if let Some(rid) = room_id_str
+                        && let Ok(rid) = Uuid::parse_str(rid)
+                    {
+                        all_room_ids.insert(rid);
                     }
                 }
                 total_new += stats.new_rooms;
@@ -186,7 +193,7 @@ async fn sync_once(db: &Database, account_id: Option<String>) -> Result<Option<H
             }
             Err(e) => {
                 tracing::error!("   ❌ Failed to sync account {user_id}: {e}");
-                failed_accounts.push(user_id.clone());
+                failed_accounts.push(user_id.to_string());
             }
         }
     }
@@ -218,27 +225,27 @@ async fn sync_once(db: &Database, account_id: Option<String>) -> Result<Option<H
 
 /// Process newly detected rooms: sync members, backfill history, and queue
 /// reconnect commands for affected accounts. Mirrors Python `process_new_rooms`.
-async fn process_new_rooms(db: &Database, new_room_ids: &HashSet<String>) {
+async fn process_new_rooms(db: &Database, new_room_ids: &HashSet<Uuid>) {
     if new_room_ids.is_empty() {
         return;
     }
     tracing::info!("\n🆕 Processing {} new room(s)...", new_room_ids.len());
-    let mut accounts_to_reconnect: HashSet<String> = HashSet::new();
+    let mut accounts_to_reconnect: HashSet<Uuid> = HashSet::new();
 
     for room_id in new_room_ids {
         tracing::info!("\n📦 New room: {room_id}");
-        if let Err(e) = sync_room_members(db, room_id).await {
+        if let Err(e) = sync_room_members(db, *room_id).await {
             tracing::error!("   ❌ Failed member sync for {room_id}: {e}");
         }
         tracing::info!("   📜 Backfilling history for {room_id}...");
-        if let Err(e) = history::HistoryFetcher::backfill_to_start(db.orm(), room_id).await {
+        if let Err(e) = history::HistoryFetcher::backfill_to_start(db.orm(), *room_id).await {
             tracing::error!("   ❌ Failed to backfill history for {room_id}: {e}");
         } else {
             tracing::info!("   ✅ History backfill complete for {room_id}");
         }
-        if let Ok(Some(room)) = room::get_by_id(db.orm(), room_id).await {
-            for acc in room.account_ids {
-                accounts_to_reconnect.insert(acc);
+        if let Ok(Some(room)) = room::get_by_id(db.orm(), *room_id).await {
+            for uid in room.account_ids {
+                accounts_to_reconnect.insert(uid);
             }
         }
     }
@@ -251,7 +258,7 @@ async fn process_new_rooms(db: &Database, new_room_ids: &HashSet<String>) {
         for account_user_id in &accounts_to_reconnect {
             match cmd_service::create_command(
                 db.orm(),
-                account_user_id,
+                *account_user_id,
                 "system:reconnect",
                 serde_json::json!({"reason": format!("new rooms detected: {}", new_room_ids.len())}),
                 false,
@@ -266,7 +273,7 @@ async fn process_new_rooms(db: &Database, new_room_ids: &HashSet<String>) {
     }
 }
 
-async fn sync_room_members(db: &Database, room_id: &str) -> Result<()> {
+async fn sync_room_members(db: &Database, room_id: Uuid) -> Result<()> {
     let conn = db.orm();
     let room = room::get_by_id(conn, room_id)
         .await
@@ -277,7 +284,7 @@ async fn sync_room_members(db: &Database, room_id: &str) -> Result<()> {
     }
     let auth = auth_for_room(conn, &room).await?;
     let config = sync::MemberSyncConfig {
-        room_id: Some(room_id.to_string()),
+        room_id: Some(room_id),
         force: false,
         ..Default::default()
     };
@@ -298,8 +305,8 @@ async fn auth_for_room(
     conn: &impl ConnectionTrait,
     room: &lilium_models::dzmm::room::Model,
 ) -> Result<DzmmApi> {
-    for acc_id in &room.account_ids {
-        if let Some(account) = account::get_account(conn, acc_id)
+    for uid in &room.account_ids {
+        if let Some(account) = account::get_account(conn, *uid)
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?
             && account.is_enabled
@@ -307,8 +314,8 @@ async fn auth_for_room(
             return Ok(account::create_auth_client(account)?);
         }
     }
-    let acc_id = room.account_ids.first().context("no accounts")?.clone();
-    let account = account::get_account(conn, &acc_id)
+    let uid = room.account_ids.first().context("no accounts")?;
+    let account = account::get_account(conn, *uid)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?
         .context("account missing")?;
@@ -317,11 +324,11 @@ async fn auth_for_room(
 
 async fn poll_mode(
     db: &Database,
-    account_id: Option<String>,
+    account_id: Option<Uuid>,
     poll_interval_minutes: u64,
 ) -> Result<u8> {
     let poll_interval = Duration::from_secs(poll_interval_minutes * 60);
-    let mut known_room_ids: HashSet<String>;
+    let mut known_room_ids: HashSet<Uuid>;
     let mut shutdown = false;
 
     tracing::info!("{}", "=".repeat(60));
@@ -331,7 +338,7 @@ async fn poll_mode(
     tracing::info!("{}", "=".repeat(60));
 
     tracing::info!("\n📋 Initial sync...");
-    let current = match sync_once(db, account_id.clone()).await? {
+    let current = match sync_once(db, account_id).await? {
         Some(set) => set,
         None => {
             tracing::error!("❌ Initial sync failed");
@@ -362,7 +369,7 @@ async fn poll_mode(
         tracing::info!("🔄 Poll #{poll_count}");
         tracing::info!("{}", "=".repeat(60));
 
-        let current = match sync_once(db, account_id.clone()).await? {
+        let current = match sync_once(db, account_id).await? {
             Some(set) => set,
             None => {
                 tracing::warn!("⚠️  Sync failed, will retry next cycle");
@@ -370,7 +377,7 @@ async fn poll_mode(
             }
         };
 
-        let new_room_ids: HashSet<String> = current.difference(&known_room_ids).cloned().collect();
+        let new_room_ids: HashSet<Uuid> = current.difference(&known_room_ids).copied().collect();
         if new_room_ids.is_empty() {
             tracing::info!("\n📊 No new rooms detected");
         } else {

@@ -10,7 +10,7 @@ pub type WebsocketConnection = Model;
 pub struct Model {
     #[sea_orm(primary_key)]
     pub lock_id: i64,
-    pub account_user_id: String,
+    pub account_user_id: Uuid,
     pub connected_at: DateTime<Utc>,
     pub last_heartbeat: DateTime<Utc>,
 }
