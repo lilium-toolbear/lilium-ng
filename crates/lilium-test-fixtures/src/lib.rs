@@ -8,3 +8,6 @@ mod seeds;
 pub use database::test_database_url;
 pub use profile::{FixtureProfile, TestDb, prepare_database};
 pub use seeds::seed_test_users;
+pub use util::test_uuid;
+
+mod util;

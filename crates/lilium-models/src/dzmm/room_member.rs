@@ -2,16 +2,18 @@ use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
-// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 models/dzmm/room_member.py
+// Python parity source: dzmm_archive@227bc1179 models/dzmm/room_member.py
+// Parity note: `room_id` is UUID after the room-chain migration; `user_id` is
+// UUID after the user-chain migration.
 pub type RoomMember = Model;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "room_members")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
-    pub room_id: String,
+    pub room_id: Uuid,
     #[sea_orm(primary_key, auto_increment = false)]
-    pub user_id: String,
+    pub user_id: Uuid,
     pub role: Option<String>,
     pub joined_at: Option<DateTime<Utc>>,
     pub left_at: Option<DateTime<Utc>>,

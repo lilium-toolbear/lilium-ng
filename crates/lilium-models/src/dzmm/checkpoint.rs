@@ -1,19 +1,20 @@
 use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-// Python parity source: dzmm_archive@18fdefbc0b6979178d7f1eb4ce0624ec4a60a2f2 models/dzmm/checkpoint.py
+// Python parity source: dzmm_archive@227bc1179 models/dzmm/checkpoint.py
 pub type Checkpoint = Model;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "checkpoints")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
-    pub checkpoint_id: String,
+    pub checkpoint_id: Uuid,
     pub name: Option<String>,
     pub description: Option<String>,
     pub is_public: bool,
-    pub user_id: Option<String>,
+    pub user_id: Option<Uuid>,
     pub user_name: Option<String>,
     pub user_avatar_url: Option<String>,
     pub creator: Option<serde_json::Value>,
@@ -37,7 +38,10 @@ impl Model {
     /// Create a Checkpoint from an explore-feed API dict. Mirrors Python
     /// `Checkpoint.from_api`. Requires `id`.
     pub fn from_api(data: &serde_json::Value) -> Option<Self> {
-        let checkpoint_id = data.get("id")?.as_str()?.to_string();
+        let checkpoint_id = data
+            .get("id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok())?;
         let now = Utc::now();
         let creator = data.get("creator").filter(|v| v.is_object()).cloned();
         Some(Self {
@@ -54,7 +58,7 @@ impl Model {
             user_id: data
                 .get("userId")
                 .and_then(|v| v.as_str())
-                .map(str::to_owned),
+                .and_then(|s| Uuid::parse_str(s).ok()),
             user_name: data
                 .get("userName")
                 .and_then(|v| v.as_str())

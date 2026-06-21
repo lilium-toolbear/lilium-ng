@@ -16,13 +16,14 @@ use lilium_services::media::MediaService;
 use lilium_services::message;
 use lilium_services::{room_member, user};
 use sea_orm::ConnectionTrait;
+use uuid::Uuid;
 
 // Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 spider/event_processor.py
 const WEBSOCKET_EVENT_INSERTED_CHANNEL: &str = "websocket_event_inserted";
 
 #[derive(Debug, Default)]
 struct BatchSideEffects {
-    media_message_ids: Vec<String>,
+    media_message_ids: Vec<Uuid>,
     avatar_downloads: Vec<user::AvatarDownload>,
 }
 
@@ -476,7 +477,7 @@ impl EventProcessor {
     async fn collect_updates_from_events(
         session: &impl ConnectionTrait,
         events: &[WebSocketEvent],
-    ) -> Result<(Vec<(String, String, String)>, Vec<String>)> {
+    ) -> Result<(Vec<(Uuid, Uuid, Uuid)>, Vec<Uuid>)> {
         let mut user_fetch_collector = Vec::new();
         let mut media_message_ids = Vec::new();
 
@@ -493,18 +494,18 @@ impl EventProcessor {
 
     async fn sync_users(
         session: &impl ConnectionTrait,
-        user_fetch_collector: &[(String, String, String)],
+        user_fetch_collector: &[(Uuid, Uuid, Uuid)],
     ) -> Result<Vec<user::AvatarDownload>> {
         if user_fetch_collector.is_empty() {
             return Ok(Vec::new());
         }
 
-        let mut grouped: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        let mut grouped: HashMap<Uuid, Vec<(Uuid, Uuid)>> = HashMap::new();
         for (source_account_user_id, user_id, room_id) in user_fetch_collector {
             grouped
-                .entry(source_account_user_id.clone())
+                .entry(*source_account_user_id)
                 .or_default()
-                .push((user_id.clone(), room_id.clone()));
+                .push((*user_id, *room_id));
         }
 
         let mut total_new = 0;
@@ -513,7 +514,7 @@ impl EventProcessor {
         let mut avatar_downloads = Vec::new();
 
         for (source_account_user_id, user_room_pairs) in grouped {
-            let account = { account::get_account(session, &source_account_user_id).await? }
+            let account = { account::get_account(session, source_account_user_id).await? }
                 .ok_or_else(|| {
                     LiliumError::service(
                         "ACCOUNT_SYNC_ACCOUNT_NOT_FOUND",
@@ -542,7 +543,7 @@ impl EventProcessor {
         Ok(avatar_downloads)
     }
 
-    fn spawn_media_download(&self, media_message_ids: Vec<String>) {
+    fn spawn_media_download(&self, media_message_ids: Vec<Uuid>) {
         if media_message_ids.is_empty() {
             return;
         }
@@ -677,8 +678,8 @@ impl EventProcessor {
     async fn process_event(
         session: &impl ConnectionTrait,
         event: &WebSocketEvent,
-        user_fetch_collector: &mut Vec<(String, String, String)>,
-    ) -> Result<Option<String>> {
+        user_fetch_collector: &mut Vec<(Uuid, Uuid, Uuid)>,
+    ) -> Result<Option<Uuid>> {
         match event.event.as_str() {
             "message:new" => {
                 if let Some(msg) =
@@ -690,32 +691,28 @@ impl EventProcessor {
                         return Ok(None);
                     }
 
-                    if !msg.sent_by.is_empty() {
-                        user_fetch_collector.push((
-                            event.user_id.clone(),
-                            msg.sent_by.clone(),
-                            msg.room_id.clone(),
-                        ));
+                    if !msg.sent_by.is_nil() {
+                        user_fetch_collector.push((event.user_id, msg.sent_by, msg.room_id));
                     }
 
                     if msg.content_type == "system"
                         && let Some(content_text) = msg.content_text.as_deref()
                     {
-                        if content_text.contains("加入了群聊") && !msg.sent_by.is_empty() {
+                        if content_text.contains("加入了群聊") && !msg.sent_by.is_nil() {
                             room_member::upsert_member_simple(
                                 session,
-                                &msg.room_id,
-                                &msg.sent_by,
+                                msg.room_id,
+                                msg.sent_by,
                                 "member",
                                 Some(msg.sent_at),
                             )
                             .await?;
-                        } else if content_text.contains("离开了群聊") && !msg.sent_by.is_empty()
+                        } else if content_text.contains("离开了群聊") && !msg.sent_by.is_nil()
                         {
                             let _ = room_member::mark_member_left(
                                 session,
-                                &msg.room_id,
-                                &msg.sent_by,
+                                msg.room_id,
+                                msg.sent_by,
                                 Some(msg.sent_at),
                             )
                             .await?;
@@ -726,7 +723,7 @@ impl EventProcessor {
                         msg.content_type.as_str(),
                         "image" | "video" | "voice" | "sticker"
                     ) {
-                        return Ok(Some(msg.message_id.clone()));
+                        return Ok(Some(msg.message_id));
                     }
 
                     if msg.content_type == "system" {
@@ -738,73 +735,77 @@ impl EventProcessor {
                         && let Some(content_type) = content.get("type").and_then(|v| v.as_str())
                         && matches!(content_type, "image" | "video" | "voice" | "sticker")
                     {
-                        return Ok(Some(msg.message_id.clone()));
+                        return Ok(Some(msg.message_id));
                     }
                 }
                 Ok(None)
             }
             "message:updated" => {
-                if let Some(message_id) = event.data.get("messageId").and_then(|v| v.as_str()) {
-                    message::update_message_from_payload(session, message_id, &event.data).await?;
+                if let Some(message_id) = event.data.get("messageId").and_then(|v| v.as_str())
+                    && let Ok(uid) = Uuid::parse_str(message_id)
+                {
+                    message::update_message_from_payload(session, uid, &event.data).await?;
                 }
                 Ok(None)
             }
             "message:deleted" => {
                 if let Some(message_id) = event.data.get("messageId").and_then(|v| v.as_str()) {
-                    let deleted_by = event.data.get("deletedBy").and_then(|v| v.as_str());
-                    message::mark_deleted(session, message_id, deleted_by).await?;
+                    let deleted_by = event
+                        .data
+                        .get("deletedBy")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| Uuid::parse_str(s).ok());
+                    if let Ok(uid) = Uuid::parse_str(message_id) {
+                        message::mark_deleted(session, uid, deleted_by).await?;
+                    }
                 }
                 Ok(None)
             }
             "message:recalled" => {
-                if let Some(message_id) = event.data.get("messageId").and_then(|v| v.as_str()) {
-                    message::mark_recalled(session, message_id).await?;
+                if let Some(message_id) = event.data.get("messageId").and_then(|v| v.as_str())
+                    && let Ok(uid) = Uuid::parse_str(message_id)
+                {
+                    message::mark_recalled(session, uid).await?;
                 }
                 Ok(None)
             }
             "presence:user-online" => {
-                if let Some(user_id) = event.data.get("userId").and_then(|v| v.as_str())
-                    && let Some(room_id) = event.data.get("chatroomId").and_then(|v| v.as_str())
+                if let Some(user_id_str) = event.data.get("userId").and_then(|v| v.as_str())
+                    && let Some(room_id_str) = event.data.get("chatroomId").and_then(|v| v.as_str())
+                    && let Ok(uid) = Uuid::parse_str(user_id_str)
+                    && let Ok(room_id) = Uuid::parse_str(room_id_str)
                 {
-                    user_fetch_collector.push((
-                        event.user_id.clone(),
-                        user_id.to_string(),
-                        room_id.to_string(),
-                    ));
+                    user_fetch_collector.push((event.user_id, uid, room_id));
                 }
                 Ok(None)
             }
             "group:member-joined" => {
-                if let Some(user_id) = event.data.get("userId").and_then(|v| v.as_str())
-                    && let Some(room_id) = event.data.get("chatroomId").and_then(|v| v.as_str())
+                if let Some(user_id_str) = event.data.get("userId").and_then(|v| v.as_str())
+                    && let Some(room_id_str) = event.data.get("chatroomId").and_then(|v| v.as_str())
+                    && let Ok(uid) = Uuid::parse_str(user_id_str)
+                    && let Ok(room_id) = Uuid::parse_str(room_id_str)
                 {
                     room_member::upsert_member_simple(
                         session,
                         room_id,
-                        user_id,
+                        uid,
                         "member",
                         Some(event.timestamp),
                     )
                     .await?;
-                    user_fetch_collector.push((
-                        event.user_id.clone(),
-                        user_id.to_string(),
-                        room_id.to_string(),
-                    ));
+                    user_fetch_collector.push((event.user_id, uid, room_id));
                 }
                 Ok(None)
             }
             "group:member-left" => {
-                if let Some(user_id) = event.data.get("userId").and_then(|v| v.as_str())
-                    && let Some(room_id) = event.data.get("chatroomId").and_then(|v| v.as_str())
+                if let Some(user_id_str) = event.data.get("userId").and_then(|v| v.as_str())
+                    && let Some(room_id_str) = event.data.get("chatroomId").and_then(|v| v.as_str())
+                    && let Ok(uid) = Uuid::parse_str(user_id_str)
+                    && let Ok(room_id) = Uuid::parse_str(room_id_str)
                 {
-                    let _ = room_member::mark_member_left(
-                        session,
-                        room_id,
-                        user_id,
-                        Some(event.timestamp),
-                    )
-                    .await?;
+                    let _ =
+                        room_member::mark_member_left(session, room_id, uid, Some(event.timestamp))
+                            .await?;
                 }
                 Ok(None)
             }
@@ -851,7 +852,7 @@ mod tests {
     use lilium_models::dzmm::room_member::RoomMember;
     use lilium_services::event;
     use lilium_services::message;
-    use lilium_test_fixtures::{FixtureProfile, TestDb};
+    use lilium_test_fixtures::{FixtureProfile, TestDb, test_uuid};
 
     fn utc(ts: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(ts)
@@ -870,15 +871,15 @@ mod tests {
             id,
             event: event.to_string(),
             data,
-            user_id: user_id.to_string(),
+            user_id: test_uuid(user_id),
             timestamp: utc(timestamp),
         }
     }
 
     async fn room_member_row(
         session: &impl ConnectionTrait,
-        room_id: &str,
-        user_id: &str,
+        room_id: Uuid,
+        user_id: Uuid,
     ) -> Result<Option<RoomMember>> {
         lilium_services::room_member::get_member_info(session, room_id, user_id)
             .await
@@ -898,11 +899,11 @@ mod tests {
                 "account_1",
                 "2026-06-02T12:00:00Z",
                 serde_json::json!({
-                    "chatroomId": "room_1",
+                    "chatroomId": test_uuid("room_1").to_string(),
                     "message": {
-                        "message_id": "msg_join",
-                        "chatroom_id": "room_1",
-                        "sent_by": "user_joined",
+                        "message_id": test_uuid("msg_join").to_string(),
+                        "chatroom_id": test_uuid("room_1").to_string(),
+                        "sent_by": test_uuid("user_joined").to_string(),
                         "sent_at": "2026-06-02T12:00:00Z",
                         "content": {
                             "type": "system",
@@ -921,17 +922,17 @@ mod tests {
             assert_eq!(
                 user_fetch_collector,
                 vec![(
-                    "account_1".to_string(),
-                    "user_joined".to_string(),
-                    "room_1".to_string()
+                    test_uuid("account_1"),
+                    test_uuid("user_joined"),
+                    test_uuid("room_1")
                 )]
             );
 
-            let member = room_member_row(session, "room_1", "user_joined")
+            let member = room_member_row(session, test_uuid("room_1"), test_uuid("user_joined"))
                 .await?
                 .expect("member row");
-            assert_eq!(member.room_id, "room_1");
-            assert_eq!(member.user_id, "user_joined");
+            assert_eq!(member.room_id, test_uuid("room_1"));
+            assert_eq!(member.user_id, test_uuid("user_joined"));
             assert_eq!(member.joined_at, Some(utc("2026-06-02T12:00:00Z")));
             assert!(member.left_at.is_none());
 
@@ -950,8 +951,8 @@ mod tests {
         lilium_database::transaction!(test_db.database(), |session| {
             room_member::upsert_member_simple(
                 session,
-                "room_1",
-                "user_left",
+                test_uuid("room_1"),
+                test_uuid("user_left"),
                 "member",
                 Some(utc("2026-06-01T00:00:00Z")),
             )
@@ -963,8 +964,8 @@ mod tests {
                 "account_1",
                 "2026-06-02T12:30:00Z",
                 serde_json::json!({
-                    "chatroomId": "room_1",
-                    "userId": "user_left"
+                    "chatroomId": test_uuid("room_1").to_string(),
+                    "userId": test_uuid("user_left").to_string()
                 }),
             );
 
@@ -975,7 +976,7 @@ mod tests {
 
             assert!(user_fetch_collector.is_empty());
 
-            let member = room_member_row(session, "room_1", "user_left")
+            let member = room_member_row(session, test_uuid("room_1"), test_uuid("user_left"))
                 .await?
                 .expect("member row");
             assert_eq!(member.left_at, Some(utc("2026-06-02T12:30:00Z")));
@@ -999,8 +1000,8 @@ mod tests {
                 "account_1",
                 "2026-06-02T12:45:00Z",
                 serde_json::json!({
-                    "chatroomId": "room_1",
-                    "userId": "user_online"
+                    "chatroomId": test_uuid("room_1").to_string(),
+                    "userId": test_uuid("user_online").to_string()
                 }),
             );
 
@@ -1012,9 +1013,9 @@ mod tests {
             assert_eq!(
                 user_fetch_collector,
                 vec![(
-                    "account_1".to_string(),
-                    "user_online".to_string(),
-                    "room_1".to_string()
+                    test_uuid("account_1"),
+                    test_uuid("user_online"),
+                    test_uuid("room_1")
                 )]
             );
 
@@ -1033,10 +1034,10 @@ mod tests {
         lilium_database::transaction!(test_db.database(), |session| {
             let sent_at = utc("2026-06-01T00:00:00Z");
             let message = DzmmMessage {
-                message_id: "msg_deleted".to_string(),
-                room_id: "room_1".to_string(),
+                message_id: test_uuid("msg_deleted"),
+                room_id: test_uuid("room_1"),
                 sent_at,
-                sent_by: "user_deleted".to_string(),
+                sent_by: test_uuid("user_deleted"),
                 content_type: "text".to_string(),
                 content_text: Some("hello".to_string()),
                 attachment_url: None,
@@ -1044,7 +1045,7 @@ mod tests {
                 sticker_id: None,
                 alt_text: None,
                 metadata: None,
-                raw_data: serde_json::json!({"message_id": "msg_deleted"}),
+                raw_data: serde_json::json!({"message_id": test_uuid("msg_deleted").to_string()}),
                 source: "spider".to_string(),
                 created_at: sent_at,
                 updated_at: None,
@@ -1065,9 +1066,9 @@ mod tests {
                 "account_1",
                 "2026-06-02T13:00:00Z",
                 serde_json::json!({
-                    "chatroomId": "room_1",
-                    "messageId": "msg_deleted",
-                    "deletedBy": "user_admin"
+                    "chatroomId": test_uuid("room_1").to_string(),
+                    "messageId": test_uuid("msg_deleted").to_string(),
+                    "deletedBy": test_uuid("user_admin").to_string()
                 }),
             );
 
@@ -1076,12 +1077,12 @@ mod tests {
                 .await
                 .expect("process event");
 
-            let updated = message::get_by_id_at(session, "msg_deleted", sent_at, false)
+            let updated = message::get_by_id_at(session, test_uuid("msg_deleted"), sent_at, false)
                 .await?
                 .expect("message exists");
 
             assert!(updated.is_deleted);
-            assert_eq!(updated.deleted_by.as_deref(), Some("user_admin"));
+            assert_eq!(updated.deleted_by, Some(test_uuid("user_admin")));
 
             Ok(())
         })
@@ -1111,8 +1112,8 @@ mod tests {
                 "account_1",
                 "2026-06-03T00:00:00Z",
                 serde_json::json!({
-                    "chatroomId": "room_1",
-                    "userId": "user_sync_missing_account"
+                    "chatroomId": test_uuid("room_1").to_string(),
+                    "userId": test_uuid("user_sync_missing_account").to_string()
                 }),
             ),
             websocket_event(
@@ -1164,11 +1165,11 @@ mod tests {
             "account_1",
             "2026-06-03T00:00:00Z",
             serde_json::json!({
-                "chatroomId": "room_1",
+                "chatroomId": test_uuid("room_1").to_string(),
                 "message": {
-                    "message_id": "msg_user_sync_fail",
-                    "chatroom_id": "room_1",
-                    "sent_by": "user_sync_missing_account",
+                    "message_id": test_uuid("msg_user_sync_fail").to_string(),
+                    "chatroom_id": test_uuid("room_1").to_string(),
+                    "sent_by": test_uuid("user_sync_missing_account").to_string(),
                     "sent_at": "2026-06-03T00:00:00Z",
                     "content": {
                         "type": "text",
@@ -1187,10 +1188,11 @@ mod tests {
             .database()
             .transaction(|session| {
                 Box::pin(async move {
-                    let message = message::get_by_id(session, "msg_user_sync_fail", false)
-                        .await?
-                        .expect("message should be committed before user sync skip");
-                    assert_eq!(message.sent_by, "user_sync_missing_account");
+                    let message =
+                        message::get_by_id(session, test_uuid("msg_user_sync_fail"), false)
+                            .await?
+                            .expect("message should be committed before user sync skip");
+                    assert_eq!(message.sent_by, test_uuid("user_sync_missing_account"));
 
                     let offset = event::get_offset(session, "test_processor").await?;
                     assert_eq!(offset, 31);

@@ -1,17 +1,18 @@
 use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-// Python parity source: dzmm_archive@18fdefbc0b6979178d7f1eb4ce0624ec4a60a2f2 models/dzmm/gallery.py
+// Python parity source: dzmm_archive@227bc1179 models/dzmm/gallery.py
 pub type Gallery = Model;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "galleries")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
-    pub gallery_id: String,
+    pub gallery_id: Uuid,
     pub title: Option<String>,
-    pub user_id: Option<String>,
+    pub user_id: Option<Uuid>,
     pub user_full_name: Option<String>,
     pub user_avatar_url: Option<String>,
     pub images: Option<Vec<String>>,
@@ -34,8 +35,14 @@ impl Model {
     /// Create a Gallery from an explore-feed API dict. Mirrors Python
     /// `Gallery.from_api`. Requires `id` and `authorId`.
     pub fn from_api(data: &serde_json::Value) -> Option<Self> {
-        let gallery_id = data.get("id")?.as_str()?.to_string();
-        let user_id = data.get("authorId")?.as_str()?.to_string();
+        let gallery_id = data
+            .get("id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok())?;
+        let user_id = data
+            .get("authorId")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok())?;
         let author = data.get("author")?;
         let now = Utc::now();
         Some(Self {

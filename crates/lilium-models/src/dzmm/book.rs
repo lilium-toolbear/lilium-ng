@@ -1,15 +1,16 @@
 use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-// Python parity source: dzmm_archive@18fdefbc0b6979178d7f1eb4ce0624ec4a60a2f2 models/dzmm/book.py
+// Python parity source: dzmm_archive@227bc1179 models/dzmm/book.py
 pub type Book = Model;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "books")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
-    pub book_id: String,
+    pub book_id: Uuid,
     pub title: Option<String>,
     pub description: Option<String>,
     pub slug: Option<String>,
@@ -17,7 +18,7 @@ pub struct Model {
     pub is_public: bool,
     pub cover_image_url: Option<String>,
     pub local_cover_path: Option<String>,
-    pub user_id: Option<String>,
+    pub user_id: Option<Uuid>,
     pub author: Option<serde_json::Value>,
     pub chapter_count: i32,
     pub total_word_count: i32,
@@ -41,7 +42,10 @@ impl Model {
     /// Create a Book from an explore-feed API dict. Mirrors Python
     /// `Book.from_api`. Requires `id`. Accepts snake_case and camelCase.
     pub fn from_api(data: &serde_json::Value) -> Option<Self> {
-        let book_id = data.get("id")?.as_str()?.to_string();
+        let book_id = data
+            .get("id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok())?;
         let now = Utc::now();
         Some(Self {
             book_id,
@@ -67,7 +71,7 @@ impl Model {
                 .and_then(|v| v.as_str())
                 .or_else(|| data.get("userId").and_then(|v| v.as_str()))
                 .or_else(|| data.get("authorId").and_then(|v| v.as_str()))
-                .map(str::to_owned),
+                .and_then(|s| Uuid::parse_str(s).ok()),
             author: normalize_author(data),
             chapter_count: super::int_field(data, "chapter_count", "chapterCount", 0),
             total_word_count: super::int_field(data, "total_word_count", "totalWordCount", 0),

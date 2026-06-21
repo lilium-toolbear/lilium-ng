@@ -1,8 +1,9 @@
 use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 models/dzmm/user.py
+// Python parity source: dzmm_archive@fea92bfdbe3ae0e0ce117fd0b8785099f77b0050 models/dzmm/user.py
 // Parity decisions:
 // - Python exposes `name_tsv` (TSVECTOR), but Rust intentionally keeps PostgreSQL
 //   search vectors out of the table row model. The DB column still exists and is
@@ -10,13 +11,17 @@ use serde::{Deserialize, Serialize};
 // - Python's `user_metadata` maps to DB column `metadata`; Rust field is named `metadata`.
 // - Python `from_api()` also checks `displayName`/`avatar` fallback keys; Rust only
 //   checks `fullName`/`avatarUrl` (current API shape).
+// - Python `from_api()` parses `UUID(data["id"])` and raises on a non-UUID id. Rust's
+//   boundary parser returns `Option` and skips the record on parse failure (`.ok()?`)
+//   rather than raising. Post-migration DZMM only emits UUID-shaped user ids, so this
+//   divergence is not exercised in practice.
 pub type User = Model;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "users")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
-    pub user_id: String,
+    pub user_id: Uuid,
     pub full_name: Option<String>,
     pub avatar_url: Option<String>,
     pub avatar_file: Option<String>,
@@ -48,8 +53,8 @@ impl User {
             .get("id")
             .or_else(|| obj.get("userId"))
             .or_else(|| obj.get("user_id"))
-            .and_then(|v| v.as_str())?
-            .to_string();
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok())?;
 
         let now = Utc::now();
         let last_seen = obj

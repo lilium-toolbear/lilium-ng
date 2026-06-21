@@ -11,6 +11,7 @@ use sea_orm::{
 };
 use std::collections::{HashMap, HashSet};
 use tracing::{info, instrument};
+use uuid::Uuid;
 
 type User = users::Model;
 
@@ -23,7 +24,7 @@ pub struct SearchUsersParams {
 
 #[derive(Debug, Clone, Default)]
 pub struct UpsertUserData {
-    pub user_id: String,
+    pub user_id: Uuid,
     pub full_name: Option<String>,
     pub avatar_url: Option<String>,
     pub avatar_file: Option<String>,
@@ -40,7 +41,7 @@ pub struct UpsertUserData {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvatarDownload {
-    pub user_id: String,
+    pub user_id: Uuid,
     pub avatar_url: String,
 }
 
@@ -53,7 +54,7 @@ pub struct BatchFetchUsersResult {
 
 #[derive(Debug, Clone)]
 pub struct UserProfile {
-    pub user_id: String,
+    pub user_id: Uuid,
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
 }
@@ -71,10 +72,10 @@ impl UpsertUserData {
             .get("id")
             .or_else(|| obj.get("userId"))
             .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok())
             .ok_or_else(|| {
                 LiliumError::service("USER_API_PAYLOAD_INVALID", "User API payload missing id")
-            })?
-            .to_string();
+            })?;
 
         let full_name = obj
             .get("fullName")
@@ -173,7 +174,7 @@ pub fn apply_avatar_sync_plan(
         _ => user.avatar_url.clone().map(|avatar_url| {
             user.avatar_file = None;
             AvatarDownload {
-                user_id: user.user_id.clone(),
+                user_id: user.user_id,
                 avatar_url,
             }
         }),
@@ -181,18 +182,16 @@ pub fn apply_avatar_sync_plan(
 }
 
 #[instrument(level = "debug" skip(db), fields(user_id = %user_id))]
-pub async fn get_by_id<C>(db: &C, user_id: &str) -> Result<Option<User>>
+pub async fn get_by_id<C>(db: &C, user_id: Uuid) -> Result<Option<User>>
 where
     C: ConnectionTrait,
 {
-    let user = users::Entity::find_by_id(user_id.to_owned())
-        .one(db)
-        .await?;
+    let user = users::Entity::find_by_id(user_id).one(db).await?;
     Ok(user)
 }
 
 #[instrument(level = "debug" skip(db, user_ids), fields(user_count = user_ids.len()))]
-pub async fn get_by_ids<C>(db: &C, user_ids: &[String]) -> Result<Vec<User>>
+pub async fn get_by_ids<C>(db: &C, user_ids: &[Uuid]) -> Result<Vec<User>>
 where
     C: ConnectionTrait,
 {
@@ -201,7 +200,7 @@ where
     }
 
     let users = users::Entity::find()
-        .filter(users::Column::UserId.is_in(user_ids.iter().cloned()))
+        .filter(users::Column::UserId.is_in(user_ids.iter().copied()))
         .all(db)
         .await?
         .into_iter()
@@ -230,7 +229,7 @@ where
                     [query_text.as_str()],
                 ))
                 .add(Expr::cust_with_values(
-                    "user_id ILIKE '%' || $1 || '%'",
+                    "user_id::text ILIKE '%' || $1 || '%'",
                     [query_text.as_str()],
                 ))
                 .add(Expr::cust_with_values(
@@ -257,7 +256,7 @@ where
     C: ConnectionTrait,
 {
     let now = Utc::now();
-    let existing = get_by_id(db, &data.user_id).await?;
+    let existing = get_by_id(db, data.user_id).await?;
     if let Some(existing_user) = existing.as_ref()
         && has_profile_changed(existing_user, data)
     {
@@ -265,7 +264,7 @@ where
     }
 
     let user = users::Entity::insert(users::ActiveModel {
-        user_id: Set(data.user_id.clone()),
+        user_id: Set(data.user_id),
         full_name: Set(data.full_name.clone()),
         avatar_url: Set(data.avatar_url.clone()),
         avatar_file: Set(data.avatar_file.clone()),
@@ -385,7 +384,7 @@ where
     C: ConnectionTrait,
 {
     user_history::Entity::insert(user_history::ActiveModel {
-        user_id: Set(user.user_id.clone()),
+        user_id: Set(user.user_id),
         full_name: Set(user.full_name.clone()),
         avatar_url: Set(user.avatar_url.clone()),
         bio: Set(user.bio.clone()),
@@ -408,7 +407,7 @@ where
 }
 
 #[instrument(level = "debug" skip(db), fields(user_id = %user_id))]
-pub async fn increment_message_count<C>(db: &C, user_id: &str) -> Result<()>
+pub async fn increment_message_count<C>(db: &C, user_id: Uuid) -> Result<()>
 where
     C: ConnectionTrait,
 {
@@ -419,7 +418,7 @@ where
 }
 
 #[instrument(level = "debug" skip(db), fields(user_id = %user_id))]
-pub async fn increment_deleted_count<C>(db: &C, user_id: &str) -> Result<()>
+pub async fn increment_deleted_count<C>(db: &C, user_id: Uuid) -> Result<()>
 where
     C: ConnectionTrait,
 {
@@ -430,7 +429,7 @@ where
 }
 
 #[instrument(level = "debug" skip(db), fields(user_id = %user_id))]
-pub async fn increment_recalled_count<C>(db: &C, user_id: &str) -> Result<()>
+pub async fn increment_recalled_count<C>(db: &C, user_id: Uuid) -> Result<()>
 where
     C: ConnectionTrait,
 {
@@ -442,7 +441,7 @@ where
 
 async fn increment_user_counter<C>(
     db: &C,
-    user_id: &str,
+    user_id: Uuid,
     counter: users::Column,
     initial_counts: (i32, i32, i32),
 ) -> Result<()>
@@ -473,7 +472,7 @@ where
         users::Entity::update(active).exec(db).await?;
     } else {
         users::Entity::insert(users::ActiveModel {
-            user_id: Set(user_id.to_owned()),
+            user_id: Set(user_id),
             message_count: Set(initial_counts.0),
             deleted_count: Set(initial_counts.1),
             recalled_count: Set(initial_counts.2),
@@ -492,7 +491,7 @@ where
 #[instrument(level = "debug" skip(db, user_room_pairs), fields(pair_count = user_room_pairs.len()))]
 pub async fn batch_fetch_and_update<C>(
     db: &C,
-    user_room_pairs: &[(String, String)],
+    user_room_pairs: &[(Uuid, Uuid)],
 ) -> Result<(i64, i64)>
 where
     C: ConnectionTrait,
@@ -504,8 +503,8 @@ where
     let mut seen = HashSet::new();
     let mut unique_user_ids = Vec::new();
     for (user_id, _room_id) in user_room_pairs {
-        if seen.insert(user_id.clone()) {
-            unique_user_ids.push(user_id.clone());
+        if seen.insert(*user_id) {
+            unique_user_ids.push(*user_id);
         }
     }
 
@@ -517,9 +516,9 @@ where
     for chunk in unique_user_ids.chunks(5000) {
         existing_users.extend(get_by_ids(db, chunk).await?);
     }
-    let existing_users: HashMap<String, User> = existing_users
+    let existing_users: HashMap<Uuid, User> = existing_users
         .into_iter()
-        .map(|user| (user.user_id.clone(), user))
+        .map(|user| (user.user_id, user))
         .collect();
 
     let mut new_count = 0;
@@ -569,7 +568,7 @@ where
 pub async fn batch_fetch_and_update_with_auth<C>(
     db: &C,
     auth: &DzmmApi,
-    user_room_pairs: &[(String, String)],
+    user_room_pairs: &[(Uuid, Uuid)],
     cache_hours: i64,
 ) -> Result<BatchFetchUsersResult>
 where
@@ -579,12 +578,10 @@ where
     let mut unique_user_ids = Vec::new();
     let mut user_to_room = HashMap::new();
     for (user_id, room_id) in user_room_pairs {
-        if seen.insert(user_id.clone()) {
-            unique_user_ids.push(user_id.clone());
+        if seen.insert(*user_id) {
+            unique_user_ids.push(*user_id);
         }
-        user_to_room
-            .entry(user_id.clone())
-            .or_insert_with(|| room_id.clone());
+        user_to_room.entry(*user_id).or_insert_with(|| *room_id);
     }
 
     if unique_user_ids.is_empty() {
@@ -595,9 +592,9 @@ where
     for chunk in unique_user_ids.chunks(5000) {
         existing_users.extend(get_by_ids(db, chunk).await?);
     }
-    let existing_users: HashMap<String, User> = existing_users
+    let existing_users: HashMap<Uuid, User> = existing_users
         .into_iter()
-        .map(|user| (user.user_id.clone(), user))
+        .map(|user| (user.user_id, user))
         .collect();
 
     let now = Utc::now();
@@ -625,25 +622,29 @@ where
             .iter()
             .map(|user_id| {
                 (
-                    user_id.clone(),
-                    user_to_room.get(user_id).cloned().unwrap_or_default(),
+                    user_id.to_string(),
+                    user_to_room
+                        .get(user_id)
+                        .copied()
+                        .map(|rid| rid.to_string())
+                        .unwrap_or_default(),
                 )
             })
             .collect::<Vec<_>>();
 
         let fetched = auth.batch_get_user_info(&pairs_to_fetch).await?;
-        for (user_data, (user_id, _room_id)) in fetched.into_iter().zip(pairs_to_fetch) {
+        for (user_data, (_user_id_str, _room_id)) in fetched.into_iter().zip(pairs_to_fetch) {
             let Some(mut user) = ApiUser::from_api(&user_data) else {
                 continue;
             };
 
-            if let Some(download) = apply_avatar_sync_plan(&mut user, existing_users.get(&user_id))
-            {
+            let uid = user.user_id;
+            if let Some(download) = apply_avatar_sync_plan(&mut user, existing_users.get(&uid)) {
                 avatar_downloads.push(download);
             }
 
             let data = UpsertUserData {
-                user_id: user.user_id.clone(),
+                user_id: user.user_id,
                 full_name: user.full_name.clone(),
                 avatar_url: user.avatar_url.clone(),
                 avatar_file: user.avatar_file.clone(),
@@ -684,13 +685,11 @@ where
 }
 
 #[instrument(level = "debug" skip(db), fields(user_id = %user_id))]
-pub async fn fetch_user_profile<C>(db: &C, user_id: &str) -> Result<Option<UserProfile>>
+pub async fn fetch_user_profile<C>(db: &C, user_id: Uuid) -> Result<Option<UserProfile>>
 where
     C: ConnectionTrait,
 {
-    let user = users::Entity::find_by_id(user_id.to_owned())
-        .one(db)
-        .await?;
+    let user = users::Entity::find_by_id(user_id).one(db).await?;
 
     Ok(user.map(|user| UserProfile {
         user_id: user.user_id,
@@ -709,7 +708,7 @@ where
 pub async fn batch_fetch_and_update_public_users<C>(
     db: &C,
     auth: &DzmmApi,
-    user_ids: &[String],
+    user_ids: &[Uuid],
     cache_hours: i64,
 ) -> Result<BatchFetchUsersResult>
 where
@@ -718,8 +717,8 @@ where
     let mut seen = HashSet::new();
     let mut unique_user_ids = Vec::new();
     for user_id in user_ids {
-        if seen.insert(user_id.clone()) {
-            unique_user_ids.push(user_id.clone());
+        if seen.insert(*user_id) {
+            unique_user_ids.push(*user_id);
         }
     }
 
@@ -731,14 +730,14 @@ where
     for chunk in unique_user_ids.chunks(5000) {
         existing_users.extend(get_by_ids(db, chunk).await?);
     }
-    let existing_users_map: HashMap<String, User> = existing_users
+    let existing_users_map: HashMap<Uuid, User> = existing_users
         .into_iter()
-        .map(|user| (user.user_id.clone(), user))
+        .map(|user| (user.user_id, user))
         .collect();
 
     let now = Utc::now();
     let cache_cutoff = chrono::Duration::hours(cache_hours.max(1));
-    let users_to_fetch: Vec<String> = unique_user_ids
+    let users_to_fetch: Vec<Uuid> = unique_user_ids
         .into_iter()
         .filter(|user_id| {
             existing_users_map
@@ -763,21 +762,21 @@ where
     let mut updated_count = 0;
 
     for user_id in users_to_fetch {
-        let user_data = match auth.get_public_user_profile(&user_id).await {
+        let user_data = match auth.get_public_user_profile(&user_id.to_string()).await {
             Ok(data) => data,
             Err(e) => {
-                tracing::warn!(user_id, "Failed to fetch public user profile: {e}");
+                tracing::warn!(user_id = %user_id, "Failed to fetch public user profile: {e}");
                 continue;
             }
         };
 
         let Some(api_user) = ApiUser::from_api(&user_data) else {
-            tracing::warn!(user_id, "Failed to parse public user profile");
+            tracing::warn!(user_id = %user_id, "Failed to parse public user profile");
             continue;
         };
 
         let user_data = UpsertUserData {
-            user_id: api_user.user_id.clone(),
+            user_id: api_user.user_id,
             full_name: api_user.full_name.clone(),
             avatar_url: api_user.avatar_url.clone(),
             avatar_file: None,
@@ -792,22 +791,22 @@ where
             last_seen: None,
         };
 
-        let existing = get_by_id(db, &user_data.user_id).await?;
+        let existing = get_by_id(db, user_data.user_id).await?;
         let is_new = existing.is_none();
         upsert_user(db, &user_data).await?;
         if is_new {
             new_count += 1;
             tracing::info!(
-                user_id,
+                user_id = %user_id,
                 "New public user discovered: {}",
-                api_user.full_name.as_deref().unwrap_or(&user_id)
+                api_user.full_name.as_deref().unwrap_or(&user_id.to_string())
             );
         } else {
             updated_count += 1;
             tracing::debug!(
-                user_id,
+                user_id = %user_id,
                 "Updated public user info: {}",
-                api_user.full_name.as_deref().unwrap_or(&user_id)
+                api_user.full_name.as_deref().unwrap_or(&user_id.to_string())
             );
         }
     }
@@ -829,14 +828,17 @@ where
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
+    use lilium_test_fixtures::test_uuid;
     use sea_orm::PaginatorTrait;
     use serde_json::json;
 
     mod user_struct {
+        use super::test_uuid;
+
         #[test]
         fn test_user() {
             let user = lilium_models::dzmm::user::User {
-                user_id: "u1".into(),
+                user_id: test_uuid("u1"),
                 full_name: Some("U".into()),
                 message_count: 0,
                 deleted_count: 0,
@@ -855,21 +857,22 @@ mod tests {
                 raw_data: None,
                 last_seen: None,
             };
-            assert_eq!(user.user_id, "u1");
+            assert_eq!(user.user_id, test_uuid("u1"));
         }
     }
 
     mod user_profile {
         use super::UserProfile;
+        use super::test_uuid;
 
         #[test]
         fn construction_and_field_access() {
             let p = UserProfile {
-                user_id: "u1".into(),
+                user_id: test_uuid("u1"),
                 display_name: Some("Alice".into()),
                 avatar_url: Some("https://example.com/avatar.jpg".into()),
             };
-            assert_eq!(p.user_id, "u1");
+            assert_eq!(p.user_id, test_uuid("u1"));
             assert_eq!(p.display_name.as_deref(), Some("Alice"));
             assert_eq!(
                 p.avatar_url.as_deref(),
@@ -880,11 +883,11 @@ mod tests {
         #[test]
         fn with_none_fields() {
             let p = UserProfile {
-                user_id: "u2".into(),
+                user_id: test_uuid("u2"),
                 display_name: None,
                 avatar_url: None,
             };
-            assert_eq!(p.user_id, "u2");
+            assert_eq!(p.user_id, test_uuid("u2"));
             assert!(p.display_name.is_none());
             assert!(p.avatar_url.is_none());
         }
@@ -900,11 +903,11 @@ mod tests {
                     .await
                     .expect("init user db");
 
-            let user = get_by_id(test_db.database().orm(), "user1")
+            let user = get_by_id(test_db.database().orm(), test_uuid("user1"))
                 .await
                 .expect("query");
             if let Some(u) = user {
-                assert_eq!(u.user_id, "user1");
+                assert_eq!(u.user_id, test_uuid("user1"));
             }
         }
 
@@ -915,7 +918,7 @@ mod tests {
                     .await
                     .expect("init user db");
 
-            let user = get_by_id(test_db.database().orm(), "__nonexistent__")
+            let user = get_by_id(test_db.database().orm(), test_uuid("__nonexistent__"))
                 .await
                 .expect("query");
             assert!(user.is_none());
@@ -928,11 +931,13 @@ mod tests {
                     .await
                     .expect("init user db");
 
-            let users = get_by_ids(test_db.database().orm(), &["user1".into(), "user2".into()])
-                .await
-                .expect("query");
-            let ids: std::collections::HashSet<_> =
-                users.iter().map(|u| u.user_id.clone()).collect();
+            let users = get_by_ids(
+                test_db.database().orm(),
+                &[test_uuid("user1"), test_uuid("user2")],
+            )
+            .await
+            .expect("query");
+            let ids: std::collections::HashSet<_> = users.iter().map(|u| u.user_id).collect();
             assert_eq!(ids.len(), users.len());
         }
 
@@ -958,11 +963,15 @@ mod tests {
 
             let users = get_by_ids(
                 test_db.database().orm(),
-                &["user1".into(), "__nonexistent__".into()],
+                &[test_uuid("user1"), test_uuid("__nonexistent__")],
             )
             .await
             .expect("query");
-            assert!(users.iter().all(|u| u.user_id != "__nonexistent__"));
+            assert!(
+                users
+                    .iter()
+                    .all(|u| u.user_id != test_uuid("__nonexistent__"))
+            );
         }
 
         #[tokio::test]
@@ -1048,10 +1057,8 @@ mod tests {
                 };
                 let users1 = search_users(session, &page1).await.expect("page1");
                 let users2 = search_users(session, &page2).await.expect("page2");
-                let ids1: std::collections::HashSet<_> =
-                    users1.iter().map(|u| u.user_id.clone()).collect();
-                let ids2: std::collections::HashSet<_> =
-                    users2.iter().map(|u| u.user_id.clone()).collect();
+                let ids1: std::collections::HashSet<_> = users1.iter().map(|u| u.user_id).collect();
+                let ids2: std::collections::HashSet<_> = users2.iter().map(|u| u.user_id).collect();
                 assert!(ids1.intersection(&ids2).next().is_none());
                 Ok(())
             })
@@ -1068,13 +1075,13 @@ mod tests {
 
             lilium_database::transaction!(test_db.database(), |session| {
                 let data = UpsertUserData {
-                    user_id: "new_test_user".into(),
+                    user_id: test_uuid("new_test_user"),
                     full_name: Some("New Test User".into()),
                     bio: Some("Test bio".into()),
                     ..Default::default()
                 };
                 let user = upsert_user(session, &data).await.expect("upsert");
-                assert_eq!(user.user_id, "new_test_user");
+                assert_eq!(user.user_id, test_uuid("new_test_user"));
                 Ok(())
             })
             .await
@@ -1090,12 +1097,12 @@ mod tests {
 
             lilium_database::transaction!(test_db.database(), |session| {
                 let data = UpsertUserData {
-                    user_id: "user1".into(),
+                    user_id: test_uuid("user1"),
                     bio: Some("Updated bio".into()),
                     ..Default::default()
                 };
                 let user = upsert_user(session, &data).await.expect("upsert");
-                assert_eq!(user.user_id, "user1");
+                assert_eq!(user.user_id, test_uuid("user1"));
                 Ok(())
             })
             .await
@@ -1111,7 +1118,7 @@ mod tests {
 
             lilium_database::transaction!(test_db.database(), |session| {
                 let initial = UpsertUserData {
-                    user_id: "avatar_change_user".into(),
+                    user_id: test_uuid("avatar_change_user"),
                     avatar_url: Some("https://example.com/old.png".into()),
                     avatar_file: Some("attachments/avatars/avatar_change_user_old.png".into()),
                     ..Default::default()
@@ -1121,7 +1128,7 @@ mod tests {
                     .expect("insert initial");
 
                 let changed = UpsertUserData {
-                    user_id: "avatar_change_user".into(),
+                    user_id: test_uuid("avatar_change_user"),
                     avatar_url: Some("https://example.com/new.png".into()),
                     avatar_file: None,
                     ..Default::default()
@@ -1150,7 +1157,7 @@ mod tests {
 
             lilium_database::transaction!(test_db.database(), |session| {
                 let initial = UpsertUserData {
-                    user_id: "history_user".into(),
+                    user_id: test_uuid("history_user"),
                     full_name: Some("Old Name".into()),
                     avatar_url: Some("https://example.com/old.png".into()),
                     bio: Some("old bio".into()),
@@ -1161,13 +1168,13 @@ mod tests {
                     .expect("insert initial");
 
                 let initial_history_count = user_history::Entity::find()
-                    .filter(user_history::Column::UserId.eq("history_user"))
+                    .filter(user_history::Column::UserId.eq(test_uuid("history_user")))
                     .count(session)
                     .await?;
                 assert_eq!(initial_history_count, 0);
 
                 let changed = UpsertUserData {
-                    user_id: "history_user".into(),
+                    user_id: test_uuid("history_user"),
                     avatar_url: Some("https://example.com/new.png".into()),
                     bio: Some("new bio".into()),
                     ..Default::default()
@@ -1177,12 +1184,12 @@ mod tests {
                     .expect("upsert changed");
 
                 let snapshot = user_history::Entity::find()
-                    .filter(user_history::Column::UserId.eq("history_user"))
+                    .filter(user_history::Column::UserId.eq(test_uuid("history_user")))
                     .one(session)
                     .await?
                     .expect("history snapshot");
 
-                assert_eq!(snapshot.user_id, "history_user");
+                assert_eq!(snapshot.user_id, test_uuid("history_user"));
                 assert_eq!(snapshot.full_name.as_deref(), Some("Old Name"));
                 assert_eq!(
                     snapshot.avatar_url.as_deref(),
@@ -1204,7 +1211,7 @@ mod tests {
                     .expect("init user db");
 
             lilium_database::transaction!(test_db.database(), |session| {
-                super::increment_message_count(session, "user1")
+                super::increment_message_count(session, test_uuid("user1"))
                     .await
                     .expect("increment");
                 Ok(())
@@ -1221,7 +1228,7 @@ mod tests {
                     .expect("init user db");
 
             lilium_database::transaction!(test_db.database(), |session| {
-                super::increment_deleted_count(session, "user1")
+                super::increment_deleted_count(session, test_uuid("user1"))
                     .await
                     .expect("increment");
                 Ok(())
@@ -1238,7 +1245,7 @@ mod tests {
                     .expect("init user db");
 
             lilium_database::transaction!(test_db.database(), |session| {
-                super::increment_recalled_count(session, "user2")
+                super::increment_recalled_count(session, test_uuid("user2"))
                     .await
                     .expect("increment");
                 Ok(())
@@ -1255,7 +1262,8 @@ mod tests {
                     .expect("init user db");
 
             lilium_database::transaction!(test_db.database(), |session| {
-                let result = super::increment_message_count(session, "__nonexistent__").await;
+                let result =
+                    super::increment_message_count(session, test_uuid("__nonexistent__")).await;
                 assert!(result.is_ok());
                 Ok(())
             })
@@ -1270,11 +1278,11 @@ mod tests {
                     .await
                     .expect("init user db");
 
-            let profile = fetch_user_profile(test_db.database().orm(), "user1")
+            let profile = fetch_user_profile(test_db.database().orm(), test_uuid("user1"))
                 .await
                 .expect("query");
             if let Some(p) = profile {
-                assert_eq!(p.user_id, "user1");
+                assert_eq!(p.user_id, test_uuid("user1"));
             }
         }
 
@@ -1285,9 +1293,10 @@ mod tests {
                     .await
                     .expect("init user db");
 
-            let profile = fetch_user_profile(test_db.database().orm(), "__nonexistent__")
-                .await
-                .expect("query");
+            let profile =
+                fetch_user_profile(test_db.database().orm(), test_uuid("__nonexistent__"))
+                    .await
+                    .expect("query");
             assert!(profile.is_none());
         }
 
@@ -1299,7 +1308,7 @@ mod tests {
                     .expect("init user db");
 
             lilium_database::transaction!(test_db.database(), |session| {
-                let pairs = vec![("user1".into(), "room1".into())];
+                let pairs = vec![(test_uuid("user1"), test_uuid("room1"))];
                 let (new_count, updated_count) = super::batch_fetch_and_update(session, &pairs)
                     .await
                     .expect("batch");
@@ -1317,8 +1326,9 @@ mod tests {
 
         #[test]
         fn from_api_payload_uses_python_aliases_and_defaults() {
+            let user_uuid = test_uuid("user_123");
             let payload = json!({
-                "id": "user_123",
+                "id": user_uuid.to_string(),
                 "fullName": "Primary Name",
                 "displayName": "Fallback Name",
                 "avatar": "https://example.com/avatar.png",
@@ -1332,7 +1342,7 @@ mod tests {
             });
 
             let data = UpsertUserData::from_api_payload(&payload).expect("payload");
-            assert_eq!(data.user_id, "user_123");
+            assert_eq!(data.user_id, test_uuid("user_123"));
             assert_eq!(data.full_name.as_deref(), Some("Primary Name"));
             assert_eq!(
                 data.avatar_url.as_deref(),
@@ -1355,12 +1365,13 @@ mod tests {
         #[test]
         fn from_api_payload_prefers_display_name_when_full_name_missing() {
             let payload = json!({
-                "id": "user_456",
+                "id": test_uuid("user_456").to_string(),
                 "displayName": "Display Name",
                 "avatarUrl": "https://example.com/avatar-2.png"
             });
 
             let data = UpsertUserData::from_api_payload(&payload).expect("payload");
+            assert_eq!(data.user_id, test_uuid("user_456"));
             assert_eq!(data.full_name.as_deref(), Some("Display Name"));
             assert_eq!(
                 data.avatar_url.as_deref(),
@@ -1400,9 +1411,9 @@ mod tests {
             assert!(avatar_url_changed(None, Some("https://example.com/a.png")));
         }
 
-        fn test_user(user_id: &str) -> User {
+        fn test_user(user_id: Uuid) -> User {
             User {
-                user_id: user_id.into(),
+                user_id,
                 full_name: None,
                 avatar_url: None,
                 avatar_file: None,
@@ -1426,16 +1437,16 @@ mod tests {
         #[test]
         fn avatar_sync_plan_matches_python_update_semantics() {
             let existing_same = User {
-                user_id: "u1".into(),
+                user_id: test_uuid("u1"),
                 avatar_url: Some("https://example.com/a.png".into()),
                 avatar_file: Some("attachments/avatars/u1_old.png".into()),
-                ..test_user("u1")
+                ..test_user(test_uuid("u1"))
             };
             let mut fetched_same = User {
-                user_id: "u1".into(),
+                user_id: test_uuid("u1"),
                 avatar_url: Some("https://example.com/a.png".into()),
                 avatar_file: None,
-                ..test_user("u1")
+                ..test_user(test_uuid("u1"))
             };
             let unchanged_plan = apply_avatar_sync_plan(&mut fetched_same, Some(&existing_same));
             assert!(unchanged_plan.is_none());
@@ -1445,39 +1456,39 @@ mod tests {
             );
 
             let existing_changed = User {
-                user_id: "u2".into(),
+                user_id: test_uuid("u2"),
                 avatar_url: Some("https://example.com/old.png".into()),
                 avatar_file: Some("attachments/avatars/u2_old.png".into()),
-                ..test_user("u2")
+                ..test_user(test_uuid("u2"))
             };
             let mut fetched_changed = User {
-                user_id: "u2".into(),
+                user_id: test_uuid("u2"),
                 avatar_url: Some("https://example.com/new.png".into()),
                 avatar_file: None,
-                ..test_user("u2")
+                ..test_user(test_uuid("u2"))
             };
             let changed_plan =
                 apply_avatar_sync_plan(&mut fetched_changed, Some(&existing_changed));
             assert_eq!(
                 changed_plan,
                 Some(AvatarDownload {
-                    user_id: "u2".into(),
+                    user_id: test_uuid("u2"),
                     avatar_url: "https://example.com/new.png".into()
                 })
             );
             assert!(fetched_changed.avatar_file.is_none());
 
             let mut fetched_new = User {
-                user_id: "u3".into(),
+                user_id: test_uuid("u3"),
                 avatar_url: Some("https://example.com/new-user.png".into()),
                 avatar_file: None,
-                ..test_user("u3")
+                ..test_user(test_uuid("u3"))
             };
             let new_plan = apply_avatar_sync_plan(&mut fetched_new, None);
             assert_eq!(
                 new_plan,
                 Some(AvatarDownload {
-                    user_id: "u3".into(),
+                    user_id: test_uuid("u3"),
                     avatar_url: "https://example.com/new-user.png".into()
                 })
             );

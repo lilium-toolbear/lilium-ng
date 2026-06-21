@@ -17,6 +17,101 @@ covers, and what remains to migrate.
 - Move completed gaps into the verified scenario list when code and tests land.
 - Delete obsolete one-off notes after their content is represented here.
 
+## 2026-06-19: Room/message/explore UUID migration (parity with Python `227bc1179`)
+
+Python commit: `dzmm_archive@227bc1179` ("refactor(uuid): complete room and message id cleanup"), Alembic revision `c4e5f6a7b8c9_uuid_migration_room_message_content.py` (+ `e5f6a7b8c9d0` fixing the message-insert notify trigger to cast `NEW.message_id::text`). Runs after the user-chain migration.
+
+Python converted the room/message/explore-content id columns to UUID and restructured `image_gps`. Rust follows for the tables Rust implements.
+
+Python sources read (for type/parity verification):
+
+- `models/dzmm/room.py` — `room_id: UUID`, `creator_id: Optional[UUID]`, `account_ids: List[UUID]`; `from_api` does `UUID(str(...))`.
+- `models/dzmm/room_member.py` — `room_id: UUID`.
+- `models/dzmm/message.py` — `message_id: UUID`, `room_id: UUID`, `reference_message_id: Optional[UUID]`, `sent_by: UUID`, `deleted_by: Optional[UUID]`; `from_api`/`from_websocket` parse via `UUID(str(...))`.
+- `models/dzmm/tweet.py` — `tweet_id`/`user_id`/`parent_tweet_id`/`reply_to_tweet_id`/`post_id` all UUID.
+- `models/dzmm/{book,gallery,chapter,checkpoint}.py` — id + `user_id` UUID; `card.user_id` UUID (`card_id` stays int).
+- `models/dzmm/image_gps.py` — composite PK `(source_type: str, source_id: UUID)`; renamed from single `message_id`.
+- `database/migrations/versions/c4e5f6a7b8c9_uuid_migration_room_message_content.py` — column conversions (`USING x::uuid`), `account_ids` → `uuid[]`, `image_gps` rename + composite PK + `source_type` CHECK.
+- `database/migrations/versions/e5f6a7b8c9d0_fix_message_notify_uuid_payload.py` — `notify_message_inserted()` now `pg_notify('message_inserted', NEW.message_id::text)`.
+
+Rust files changed:
+
+- `crates/lilium-database/testdata/live_schema_bootstrap/0001_live_schema.sql` — declared `uuid` for `rooms.room_id`/`creator_id`/`account_ids` (`uuid[]`), `room_members.room_id`, `messages.message_id`/`room_id`/`reference_message_id`, `tweets.*` id/user/parent/reply/post, `books`/`galleries`/`chapters`/`checkpoints` id+user_id, `cards.user_id`; restructured `image_gps` to `(source_type text, source_id uuid)` composite PK with `idx_image_gps_source`; `notify_message_inserted()` casts `NEW.message_id::text`.
+- `crates/lilium-models/src/dzmm/{room,room_member,message,tweet,book,gallery,card,chapter,checkpoint,image_gps}.rs` — field types → `Uuid`/`Option<Uuid>`/`Vec<Uuid>`; boundary parsers parse via `Uuid::parse_str(s).ok()?`; `image_gps` model now `source_type`+`source_id` composite PK; parity comments updated to `@227bc1179`.
+- `crates/lilium-services/src/{message,room,room_member,explore_content,explore,media,history,sync,user}.rs` — `Uuid` threaded through signatures (`room_id`/`message_id`/`reference_message_id`/explore-content ids); `account_ids` now `Vec<Uuid>` iterated directly; `Message::from_api(data, room_id: Uuid)`; `image_gps` join uses `source_id`+`source_type='message'` condition; `media.rs` inserts `image_gps` with `source_type="message"`; cursor encoding uses `uuid.to_string()`/`Uuid::parse_str`; `user.rs` batch functions take `&[(Uuid, Uuid)]`.
+- `binaries/lilium/src/commands/{event_processor,sync_rooms,sync_members}.rs` — `room_id`/`message_id` parsed to `Uuid` from WebSocket JSON / CLI args; `user_fetch_collector` → `Vec<(Uuid, Uuid, Uuid)>`; `media_message_ids` → `Vec<Uuid>`; `account_ids` iterated as `Vec<Uuid>`. `send_command.rs` keeps room/message CLI args as `String` (JSON/HTTP payload), parses account id to `Uuid` (already done in user-chain step).
+- `crates/lilium-api-client/src/websocket.rs` — `event_to_message`/`decode_message` tests use UUID-shaped `messageId`/`chatroomId`.
+- `crates/lilium-test-fixtures/src/seeds.rs` — `RoomSeed.room_id: Uuid`; `MESSAGE_SERVICE_TEST_ROOMS` → `message_service_test_rooms()` fn using `test_uuid("room1")`.
+
+Divergences documented (in code comments):
+
+- **Boundary parse failure**: same convention as user chain — Rust `.ok()?` skips on non-UUID ids rather than raising like Python `UUID(str(...))`. Not exercised post-migration.
+- **`image_gps` join**: SeaORM `belongs_to` join from `messages.message_id` to `image_gps.source_id` with an `on_condition` requiring `source_type = 'message'` (polymorphic GPS rows have no single FK, mirroring Python).
+
+Remaining gaps (not in this change):
+
+- `bot_memory` — not implemented in Rust.
+- Any Python-side tables Rust doesn't model (games, polls, trpg, etc.) — out of Rust scope.
+
+Verification commands:
+
+```bash
+cargo build --workspace --tests
+cargo test --workspace
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets
+```
+
+All workspace tests green; fmt clean; clippy 0 warnings.
+
+## 2026-06-19: User-chain UUID migration (parity with Python `fea92bfd`)
+
+Python commit: `dzmm_archive@fea92bfdbe3ae0e0ce117fd0b8785099f77b0050` ("Refactor UUID migration final cleanup #1005"), Alembic revision `b53ee175e51c_uuid_migration_user_chain.py`.
+
+Python converted every user-id-shaped column from `text`/`varchar` to PostgreSQL `uuid` (with UUIDv5 mapping of legacy sentinels `system`/`__system__`/`__futures_*__` and coalescing of duplicate alias rows). Rust follows for the subset of tables Rust implements.
+
+Python sources read (for type/parity verification):
+
+- `models/dzmm/user.py` — `user_id: UUID`; `from_api` does `UUID(data["id"])`.
+- `models/dzmm/room_member.py` — `user_id: UUID`, `room_id: str` (room chain not migrated).
+- `models/dzmm/message.py` — `sent_by: UUID`, `deleted_by: Optional[UUID]`; `message_id`/`room_id`/`reference_message_id` stay `str` (message chain not migrated).
+- `models/dzmm/user_history.py` — `user_id: UUID`.
+- `models/ingestion/dzmm_account.py`, `models/ingestion/websocket_connection.py`, `models/ingestion/outgoing_command.py`, `models/ingestion/websocket_event.py` — `user_id`/`account_user_id: UUID`.
+- `models/dzmm/room.py`, `models/dzmm/tweet.py`, `models/dzmm/book.py`, `models/dzmm/gallery.py`, `models/dzmm/card.py` — confirmed `room_id`/`creator_id`/`account_ids` and explore-content `user_id` remain `str` (room/message/explore chains pending in Python).
+- `database/migrations/versions/b53ee175e51c_uuid_migration_user_chain.py` — column conversion + sentinel mapping logic.
+
+Rust files changed:
+
+- `Cargo.toml` — added sea-orm `with-uuid` feature; added `serde`/`v5` to `uuid` features.
+- `crates/lilium-models/Cargo.toml`, `crates/lilium-api-client/Cargo.toml`, `crates/lilium-services/Cargo.toml`, `crates/lilium-test-fixtures/Cargo.toml` — added `uuid.workspace = true`.
+- `crates/lilium-database/testdata/live_schema_bootstrap/0001_live_schema.sql` — declared `uuid` for `users.user_id`, `user_history.user_id`, `room_members.user_id`, `dzmm_account.user_id`, `websocket_connections.account_user_id`, `outgoing_commands.account_user_id`, `messages.sent_by`, `messages.deleted_by`, `websocket_events.user_id`.
+- `crates/lilium-models/src/dzmm/{user,user_history,room_member,account,websocket_connection,outgoing_command,message}.rs`, `crates/lilium-models/src/ingestion/mod.rs` — field types `String`→`Uuid`; boundary parsers (`User::from_api`, `Message::from_api`/`from_websocket`, `RoomMember`/`member_from_api`) parse via `Uuid::parse_str(...).ok()?`.
+- `crates/lilium-api-client/src/websocket.rs` — `WsClient.account_id: Uuid`.
+- `crates/lilium-services/src/{account,event,explore,history,media,message,outgoing_command,room,room_member,sync,user,websocket_connection}.rs` — `Uuid` threaded through signatures; `account.user_id.to_string()` at the `DzmmApiAuth` HTTP boundary; `room.account_ids` (text) parsed to `Uuid` at `account::get_account` call sites; `user_id::text ILIKE` cast in user search.
+- `binaries/lilium/src/commands/{event_processor,send_command,sync_members,sync_rooms}.rs`, `binaries/lilium/src/commands/ws_client/{arbiter,control,ingestion,mod,worker}.rs` — `Uuid` threaded; CLI/socket string↔Uuid parsing at process/control boundaries; `EventIngestor`/`SpillRecord`/`Worker`/`WorkerHandle` account ids `Uuid`; `run_worker` parses the CLI arg to `Uuid`.
+- `crates/lilium-test-fixtures/src/util.rs` (new) — `test_uuid(name)` deterministic UUIDv5 name→Uuid helper for tests; `seeds.rs` maps seed user names through `test_uuid`.
+
+Divergences documented (in code comments):
+
+- **Boundary parse failure**: Python `UUID(...)` raises `ValueError`; Rust's `Option`-returning parsers `.ok()?` (skip the record) instead. Post-migration DZMM only emits UUID-shaped user ids, so not exercised in practice.
+- **No runtime sentinel mapping**: Rust has no `bot_memory` model and no string user-id sentinels (`"system"` etc. only appear as `content_type`, not user ids), so the UUIDv5 sentinel mapping lives only in the Python Alembic revision.
+
+Remaining gaps (not in this change — pending in Python):
+
+- Room chain (`rooms.room_id`/`creator_id`/`account_ids`, `room_members.room_id`) — Python Task 5.
+- Message-id chain (`messages.message_id`/`room_id`/`reference_message_id`, partition rewrite) — Python Task 7.
+- Explore-content chain (`tweet`/`book`/`gallery`/`card`/`chapter`/`checkpoint` `user_id`) — Python Task 6.
+- `bot_memory` — not implemented in Rust.
+
+Verification commands:
+
+```bash
+cargo build --workspace --tests
+cargo test --workspace
+```
+
+All workspace tests green (DB-backed via `TEST_DATABASE_URL`); `calculate_lock_id` test preserved by hashing the canonical hyphenated UUID string.
+
 ## 2026-06-18: Code quality review and logic consistency fixes
 
 Python commit: `dzmm_archive@18fdefbc0b6979178d7f1eb4ce0624ec4a60a2f2`

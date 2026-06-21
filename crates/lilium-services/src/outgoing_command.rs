@@ -8,6 +8,7 @@ use sea_orm::{
     QuerySelect, Set,
 };
 use tracing::instrument;
+use uuid::Uuid;
 
 type OutgoingCommand = outgoing_commands::Model;
 
@@ -70,7 +71,7 @@ pub(crate) fn is_ready_for_processing(
 #[instrument(level = "debug" skip(db, data), fields(account_user_id = %account_user_id, event = %event, require_ack, has_max_attempts = max_attempts.is_some()))]
 pub async fn create_command<C>(
     db: &C,
-    account_user_id: &str,
+    account_user_id: Uuid,
     event: &str,
     data: serde_json::Value,
     require_ack: bool,
@@ -82,7 +83,7 @@ where
     let max_attempts = max_attempts.unwrap_or_else(|| default_max_attempts_for_event(event));
 
     let command = outgoing_commands::ActiveModel {
-        account_user_id: Set(account_user_id.to_owned()),
+        account_user_id: Set(account_user_id),
         event: Set(event.to_owned()),
         data: Set(data),
         require_ack: Set(require_ack),
@@ -101,7 +102,7 @@ where
 #[instrument(level = "debug" skip(db), fields(account_user_id = %account_user_id, limit))]
 pub async fn get_pending_commands<C>(
     db: &C,
-    account_user_id: &str,
+    account_user_id: Uuid,
     limit: i64,
 ) -> Result<Vec<OutgoingCommand>>
 where
@@ -316,6 +317,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lilium_test_fixtures::test_uuid;
 
     mod test_default_max_attempts {
         use super::*;
@@ -388,7 +390,7 @@ mod tests {
             OutgoingCommand {
                 id: 1,
                 created_at: Utc::now(),
-                account_user_id: "user1".into(),
+                account_user_id: test_uuid("user1"),
                 event: event.into(),
                 data: serde_json::json!({}),
                 require_ack: true,
@@ -434,7 +436,7 @@ mod tests {
             OutgoingCommand {
                 id: 1,
                 created_at,
-                account_user_id: "user1".into(),
+                account_user_id: test_uuid("user1"),
                 event: "message:send".into(),
                 data: serde_json::json!({}),
                 require_ack: true,
@@ -494,7 +496,7 @@ mod tests {
             OutgoingCommand {
                 id: 1,
                 created_at,
-                account_user_id: "user1".into(),
+                account_user_id: test_uuid("user1"),
                 event: event.into(),
                 data: serde_json::json!({}),
                 require_ack: true,
@@ -550,7 +552,7 @@ mod tests {
             lilium_database::transaction!(test_db.database(), |tx| {
                 let cmd = create_command(
                     tx,
-                    "user1",
+                    test_uuid("user1"),
                     "message:send",
                     serde_json::json!({"room_id": "room1", "text": "hello"}),
                     true,
@@ -558,7 +560,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                assert_eq!(cmd.account_user_id, "user1");
+                assert_eq!(cmd.account_user_id, test_uuid("user1"));
                 assert_eq!(cmd.event, "message:send");
                 assert!(cmd.require_ack);
                 assert_eq!(cmd.max_attempts, 6);
@@ -581,7 +583,7 @@ mod tests {
             lilium_database::transaction!(test_db.database(), |tx| {
                 let cmd = create_command(
                     tx,
-                    "user1",
+                    test_uuid("user1"),
                     "message:join-room",
                     serde_json::json!({}),
                     true,
@@ -607,7 +609,7 @@ mod tests {
             lilium_database::transaction!(test_db.database(), |tx| {
                 let cmd = create_command(
                     tx,
-                    "user1",
+                    test_uuid("user1"),
                     "test:event",
                     serde_json::json!({}),
                     false,
@@ -632,10 +634,16 @@ mod tests {
             .expect("init outgoing command db");
 
             lilium_database::transaction!(test_db.database(), |tx| {
-                let cmd =
-                    create_command(tx, "user1", "test:event", serde_json::json!({}), true, None)
-                        .await
-                        .unwrap();
+                let cmd = create_command(
+                    tx,
+                    test_uuid("user1"),
+                    "test:event",
+                    serde_json::json!({}),
+                    true,
+                    None,
+                )
+                .await
+                .unwrap();
                 assert!(cmd.id > 0);
                 Ok(())
             })
@@ -654,7 +662,7 @@ mod tests {
             lilium_database::transaction!(test_db.database(), |tx| {
                 let cmd1 = create_command(
                     tx,
-                    "user1",
+                    test_uuid("user1"),
                     "event:a",
                     serde_json::json!({"n": 1}),
                     true,
@@ -664,7 +672,7 @@ mod tests {
                 .unwrap();
                 let cmd2 = create_command(
                     tx,
-                    "user1",
+                    test_uuid("user1"),
                     "event:b",
                     serde_json::json!({"n": 2}),
                     true,
@@ -674,7 +682,7 @@ mod tests {
                 .unwrap();
                 let cmd3 = create_command(
                     tx,
-                    "user1",
+                    test_uuid("user1"),
                     "event:c",
                     serde_json::json!({"n": 3}),
                     true,
@@ -705,7 +713,7 @@ mod tests {
             lilium_database::transaction!(test_db.database(), |tx| {
                 let cmd1 = create_command(
                     tx,
-                    "user1",
+                    test_uuid("user1"),
                     "event:a",
                     serde_json::json!({"n": 1}),
                     true,
@@ -715,7 +723,7 @@ mod tests {
                 .unwrap();
                 let cmd2 = create_command(
                     tx,
-                    "user1",
+                    test_uuid("user1"),
                     "event:b",
                     serde_json::json!({"n": 2}),
                     true,
@@ -725,7 +733,7 @@ mod tests {
                 .unwrap();
                 let cmd3 = create_command(
                     tx,
-                    "user1",
+                    test_uuid("user1"),
                     "event:c",
                     serde_json::json!({"n": 3}),
                     true,
@@ -733,7 +741,9 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                let pending = get_pending_commands(tx, "user1", 10).await.unwrap();
+                let pending = get_pending_commands(tx, test_uuid("user1"), 10)
+                    .await
+                    .unwrap();
                 assert_eq!(pending.len(), 3);
                 assert_eq!(pending[0].id, cmd1.id);
                 assert_eq!(pending[1].id, cmd2.id);
@@ -753,18 +763,45 @@ mod tests {
             .expect("init outgoing command db");
 
             lilium_database::transaction!(test_db.database(), |tx| {
-                create_command(tx, "user1", "event:a", serde_json::json!({}), true, None)
+                create_command(
+                    tx,
+                    test_uuid("user1"),
+                    "event:a",
+                    serde_json::json!({}),
+                    true,
+                    None,
+                )
+                .await
+                .unwrap();
+                create_command(
+                    tx,
+                    test_uuid("user2"),
+                    "event:b",
+                    serde_json::json!({}),
+                    true,
+                    None,
+                )
+                .await
+                .unwrap();
+                create_command(
+                    tx,
+                    test_uuid("user1"),
+                    "event:c",
+                    serde_json::json!({}),
+                    true,
+                    None,
+                )
+                .await
+                .unwrap();
+                let pending_user1 = get_pending_commands(tx, test_uuid("user1"), 10)
                     .await
                     .unwrap();
-                create_command(tx, "user2", "event:b", serde_json::json!({}), true, None)
-                    .await
-                    .unwrap();
-                create_command(tx, "user1", "event:c", serde_json::json!({}), true, None)
-                    .await
-                    .unwrap();
-                let pending_user1 = get_pending_commands(tx, "user1", 10).await.unwrap();
                 assert_eq!(pending_user1.len(), 2);
-                assert!(pending_user1.iter().all(|c| c.account_user_id == "user1"));
+                assert!(
+                    pending_user1
+                        .iter()
+                        .all(|c| c.account_user_id == test_uuid("user1"))
+                );
                 Ok(())
             })
             .await
@@ -783,7 +820,7 @@ mod tests {
                 for i in 0..5 {
                     create_command(
                         tx,
-                        "user1",
+                        test_uuid("user1"),
                         &format!("event:{}", i),
                         serde_json::json!({}),
                         true,
@@ -792,7 +829,9 @@ mod tests {
                     .await
                     .unwrap();
                 }
-                let pending = get_pending_commands(tx, "user1", 3).await.unwrap();
+                let pending = get_pending_commands(tx, test_uuid("user1"), 3)
+                    .await
+                    .unwrap();
                 assert_eq!(pending.len(), 3);
                 Ok(())
             })
@@ -809,7 +848,7 @@ mod tests {
             .expect("init outgoing command db");
 
             lilium_database::transaction!(test_db.database(), |tx| {
-                let pending = get_pending_commands(tx, "user_nonexistent", 10)
+                let pending = get_pending_commands(tx, test_uuid("user_nonexistent"), 10)
                     .await
                     .unwrap();
                 assert!(pending.is_empty());

@@ -15,6 +15,7 @@ use std::time::Duration;
 use tokio::net::UnixListener;
 use tokio::sync::Notify;
 use tracing::{error, info, instrument, warn};
+use uuid::Uuid;
 
 use crate::commands::ws_client::control::{
     self, ControlAction, ControlCommand, ControlResponse, read_message, write_message,
@@ -22,7 +23,7 @@ use crate::commands::ws_client::control::{
 use crate::commands::ws_client::ingestion::{DiskSpillBuffer, EventIngestor, EventWriter};
 
 pub struct Worker {
-    account_id: String,
+    account_id: Uuid,
     database: Database,
     runtime: WorkerRuntimeConfig,
 }
@@ -39,7 +40,7 @@ pub struct WorkerRuntimeConfig {
 }
 
 struct WebsocketRunContext {
-    account_id: String,
+    account_id: Uuid,
     database: Database,
     websocket_url: String,
     reconnect_delay_ms: u64,
@@ -51,7 +52,7 @@ struct WebsocketRunContext {
 }
 
 struct WorkerControlContext {
-    account_id: String,
+    account_id: Uuid,
     ingestor: Arc<EventIngestor>,
     writer: Arc<EventWriter>,
     socket_executor: SocketCommandExecutor,
@@ -61,7 +62,7 @@ struct WorkerControlContext {
 }
 
 impl Worker {
-    pub fn new(account_id: String, database: Database, runtime: WorkerRuntimeConfig) -> Self {
+    pub fn new(account_id: Uuid, database: Database, runtime: WorkerRuntimeConfig) -> Self {
         Self {
             account_id,
             database,
@@ -82,8 +83,7 @@ impl Worker {
         let spill = DiskSpillBuffer::new(buffer_path);
 
         // Create event ingestor
-        let (ingestor, rx) =
-            EventIngestor::new(self.account_id.clone(), self.runtime.queue_size, spill);
+        let (ingestor, rx) = EventIngestor::new(self.account_id, self.runtime.queue_size, spill);
         let ingestor = Arc::new(ingestor);
 
         // Create event writer
@@ -106,13 +106,13 @@ impl Worker {
             .context("connect websocket advisory-lock session")?;
         let lock_id = websocket_connection::acquire_dedicated_connection_lock(
             &mut lock_connection,
-            &self.account_id,
+            self.account_id,
         )
         .await
         .context("acquire websocket advisory lock")?;
         let lock_connection = Arc::new(tokio::sync::Mutex::new(lock_connection));
         let ws_fut = Self::run_websocket(WebsocketRunContext {
-            account_id: self.account_id.clone(),
+            account_id: self.account_id,
             database: self.database.clone(),
             websocket_url: self.runtime.websocket_url.clone(),
             reconnect_delay_ms: self.runtime.reconnect_delay_ms,
@@ -124,7 +124,7 @@ impl Worker {
         });
 
         let command_fut = Self::run_outgoing_command_listener(
-            self.account_id.clone(),
+            self.account_id,
             self.database.clone(),
             self.runtime.notification_config.clone(),
             socket_executor.clone(),
@@ -162,7 +162,7 @@ impl Worker {
         let control_fut = Self::run_control_server(
             control_listener,
             WorkerControlContext {
-                account_id: self.account_id.clone(),
+                account_id: self.account_id,
                 ingestor: ingestor.clone(),
                 writer: writer.clone(),
                 socket_executor: socket_executor.clone(),
@@ -173,7 +173,7 @@ impl Worker {
         );
 
         let heartbeat_fut = Self::run_heartbeat_loop(
-            self.account_id.clone(),
+            self.account_id,
             lock_id,
             lock_connection.clone(),
             socket_executor.clone(),
@@ -251,25 +251,24 @@ impl Worker {
         Ok(())
     }
 
-    async fn build_auth_client(database: &Database, account_id: &str) -> Result<DzmmApi> {
-        let account_id = account_id.to_string();
-        let lookup_account_id = account_id.clone();
+    async fn build_auth_client(database: &Database, account_id: Uuid) -> Result<DzmmApi> {
+        let lookup_account_id = account_id;
         let account = lilium_database::transaction!(database, |session| {
-            let account = account::get_account(session, &lookup_account_id).await?;
+            let account = account::get_account(session, lookup_account_id).await?;
             Ok(account)
         })
         .await?
         .with_context(|| format!("Account '{}' not found", account_id))?;
 
         let database_for_callback = database.clone();
-        let account_id_for_callback = account_id.clone();
+        let account_id_for_callback = account_id;
         let on_cookies_refreshed: CookieRefreshCallback = Arc::new(move |cookies| {
             let database = database_for_callback.clone();
-            let account_id = account_id_for_callback.clone();
+            let account_id = account_id_for_callback;
             Box::pin(async move {
-                let update_account_id = account_id.clone();
+                let update_account_id = account_id;
                 let result = lilium_database::transaction!(database, |session| {
-                    account::update_cookies(session, &update_account_id, &cookies).await?;
+                    account::update_cookies(session, update_account_id, &cookies).await?;
                     Ok(())
                 })
                 .await;
@@ -296,7 +295,7 @@ impl Worker {
             signin_code_image: account.signin_code_image,
             signin_code_image_mime: account.signin_code_image_mime.map(Cow::Owned),
             cookies: account.cookies.map(Cow::Owned),
-            user_id: Some(Cow::Owned(account.user_id)),
+            user_id: Some(Cow::Owned(account.user_id.to_string())),
             auto_refresh: true,
             on_cookies_refreshed: Some(on_cookies_refreshed),
         })
@@ -325,17 +324,14 @@ impl Worker {
             }
 
             let result = async {
-                let auth = Self::build_auth_client(&database, &account_id).await?;
+                let auth = Self::build_auth_client(&database, account_id).await?;
                 auth.authenticate()
                     .await
                     .context("DZMM authentication failed")?;
                 let cookie_header = auth.get_cookie_string().await;
 
-                let mut client = WsClient::new(
-                    account_id.clone(),
-                    websocket_url.clone(),
-                    Some(cookie_header),
-                );
+                let mut client =
+                    WsClient::new(account_id, websocket_url.clone(), Some(cookie_header));
                 let ingest = ingestor.clone();
                 let ws_stop = stop_event.clone();
                 let ws_shutdown = shutdown.clone();
@@ -387,7 +383,7 @@ impl Worker {
 
     #[instrument(level = "debug" skip_all)]
     async fn run_outgoing_command_listener(
-        account_id: String,
+        account_id: Uuid,
         database: Database,
         notification_config: NotificationDatabaseConfig,
         socket_executor: SocketCommandExecutor,
@@ -407,7 +403,7 @@ impl Worker {
             .await
             .context("listen for outgoing command notifications")?;
 
-        Self::process_pending_commands(&account_id, &database, &socket_executor, &reconnect_notify)
+        Self::process_pending_commands(account_id, &database, &socket_executor, &reconnect_notify)
             .await?;
 
         let mut polling = tokio::time::interval(POLLING_INTERVAL);
@@ -429,7 +425,7 @@ impl Worker {
                         "received outgoing command notification"
                     );
                     Self::process_pending_commands(
-                        &account_id,
+                        account_id,
                         &database,
                         &socket_executor,
                         &reconnect_notify,
@@ -438,7 +434,7 @@ impl Worker {
                 }
                 _ = polling.tick() => {
                     Self::process_pending_commands(
-                        &account_id,
+                        account_id,
                         &database,
                         &socket_executor,
                         &reconnect_notify,
@@ -485,7 +481,7 @@ impl Worker {
     }
 
     async fn run_heartbeat_loop(
-        account_id: String,
+        account_id: Uuid,
         lock_id: i64,
         lock_connection: Arc<tokio::sync::Mutex<DedicatedDbConnection>>,
         socket_executor: SocketCommandExecutor,
@@ -514,7 +510,7 @@ impl Worker {
                             let mut connection = lock_connection.lock().await;
                             websocket_connection::ensure_dedicated_connection_lock(
                                 &mut connection,
-                                &account_id,
+                                account_id,
                                 Some(lock_id),
                             )
                             .await
@@ -589,16 +585,14 @@ impl Worker {
     }
 
     async fn process_pending_commands(
-        account_id: &str,
+        account_id: Uuid,
         database: &Database,
         socket_executor: &SocketCommandExecutor,
         reconnect_notify: &Arc<Notify>,
     ) -> Result<()> {
-        let account_id_owned = account_id.to_owned();
         let db = database.clone();
         let commands = lilium_database::transaction!(db, |session| {
-            let commands =
-                outgoing_command::get_pending_commands(session, &account_id_owned, 100).await?;
+            let commands = outgoing_command::get_pending_commands(session, account_id, 100).await?;
             Ok(commands)
         })
         .await?;

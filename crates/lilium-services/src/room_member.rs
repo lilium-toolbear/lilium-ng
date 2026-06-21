@@ -10,6 +10,7 @@ use sea_orm::{
     QuerySelect, Set,
 };
 use tracing::instrument;
+use uuid::Uuid;
 
 type RoomMember = room_members::Model;
 
@@ -20,23 +21,23 @@ pub struct BatchUpsertResult {
     pub new: usize,
     pub updated: usize,
     pub left: usize,
-    pub new_user_ids: Vec<String>,
+    pub new_user_ids: Vec<Uuid>,
 }
 
 #[instrument(level = "debug" skip(db), fields(room_id = %room_id, user_id = %user_id))]
 pub async fn get_member_info(
     db: &impl ConnectionTrait,
-    room_id: &str,
-    user_id: &str,
+    room_id: Uuid,
+    user_id: Uuid,
 ) -> Result<Option<RoomMember>> {
-    let member = room_members::Entity::find_by_id((room_id.to_owned(), user_id.to_owned()))
+    let member = room_members::Entity::find_by_id((room_id, user_id))
         .one(db)
         .await?;
     Ok(member)
 }
 
 #[instrument(level = "debug" skip(db), fields(room_id = %room_id, user_id = %user_id))]
-pub async fn is_member(db: &impl ConnectionTrait, room_id: &str, user_id: &str) -> Result<bool> {
+pub async fn is_member(db: &impl ConnectionTrait, room_id: Uuid, user_id: Uuid) -> Result<bool> {
     let member = room_members::Entity::find()
         .filter(room_members::Column::RoomId.eq(room_id))
         .filter(room_members::Column::UserId.eq(user_id))
@@ -49,40 +50,37 @@ pub async fn is_member(db: &impl ConnectionTrait, room_id: &str, user_id: &str) 
 #[instrument(level = "debug" skip(db, user_ids), fields(room_id = %room_id, user_count = user_ids.len(), has_account_user_id = _account_user_id.is_some()))]
 pub async fn get_active_members_by_ids(
     db: &impl ConnectionTrait,
-    room_id: &str,
-    user_ids: &[String],
-    _account_user_id: Option<&str>,
-) -> Result<HashMap<String, RoomMember>> {
+    room_id: Uuid,
+    user_ids: &[Uuid],
+    _account_user_id: Option<Uuid>,
+) -> Result<HashMap<Uuid, RoomMember>> {
     if user_ids.is_empty() {
         return Ok(HashMap::new());
     }
     let members: Vec<RoomMember> = room_members::Entity::find()
         .filter(room_members::Column::RoomId.eq(room_id))
-        .filter(room_members::Column::UserId.is_in(user_ids.iter().cloned()))
+        .filter(room_members::Column::UserId.is_in(user_ids.iter().copied()))
         .filter(room_members::Column::LeftAt.is_null())
         .all(db)
         .await?
         .into_iter()
         .collect();
-    let map = members
-        .into_iter()
-        .map(|m| (m.user_id.clone(), m))
-        .collect();
+    let map = members.into_iter().map(|m| (m.user_id, m)).collect();
     Ok(map)
 }
 
 #[instrument(level = "debug" skip(db), fields(room_id = %room_id, user_id = %user_id, role = %role, has_joined_at = joined_at.is_some()))]
 pub async fn upsert_member(
     db: &impl ConnectionTrait,
-    room_id: &str,
-    user_id: &str,
+    room_id: Uuid,
+    user_id: Uuid,
     role: &str,
     joined_at: Option<DateTime<Utc>>,
 ) -> Result<()> {
     let now = Utc::now();
     room_members::Entity::insert(room_members::ActiveModel {
-        room_id: Set(room_id.to_owned()),
-        user_id: Set(user_id.to_owned()),
+        room_id: Set(room_id),
+        user_id: Set(user_id),
         role: Set(Some(role.to_owned())),
         joined_at: Set(joined_at),
         raw_data: Set(None),
@@ -108,8 +106,8 @@ pub async fn upsert_member(
 #[instrument(level = "debug" skip(db), fields(room_id = %room_id, user_id = %user_id, role = %role, has_joined_at = joined_at.is_some()))]
 pub async fn upsert_member_simple(
     db: &impl ConnectionTrait,
-    room_id: &str,
-    user_id: &str,
+    room_id: Uuid,
+    user_id: Uuid,
     role: &str,
     joined_at: Option<DateTime<Utc>>,
 ) -> Result<()> {
@@ -119,11 +117,11 @@ pub async fn upsert_member_simple(
 #[instrument(level = "debug" skip(db), fields(room_id = %room_id, user_id = %user_id, has_left_at = left_at.is_some()))]
 pub async fn mark_member_left(
     db: &impl ConnectionTrait,
-    room_id: &str,
-    user_id: &str,
+    room_id: Uuid,
+    user_id: Uuid,
     left_at: Option<DateTime<Utc>>,
 ) -> Result<bool> {
-    if let Some(member) = room_members::Entity::find_by_id((room_id.to_owned(), user_id.to_owned()))
+    if let Some(member) = room_members::Entity::find_by_id((room_id, user_id))
         .filter(room_members::Column::LeftAt.is_null())
         .one(db)
         .await?
@@ -138,7 +136,7 @@ pub async fn mark_member_left(
 }
 
 #[instrument(level = "debug" skip(db), fields(room_id = %room_id))]
-pub async fn get_member_count(db: &impl ConnectionTrait, room_id: &str) -> Result<i64> {
+pub async fn get_member_count(db: &impl ConnectionTrait, room_id: Uuid) -> Result<i64> {
     let count = room_members::Entity::find()
         .select_only()
         .column_as(room_members::Column::UserId.count(), "count")
@@ -155,7 +153,7 @@ pub async fn get_member_count(db: &impl ConnectionTrait, room_id: &str) -> Resul
 #[instrument(level = "debug" skip(db), fields(room_id = %room_id, limit, offset))]
 pub async fn get_room_members(
     db: &impl ConnectionTrait,
-    room_id: &str,
+    room_id: Uuid,
     limit: i64,
     offset: i64,
 ) -> Result<Vec<RoomMember>> {
@@ -179,7 +177,7 @@ pub async fn get_room_members(
 #[instrument(level = "debug", skip(db, members_data), fields(room_id = %room_id, api_count = members_data.len()))]
 pub async fn batch_upsert_members<C>(
     db: &C,
-    room_id: &str,
+    room_id: Uuid,
     members_data: &[serde_json::Value],
 ) -> Result<BatchUpsertResult>
 where
@@ -195,22 +193,22 @@ where
         .filter(room_members::Column::LeftAt.is_null())
         .all(db)
         .await?;
-    let existing_active_ids: std::collections::HashSet<String> =
-        existing_active.iter().map(|m| m.user_id.clone()).collect();
+    let existing_active_ids: std::collections::HashSet<Uuid> =
+        existing_active.iter().map(|m| m.user_id).collect();
 
     // Step 2: parse API members, track api user_ids and new user_ids.
     let now = Utc::now();
     let mut members_to_upsert: Vec<room_members::ActiveModel> = Vec::new();
-    let mut api_user_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut new_user_ids: Vec<String> = Vec::new();
+    let mut api_user_ids: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    let mut new_user_ids: Vec<Uuid> = Vec::new();
 
     for data in members_data {
         let Some((user_id, mut member)) = member_from_api(data, room_id) else {
             continue;
         };
-        api_user_ids.insert(user_id.clone());
+        api_user_ids.insert(user_id);
         if !existing_active_ids.contains(&user_id) {
-            new_user_ids.push(user_id.clone());
+            new_user_ids.push(user_id);
         }
         // created_at/updated_at set by from_api; ensure updated_at reflects now.
         member.updated_at = Set(now);
@@ -222,9 +220,9 @@ where
     }
 
     // Step 3: mark members who left (in DB active set but not in API response).
-    let left_user_ids: Vec<String> = existing_active_ids
+    let left_user_ids: Vec<Uuid> = existing_active_ids
         .difference(&api_user_ids)
-        .cloned()
+        .copied()
         .collect();
     let left_count = left_user_ids.len();
     if !left_user_ids.is_empty() {
@@ -270,7 +268,7 @@ where
 /// Remove all members for a room (bulk DELETE). Mirrors Python
 /// `RoomMemberService.clear_room_members`. Returns rows affected.
 #[instrument(level = "debug", skip(db), fields(room_id = %room_id))]
-pub async fn clear_room_members<C>(db: &C, room_id: &str) -> Result<u64>
+pub async fn clear_room_members<C>(db: &C, room_id: Uuid) -> Result<u64>
 where
     C: ConnectionTrait,
 {
@@ -285,8 +283,8 @@ where
 /// Returns `(user_id, ActiveModel)` or `None` if no user_id can be extracted.
 fn member_from_api(
     data: &serde_json::Value,
-    room_id: &str,
-) -> Option<(String, room_members::ActiveModel)> {
+    room_id: Uuid,
+) -> Option<(Uuid, room_members::ActiveModel)> {
     let user_id = data
         .get("id")
         .and_then(|v| v.as_str())
@@ -295,8 +293,8 @@ fn member_from_api(
             data.get("user")
                 .and_then(|v| v.get("id"))
                 .and_then(|v| v.as_str())
-        })?
-        .to_owned();
+        })
+        .and_then(|s| Uuid::parse_str(s).ok())?;
 
     let role = data
         .get("role")
@@ -313,8 +311,8 @@ fn member_from_api(
     let now = Utc::now();
 
     let member = room_members::ActiveModel {
-        room_id: Set(room_id.to_owned()),
-        user_id: Set(user_id.clone()),
+        room_id: Set(room_id),
+        user_id: Set(user_id),
         role: Set(role),
         joined_at: Set(joined_at),
         left_at: Set(None),
@@ -329,6 +327,7 @@ fn member_from_api(
 mod tests {
     use super::*;
     use chrono::Utc;
+    use lilium_test_fixtures::test_uuid;
 
     mod room_member_struct {
         use super::*;
@@ -337,8 +336,8 @@ mod tests {
         fn construction() {
             let now = Utc::now();
             let m = lilium_models::dzmm::room_member::RoomMember {
-                room_id: "r1".into(),
-                user_id: "u1".into(),
+                room_id: test_uuid("r1"),
+                user_id: test_uuid("u1"),
                 role: Some("member".into()),
                 joined_at: Some(now),
                 left_at: None,
@@ -346,8 +345,8 @@ mod tests {
                 created_at: now,
                 updated_at: now,
             };
-            assert_eq!(m.room_id, "r1");
-            assert_eq!(m.user_id, "u1");
+            assert_eq!(m.room_id, test_uuid("r1"));
+            assert_eq!(m.user_id, test_uuid("u1"));
             assert_eq!(m.role.as_deref(), Some("member"));
             assert!(m.joined_at.is_some());
             assert!(m.left_at.is_none());
@@ -357,8 +356,8 @@ mod tests {
         fn admin_role() {
             let now = Utc::now();
             let m = lilium_models::dzmm::room_member::RoomMember {
-                room_id: "r1".into(),
-                user_id: "u1".into(),
+                room_id: test_uuid("r1"),
+                user_id: test_uuid("u1"),
                 role: Some("admin".into()),
                 joined_at: None,
                 left_at: None,
@@ -373,8 +372,8 @@ mod tests {
         fn creator_role() {
             let now = Utc::now();
             let m = lilium_models::dzmm::room_member::RoomMember {
-                room_id: "r1".into(),
-                user_id: "u1".into(),
+                room_id: test_uuid("r1"),
+                user_id: test_uuid("u1"),
                 role: Some("creator".into()),
                 joined_at: None,
                 left_at: None,
@@ -390,8 +389,8 @@ mod tests {
             let now = Utc::now();
             let left_at = Utc::now();
             let m = lilium_models::dzmm::room_member::RoomMember {
-                room_id: "r1".into(),
-                user_id: "u2".into(),
+                room_id: test_uuid("r1"),
+                user_id: test_uuid("u2"),
                 role: Some("member".into()),
                 joined_at: Some(now),
                 left_at: Some(left_at),
@@ -415,16 +414,22 @@ mod tests {
             .expect("init room member db");
             let db = test_db.database().orm();
             let now = Utc::now();
-            upsert_member(db, "test_r", "test_u", "member", Some(now))
-                .await
-                .expect("upsert");
-            let member = get_member_info(db, "test_r", "test_u")
+            upsert_member(
+                db,
+                test_uuid("test_r"),
+                test_uuid("test_u"),
+                "member",
+                Some(now),
+            )
+            .await
+            .expect("upsert");
+            let member = get_member_info(db, test_uuid("test_r"), test_uuid("test_u"))
                 .await
                 .expect("query");
             assert!(member.is_some());
             if let Some(m) = member {
-                assert_eq!(m.room_id, "test_r");
-                assert_eq!(m.user_id, "test_u");
+                assert_eq!(m.room_id, test_uuid("test_r"));
+                assert_eq!(m.user_id, test_uuid("test_u"));
                 assert_eq!(m.role.as_deref(), Some("member"));
             }
         }
@@ -437,7 +442,7 @@ mod tests {
             .await
             .expect("init room member db");
             let db = test_db.database().orm();
-            let member = get_member_info(db, "__no_room__", "__no_user__")
+            let member = get_member_info(db, test_uuid("__no_room__"), test_uuid("__no_user__"))
                 .await
                 .expect("query");
             assert!(member.is_none());
@@ -452,10 +457,16 @@ mod tests {
             .expect("init room member db");
             let db = test_db.database().orm();
             let now = Utc::now();
-            upsert_member(db, "test_r1", "test_u", "member", Some(now))
-                .await
-                .expect("upsert");
-            let member = get_member_info(db, "test_r2", "test_u")
+            upsert_member(
+                db,
+                test_uuid("test_r1"),
+                test_uuid("test_u"),
+                "member",
+                Some(now),
+            )
+            .await
+            .expect("upsert");
+            let member = get_member_info(db, test_uuid("test_r2"), test_uuid("test_u"))
                 .await
                 .expect("query");
             assert!(member.is_none());
@@ -470,11 +481,17 @@ mod tests {
             .expect("init room member db");
             let db = test_db.database().orm();
             let now = Utc::now();
-            upsert_member(db, "test_is_member", "test_u", "member", Some(now))
-                .await
-                .expect("upsert");
+            upsert_member(
+                db,
+                test_uuid("test_is_member"),
+                test_uuid("test_u"),
+                "member",
+                Some(now),
+            )
+            .await
+            .expect("upsert");
             assert!(
-                is_member(db, "test_is_member", "test_u")
+                is_member(db, test_uuid("test_is_member"), test_uuid("test_u"))
                     .await
                     .expect("query")
             );
@@ -489,7 +506,7 @@ mod tests {
             .expect("init room member db");
             let db = test_db.database().orm();
             assert!(
-                !is_member(db, "__no_room__", "__no_user__")
+                !is_member(db, test_uuid("__no_room__"), test_uuid("__no_user__"))
                     .await
                     .expect("query")
             );
@@ -504,19 +521,25 @@ mod tests {
             .expect("init room member db");
             let db = test_db.database().orm();
             let now = Utc::now();
-            upsert_member(db, "test_active", "test_u1", "member", Some(now))
-                .await
-                .expect("upsert");
+            upsert_member(
+                db,
+                test_uuid("test_active"),
+                test_uuid("test_u1"),
+                "member",
+                Some(now),
+            )
+            .await
+            .expect("upsert");
             let members = get_active_members_by_ids(
                 db,
-                "test_active",
-                &["test_u1".into(), "test_u1".into()],
+                test_uuid("test_active"),
+                &[test_uuid("test_u1"), test_uuid("test_u1")],
                 None,
             )
             .await
             .expect("query");
             assert_eq!(members.len(), 1);
-            assert!(members.contains_key("test_u1"));
+            assert!(members.contains_key(&test_uuid("test_u1")));
         }
 
         #[tokio::test]
@@ -527,7 +550,7 @@ mod tests {
             .await
             .expect("init room member db");
             let db = test_db.database().orm();
-            let members = get_active_members_by_ids(db, "test_r", &[], None)
+            let members = get_active_members_by_ids(db, test_uuid("test_r"), &[], None)
                 .await
                 .expect("query");
             assert!(members.is_empty());
@@ -542,10 +565,16 @@ mod tests {
             .expect("init room member db");
             let db = test_db.database().orm();
             let now = Utc::now();
-            upsert_member(db, "test_new_r", "test_new_u", "member", Some(now))
-                .await
-                .expect("upsert");
-            let member = get_member_info(db, "test_new_r", "test_new_u")
+            upsert_member(
+                db,
+                test_uuid("test_new_r"),
+                test_uuid("test_new_u"),
+                "member",
+                Some(now),
+            )
+            .await
+            .expect("upsert");
+            let member = get_member_info(db, test_uuid("test_new_r"), test_uuid("test_new_u"))
                 .await
                 .expect("query");
             assert!(member.is_some());
@@ -560,13 +589,25 @@ mod tests {
             .expect("init room member db");
             let db = test_db.database().orm();
             let now = Utc::now();
-            upsert_member(db, "test_upd_r", "test_upd_u", "member", Some(now))
-                .await
-                .expect("upsert member");
-            upsert_member(db, "test_upd_r", "test_upd_u", "admin", Some(now))
-                .await
-                .expect("upsert admin");
-            let member = get_member_info(db, "test_upd_r", "test_upd_u")
+            upsert_member(
+                db,
+                test_uuid("test_upd_r"),
+                test_uuid("test_upd_u"),
+                "member",
+                Some(now),
+            )
+            .await
+            .expect("upsert member");
+            upsert_member(
+                db,
+                test_uuid("test_upd_r"),
+                test_uuid("test_upd_u"),
+                "admin",
+                Some(now),
+            )
+            .await
+            .expect("upsert admin");
+            let member = get_member_info(db, test_uuid("test_upd_r"), test_uuid("test_upd_u"))
                 .await
                 .expect("query");
             assert_eq!(member.unwrap().role.as_deref(), Some("admin"));
@@ -581,12 +622,19 @@ mod tests {
             .expect("init room member db");
             let db = test_db.database().orm();
             let now = Utc::now();
-            upsert_member_simple(db, "test_simple_r", "test_simple_u", "creator", Some(now))
-                .await
-                .expect("upsert");
-            let member = get_member_info(db, "test_simple_r", "test_simple_u")
-                .await
-                .expect("query");
+            upsert_member_simple(
+                db,
+                test_uuid("test_simple_r"),
+                test_uuid("test_simple_u"),
+                "creator",
+                Some(now),
+            )
+            .await
+            .expect("upsert");
+            let member =
+                get_member_info(db, test_uuid("test_simple_r"), test_uuid("test_simple_u"))
+                    .await
+                    .expect("query");
             assert_eq!(member.unwrap().role.as_deref(), Some("creator"));
         }
 
@@ -599,24 +647,36 @@ mod tests {
             .expect("init room member db");
             let db = test_db.database().orm();
             let now = Utc::now();
-            upsert_member(db, "test_rejoin_r", "test_rejoin_u", "member", Some(now))
-                .await
-                .expect("upsert");
-            mark_member_left(db, "test_rejoin_r", "test_rejoin_u", Some(Utc::now()))
-                .await
-                .expect("mark left");
+            upsert_member(
+                db,
+                test_uuid("test_rejoin_r"),
+                test_uuid("test_rejoin_u"),
+                "member",
+                Some(now),
+            )
+            .await
+            .expect("upsert");
+            mark_member_left(
+                db,
+                test_uuid("test_rejoin_r"),
+                test_uuid("test_rejoin_u"),
+                Some(Utc::now()),
+            )
+            .await
+            .expect("mark left");
             upsert_member_simple(
                 db,
-                "test_rejoin_r",
-                "test_rejoin_u",
+                test_uuid("test_rejoin_r"),
+                test_uuid("test_rejoin_u"),
                 "member",
                 Some(Utc::now()),
             )
             .await
             .expect("rejoin");
-            let member = get_member_info(db, "test_rejoin_r", "test_rejoin_u")
-                .await
-                .expect("query");
+            let member =
+                get_member_info(db, test_uuid("test_rejoin_r"), test_uuid("test_rejoin_u"))
+                    .await
+                    .expect("query");
             assert!(member.unwrap().left_at.is_none());
         }
 
@@ -629,15 +689,26 @@ mod tests {
             .expect("init room member db");
             let db = test_db.database().orm();
             let now = Utc::now();
-            upsert_member(db, "test_leave_r", "test_leave_u", "member", Some(now))
-                .await
-                .expect("upsert");
+            upsert_member(
+                db,
+                test_uuid("test_leave_r"),
+                test_uuid("test_leave_u"),
+                "member",
+                Some(now),
+            )
+            .await
+            .expect("upsert");
             let left_at = Utc::now();
-            let marked = mark_member_left(db, "test_leave_r", "test_leave_u", Some(left_at))
-                .await
-                .expect("mark left");
+            let marked = mark_member_left(
+                db,
+                test_uuid("test_leave_r"),
+                test_uuid("test_leave_u"),
+                Some(left_at),
+            )
+            .await
+            .expect("mark left");
             assert!(marked);
-            let member = get_member_info(db, "test_leave_r", "test_leave_u")
+            let member = get_member_info(db, test_uuid("test_leave_r"), test_uuid("test_leave_u"))
                 .await
                 .expect("query");
             assert!(member.unwrap().left_at.is_some());
@@ -651,9 +722,10 @@ mod tests {
             .await
             .expect("init room member db");
             let db = test_db.database().orm();
-            let marked = mark_member_left(db, "__no_room__", "__no_user__", None)
-                .await
-                .expect("mark left");
+            let marked =
+                mark_member_left(db, test_uuid("__no_room__"), test_uuid("__no_user__"), None)
+                    .await
+                    .expect("mark left");
             assert!(!marked);
         }
 
@@ -665,7 +737,9 @@ mod tests {
             .await
             .expect("init room member db");
             let db = test_db.database().orm();
-            let count = get_member_count(db, "__empty_room__").await.expect("count");
+            let count = get_member_count(db, test_uuid("__empty_room__"))
+                .await
+                .expect("count");
             assert_eq!(count, 0);
         }
 
@@ -678,16 +752,36 @@ mod tests {
             .expect("init room member db");
             let db = test_db.database().orm();
             let now = Utc::now();
-            upsert_member(db, "test_count_r", "test_u1", "member", Some(now))
+            upsert_member(
+                db,
+                test_uuid("test_count_r"),
+                test_uuid("test_u1"),
+                "member",
+                Some(now),
+            )
+            .await
+            .expect("upsert u1");
+            upsert_member(
+                db,
+                test_uuid("test_count_r"),
+                test_uuid("test_u2"),
+                "member",
+                Some(now),
+            )
+            .await
+            .expect("upsert u2");
+            upsert_member(
+                db,
+                test_uuid("test_count_r"),
+                test_uuid("test_u3"),
+                "member",
+                Some(now),
+            )
+            .await
+            .expect("upsert u3");
+            let count = get_member_count(db, test_uuid("test_count_r"))
                 .await
-                .expect("upsert u1");
-            upsert_member(db, "test_count_r", "test_u2", "member", Some(now))
-                .await
-                .expect("upsert u2");
-            upsert_member(db, "test_count_r", "test_u3", "member", Some(now))
-                .await
-                .expect("upsert u3");
-            let count = get_member_count(db, "test_count_r").await.expect("count");
+                .expect("count");
             assert_eq!(count, 3);
         }
 
@@ -700,20 +794,32 @@ mod tests {
             .expect("init room member db");
             let db = test_db.database().orm();
             let now = Utc::now();
-            upsert_member(db, "test_list_r", "test_u1", "member", Some(now))
-                .await
-                .expect("upsert");
-            upsert_member(db, "test_list_r", "test_u2", "admin", Some(now))
-                .await
-                .expect("upsert");
-            let members = get_room_members(db, "test_list_r", 100, 0)
+            upsert_member(
+                db,
+                test_uuid("test_list_r"),
+                test_uuid("test_u1"),
+                "member",
+                Some(now),
+            )
+            .await
+            .expect("upsert");
+            upsert_member(
+                db,
+                test_uuid("test_list_r"),
+                test_uuid("test_u2"),
+                "admin",
+                Some(now),
+            )
+            .await
+            .expect("upsert");
+            let members = get_room_members(db, test_uuid("test_list_r"), 100, 0)
                 .await
                 .expect("query");
             assert_eq!(members.len(), 2);
             let ids: std::collections::HashSet<_> =
                 members.into_iter().map(|m| m.user_id).collect();
-            assert!(ids.contains("test_u1"));
-            assert!(ids.contains("test_u2"));
+            assert!(ids.contains(&test_uuid("test_u1")));
+            assert!(ids.contains(&test_uuid("test_u2")));
         }
 
         #[tokio::test]
@@ -724,7 +830,7 @@ mod tests {
             .await
             .expect("init room member db");
             let db = test_db.database().orm();
-            let members = get_room_members(db, "__empty_room__", 100, 0)
+            let members = get_room_members(db, test_uuid("__empty_room__"), 100, 0)
                 .await
                 .expect("query");
             assert!(members.is_empty());
@@ -739,17 +845,29 @@ mod tests {
             .expect("init room member db");
             let db = test_db.database().orm();
             let now = Utc::now();
-            upsert_member(db, "test_room_a", "test_u1", "member", Some(now))
-                .await
-                .expect("upsert");
-            upsert_member(db, "test_room_b", "test_u2", "member", Some(now))
-                .await
-                .expect("upsert");
-            let members = get_room_members(db, "test_room_a", 100, 0)
+            upsert_member(
+                db,
+                test_uuid("test_room_a"),
+                test_uuid("test_u1"),
+                "member",
+                Some(now),
+            )
+            .await
+            .expect("upsert");
+            upsert_member(
+                db,
+                test_uuid("test_room_b"),
+                test_uuid("test_u2"),
+                "member",
+                Some(now),
+            )
+            .await
+            .expect("upsert");
+            let members = get_room_members(db, test_uuid("test_room_a"), 100, 0)
                 .await
                 .expect("query");
             assert_eq!(members.len(), 1);
-            assert_eq!(members[0].user_id, "test_u1");
+            assert_eq!(members[0].user_id, test_uuid("test_u1"));
         }
     }
 
@@ -757,8 +875,8 @@ mod tests {
         use super::*;
         use serde_json::json;
 
-        fn member(user_id: &str, role: &str) -> serde_json::Value {
-            json!({"id": user_id, "role": role, "joinedAt": "2024-01-01T00:00:00Z"})
+        fn member(user_id: Uuid, role: &str) -> serde_json::Value {
+            json!({"id": user_id.to_string(), "role": role, "joinedAt": "2024-01-01T00:00:00Z"})
         }
 
         #[tokio::test]
@@ -771,12 +889,21 @@ mod tests {
             let db = test_db.database().orm();
 
             // Seed an active member who will later leave.
-            upsert_member(db, "room-x", "u-old", "member", Some(Utc::now()))
-                .await
-                .expect("seed");
+            upsert_member(
+                db,
+                test_uuid("room-x"),
+                test_uuid("u-old"),
+                "member",
+                Some(Utc::now()),
+            )
+            .await
+            .expect("seed");
 
-            let data = vec![member("u-a", "member"), member("u-b", "admin")];
-            let result = batch_upsert_members(db, "room-x", &data)
+            let data = vec![
+                member(test_uuid("u-a"), "member"),
+                member(test_uuid("u-b"), "admin"),
+            ];
+            let result = batch_upsert_members(db, test_uuid("room-x"), &data)
                 .await
                 .expect("upsert");
             assert_eq!(result.new, 2);
@@ -784,17 +911,20 @@ mod tests {
             assert_eq!(result.left, 1); // u-old left
             assert_eq!(
                 result.new_user_ids,
-                vec!["u-a".to_string(), "u-b".to_string()]
+                vec![test_uuid("u-a"), test_uuid("u-b")]
             );
 
             // u-old should have left_at set.
-            let old = get_member_info(db, "room-x", "u-old")
+            let old = get_member_info(db, test_uuid("room-x"), test_uuid("u-old"))
                 .await
                 .unwrap()
                 .unwrap();
             assert!(old.left_at.is_some());
             // Returning members are active.
-            let a = get_member_info(db, "room-x", "u-a").await.unwrap().unwrap();
+            let a = get_member_info(db, test_uuid("room-x"), test_uuid("u-a"))
+                .await
+                .unwrap()
+                .unwrap();
             assert!(a.left_at.is_none());
         }
 
@@ -807,19 +937,26 @@ mod tests {
             .expect("init room member db");
             let db = test_db.database().orm();
 
-            upsert_member(db, "room-y", "u-a", "member", Some(Utc::now()))
-                .await
-                .expect("seed");
-            let marked = mark_member_left(db, "room-y", "u-a", Some(Utc::now()))
-                .await
-                .expect("leave");
+            upsert_member(
+                db,
+                test_uuid("room-y"),
+                test_uuid("u-a"),
+                "member",
+                Some(Utc::now()),
+            )
+            .await
+            .expect("seed");
+            let marked =
+                mark_member_left(db, test_uuid("room-y"), test_uuid("u-a"), Some(Utc::now()))
+                    .await
+                    .expect("leave");
             assert!(
                 marked,
                 "mark_member_left should have found the active member"
             );
 
-            let data = vec![member("u-a", "admin")];
-            let result = batch_upsert_members(db, "room-y", &data)
+            let data = vec![member(test_uuid("u-a"), "admin")];
+            let result = batch_upsert_members(db, test_uuid("room-y"), &data)
                 .await
                 .expect("upsert");
             // A returning (previously-left) member is not in existing_active, so
@@ -827,7 +964,10 @@ mod tests {
             assert_eq!(result.new, 1);
             assert_eq!(result.updated, 0);
             assert_eq!(result.left, 0);
-            let a = get_member_info(db, "room-y", "u-a").await.unwrap().unwrap();
+            let a = get_member_info(db, test_uuid("room-y"), test_uuid("u-a"))
+                .await
+                .unwrap()
+                .unwrap();
             assert!(a.left_at.is_none()); // cleared
             assert_eq!(a.role.as_deref(), Some("admin"));
         }
@@ -841,15 +981,29 @@ mod tests {
             .expect("init room member db");
             let db = test_db.database().orm();
 
-            upsert_member(db, "room-z", "u-a", "member", Some(Utc::now()))
+            upsert_member(
+                db,
+                test_uuid("room-z"),
+                test_uuid("u-a"),
+                "member",
+                Some(Utc::now()),
+            )
+            .await
+            .expect("seed");
+            upsert_member(
+                db,
+                test_uuid("room-z"),
+                test_uuid("u-b"),
+                "member",
+                Some(Utc::now()),
+            )
+            .await
+            .expect("seed");
+            let deleted = clear_room_members(db, test_uuid("room-z"))
                 .await
-                .expect("seed");
-            upsert_member(db, "room-z", "u-b", "member", Some(Utc::now()))
-                .await
-                .expect("seed");
-            let deleted = clear_room_members(db, "room-z").await.expect("clear");
+                .expect("clear");
             assert_eq!(deleted, 2);
-            assert_eq!(get_member_count(db, "room-z").await.unwrap(), 0);
+            assert_eq!(get_member_count(db, test_uuid("room-z")).await.unwrap(), 0);
         }
     }
 }

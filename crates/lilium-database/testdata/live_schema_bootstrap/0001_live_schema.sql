@@ -188,7 +188,7 @@ CREATE FUNCTION public.notify_message_inserted() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
         BEGIN
-            PERFORM pg_notify('message_inserted', NEW.message_id);
+            PERFORM pg_notify('message_inserted', NEW.message_id::text);
             RETURN NEW;
         END;
         $$;
@@ -326,7 +326,7 @@ $$;
 
 
 CREATE TABLE public.users (
-    user_id character varying NOT NULL,
+    user_id uuid NOT NULL,
     full_name character varying,
     avatar_url character varying,
     bio character varying,
@@ -390,7 +390,7 @@ CREATE TRIGGER users_name_tsv_update BEFORE INSERT OR UPDATE ON public.users FOR
 
 CREATE TABLE public.user_history (
     id integer NOT NULL,
-    user_id character varying NOT NULL,
+    user_id uuid NOT NULL,
     full_name character varying,
     avatar_url character varying,
     bio character varying,
@@ -445,14 +445,14 @@ CREATE INDEX ix_user_history_user_id ON public.user_history USING btree (user_id
 
 
 CREATE TABLE public.rooms (
-    room_id character varying NOT NULL,
+    room_id uuid NOT NULL,
     title character varying NOT NULL,
     chat_type character varying,
     avatar_url character varying,
     member_count integer,
     tags text[],
     is_public boolean DEFAULT false,
-    creator_id character varying,
+    creator_id uuid,
     last_message_at timestamp with time zone,
     first_message_at timestamp with time zone,
     backfill_until timestamp with time zone,
@@ -467,7 +467,7 @@ CREATE TABLE public.rooms (
     raw_data jsonb,
     created_at timestamp with time zone NOT NULL,
     updated_at timestamp with time zone NOT NULL,
-    account_ids text[] DEFAULT '{}'::text[] NOT NULL
+    account_ids uuid[] DEFAULT '{}'::uuid[] NOT NULL
 );
 
 
@@ -508,8 +508,8 @@ CREATE INDEX ix_rooms_message_count ON public.rooms USING btree (message_count);
 
 
 CREATE TABLE public.room_members (
-    room_id character varying NOT NULL,
-    user_id character varying NOT NULL,
+    room_id uuid NOT NULL,
+    user_id uuid NOT NULL,
     role character varying,
     joined_at timestamp with time zone,
     raw_data jsonb,
@@ -548,7 +548,7 @@ CREATE INDEX ix_room_members_user_id ON public.room_members USING btree (user_id
 
 
 CREATE TABLE public.dzmm_account (
-    user_id character varying NOT NULL,
+    user_id uuid NOT NULL,
     user_profile jsonb NOT NULL,
     email character varying,
     password character varying,
@@ -585,7 +585,7 @@ ALTER TABLE ONLY public.dzmm_account
 
 CREATE TABLE public.websocket_connections (
     lock_id bigint NOT NULL,
-    account_user_id character varying NOT NULL,
+    account_user_id uuid NOT NULL,
     connected_at timestamp with time zone NOT NULL,
     last_heartbeat timestamp with time zone NOT NULL
 );
@@ -637,7 +637,7 @@ ALTER TABLE ONLY public.websocket_connections
 CREATE TABLE public.outgoing_commands (
     id integer NOT NULL,
     created_at timestamp with time zone NOT NULL,
-    account_user_id character varying NOT NULL,
+    account_user_id uuid NOT NULL,
     event character varying NOT NULL,
     data jsonb NOT NULL,
     require_ack boolean NOT NULL,
@@ -733,10 +733,10 @@ ALTER TABLE ONLY public.event_processor_offsets
 
 
 CREATE TABLE public.messages (
-    message_id text NOT NULL,
-    room_id text NOT NULL,
+    message_id uuid NOT NULL,
+    room_id uuid NOT NULL,
     sent_at timestamp with time zone NOT NULL,
-    sent_by text NOT NULL,
+    sent_by uuid NOT NULL,
     content_type text NOT NULL,
     content_text text,
     content_tsv tsvector,
@@ -751,11 +751,11 @@ CREATE TABLE public.messages (
     updated_at timestamp with time zone,
     is_deleted boolean DEFAULT false NOT NULL,
     deleted_at timestamp with time zone,
-    deleted_by text,
+    deleted_by uuid,
     is_recalled boolean DEFAULT false NOT NULL,
     is_edited boolean DEFAULT false NOT NULL,
     history jsonb,
-    reference_message_id text,
+    reference_message_id uuid,
     reference_data jsonb
 )
 PARTITION BY RANGE (sent_at);
@@ -840,7 +840,8 @@ CREATE INDEX ix_messages_sticker_id ON ONLY public.messages USING btree (sticker
 
 
 CREATE TABLE public.image_gps (
-    message_id character varying NOT NULL,
+    source_type text NOT NULL,
+    source_id uuid NOT NULL,
     latitude double precision NOT NULL,
     longitude double precision NOT NULL,
     altitude double precision,
@@ -851,11 +852,11 @@ CREATE TABLE public.image_gps (
 
 
 ALTER TABLE ONLY public.image_gps
-    ADD CONSTRAINT image_gps_pkey PRIMARY KEY (message_id);
+    ADD CONSTRAINT image_gps_pkey PRIMARY KEY (source_type, source_id);
 
 
 
-CREATE INDEX idx_image_gps_message_id ON public.image_gps USING btree (message_id);
+CREATE INDEX idx_image_gps_source ON public.image_gps USING btree (source_type, source_id);
 
 
 
@@ -879,7 +880,7 @@ CREATE TRIGGER messages_fts_update BEFORE INSERT OR UPDATE ON public.messages FO
 CREATE TABLE public.websocket_events (
     id bigint NOT NULL,
     "timestamp" timestamp with time zone NOT NULL,
-    user_id text NOT NULL,
+    user_id uuid NOT NULL,
     event text NOT NULL,
     data jsonb NOT NULL
 )
@@ -922,19 +923,19 @@ CREATE TRIGGER websocket_event_inserted_trigger AFTER INSERT ON public.websocket
 -- Explore content tables (Python parity: dzmm_archive models/dzmm/{tweet,card,gallery,checkpoint,book,chapter}.py)
 
 CREATE TABLE public.tweets (
-    tweet_id text NOT NULL,
-    user_id text,
+    tweet_id uuid NOT NULL,
+    user_id uuid,
     content text,
     media_urls text[],
     local_media_paths text[],
     source text,
     tweet_type text,
-    parent_tweet_id text,
-    reply_to_tweet_id text,
+    parent_tweet_id uuid,
+    reply_to_tweet_id uuid,
     reply_to_username text,
     is_edited boolean NOT NULL DEFAULT false,
     edit_history jsonb,
-    post_id text,
+    post_id uuid,
     draw_id text,
     likes_count integer NOT NULL DEFAULT 0,
     comments_count integer NOT NULL DEFAULT 0,
@@ -961,7 +962,7 @@ CREATE TABLE public.cards (
     original_filename text,
     creator text,
     creator_notes text,
-    user_id text,
+    user_id uuid,
     creator_full_name text,
     creator_avatar_url text,
     tags text[],
@@ -987,9 +988,9 @@ CREATE INDEX idx_cards_likes_count ON public.cards USING btree (likes_count);
 CREATE INDEX idx_cards_created_at ON public.cards USING btree (created_at);
 
 CREATE TABLE public.galleries (
-    gallery_id text NOT NULL,
+    gallery_id uuid NOT NULL,
     title text,
-    user_id text,
+    user_id uuid,
     user_full_name text,
     user_avatar_url text,
     images text[],
@@ -1008,11 +1009,11 @@ CREATE INDEX idx_galleries_likes_count ON public.galleries USING btree (likes_co
 CREATE INDEX idx_galleries_created_at ON public.galleries USING btree (created_at);
 
 CREATE TABLE public.checkpoints (
-    checkpoint_id text NOT NULL,
+    checkpoint_id uuid NOT NULL,
     name text,
     description text,
     is_public boolean NOT NULL DEFAULT true,
-    user_id text,
+    user_id uuid,
     user_name text,
     user_avatar_url text,
     creator jsonb,
@@ -1033,7 +1034,7 @@ CREATE INDEX idx_checkpoints_share_code ON public.checkpoints USING btree (share
 CREATE INDEX idx_checkpoints_created_at ON public.checkpoints USING btree (created_at);
 
 CREATE TABLE public.books (
-    book_id text NOT NULL,
+    book_id uuid NOT NULL,
     title text,
     description text,
     slug text,
@@ -1041,7 +1042,7 @@ CREATE TABLE public.books (
     is_public boolean NOT NULL DEFAULT true,
     cover_image_url text,
     local_cover_path text,
-    user_id text,
+    user_id uuid,
     author jsonb,
     chapter_count integer NOT NULL DEFAULT 0,
     total_word_count integer NOT NULL DEFAULT 0,
@@ -1063,12 +1064,12 @@ CREATE INDEX idx_books_likes_count ON public.books USING btree (likes_count);
 CREATE INDEX idx_books_created_at ON public.books USING btree (created_at);
 
 CREATE TABLE public.chapters (
-    chapter_id text NOT NULL,
+    chapter_id uuid NOT NULL,
     title text,
     content text,
     is_adult boolean NOT NULL DEFAULT false,
     is_nsfw boolean NOT NULL DEFAULT false,
-    user_id text,
+    user_id uuid,
     author jsonb,
     likes_count integer NOT NULL DEFAULT 0,
     comments_count integer NOT NULL DEFAULT 0,

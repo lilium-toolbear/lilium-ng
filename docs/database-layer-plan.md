@@ -124,6 +124,20 @@ imports table modules directly from `lilium_models::dzmm` and
 `lilium_models::ingestion`, and uses local raw-query structs only for non-table
 projections such as enriched search rows and aggregate stats.
 
+### User-chain UUID columns
+
+After the Python user-chain UUID migration (`dzmm_archive@fea92bfd`), the
+following columns are PostgreSQL `uuid` (not `text`): `users.user_id`,
+`user_history.user_id`, `room_members.user_id`, `dzmm_account.user_id`,
+`websocket_connections.account_user_id`, `outgoing_commands.account_user_id`,
+`messages.sent_by`, `messages.deleted_by`, `websocket_events.user_id`. The
+SeaORM models type these as `uuid::Uuid` (sea-orm `with-uuid` feature enabled)
+and boundary parsers (`User::from_api`, `Message::from_api`/`from_websocket`,
+`RoomMember::member_from_api`) parse the DZMM string id via `Uuid::parse_str`.
+Columns still `text`/`varchar`: `messages.content_type`/`source`/`content_text`, `rooms.title`/`chat_type`/`tags` (`text[]`), `image_gps.source_type`, `event` names, `processor_id`. The bootstrap SQL in `crates/lilium-database/testdata/live_schema_bootstrap` mirrors this.
+
+After the Python room/message/explore migration (`dzmm_archive@227bc1179`), the following are also `uuid`: `rooms.room_id`/`creator_id`/`account_ids` (`uuid[]`), `room_members.room_id`, `messages.message_id`/`room_id`/`reference_message_id`, `tweets.tweet_id`/`user_id`/`parent_tweet_id`/`reply_to_tweet_id`/`post_id`, `books`/`galleries`/`chapters`/`checkpoints` id+`user_id`, `cards.user_id` (`card_id` stays `int`). `image_gps` was restructured to a composite PK `(source_type text, source_id uuid)` where `source_type` is `'message'` or `'tweet'`. The SeaORM models type these as `Uuid`/`Option<Uuid>`/`Vec<Uuid>` and boundary parsers parse via `Uuid::parse_str`. `room.account_ids` is `Vec<Uuid>` iterated directly; `DzmmApiAuth.user_id` stays a string for HTTP transport (`account.user_id.to_string()`). The `notify_message_inserted()` trigger casts `NEW.message_id::text` for `pg_notify`.
+
 ## Test Fixtures
 
 Database-backed tests use guard-style fixtures:

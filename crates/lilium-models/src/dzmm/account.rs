@@ -2,14 +2,14 @@ use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
-// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 models/ingestion/dzmm_account.py
+// Python parity source: dzmm_archive@fea92bfdbe3ae0e0ce117fd0b8785099f77b0050 models/ingestion/dzmm_account.py
 pub type DzmmAccount = Model;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "dzmm_account")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
-    pub user_id: String,
+    pub user_id: Uuid,
     pub user_profile: serde_json::Value,
     pub email: Option<String>,
     pub password: Option<String>,

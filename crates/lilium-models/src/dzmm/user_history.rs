@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
-// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 models/dzmm/user_history.py
+// Python parity source: dzmm_archive@fea92bfdbe3ae0e0ce117fd0b8785099f77b0050 models/dzmm/user_history.py
 pub type UserHistory = Model;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
@@ -10,7 +10,7 @@ pub type UserHistory = Model;
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
-    pub user_id: String,
+    pub user_id: Uuid,
     pub full_name: Option<String>,
     pub avatar_url: Option<String>,
     pub bio: Option<String>,

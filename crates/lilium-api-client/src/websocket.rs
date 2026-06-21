@@ -19,6 +19,7 @@ use tokio_tungstenite::{
 use tracing::instrument;
 use tracing::{error, info, warn};
 use url::Url;
+use uuid::Uuid;
 
 pub struct WebSocketEventDecoder;
 
@@ -130,7 +131,7 @@ impl WebSocketEventDecoder {
 }
 
 pub struct WsClient {
-    account_id: String,
+    account_id: Uuid,
     url: String,
     cookie_header: Option<String>,
 }
@@ -250,7 +251,7 @@ impl SocketCommandExecutor {
 
 impl WsClient {
     #[instrument(level = "debug" fields(account_id = %account_id, has_cookie_header = cookie_header.is_some()))]
-    pub fn new(account_id: String, url: String, cookie_header: Option<String>) -> Self {
+    pub fn new(account_id: Uuid, url: String, cookie_header: Option<String>) -> Self {
         Self {
             account_id,
             url,
@@ -292,10 +293,10 @@ impl WsClient {
             .opening_header("Cache-Control", "no-cache")
             .opening_header("Pragma", "no-cache");
 
-        let account_id = self.account_id.clone();
+        let account_id = self.account_id;
         let on_event_connect = on_event.clone();
         builder = builder.on("connect", move |_, _| {
-            let account_id = account_id.clone();
+            let account_id = account_id;
             let on_event = on_event_connect.clone();
             async move {
                 info!(account = %account_id, "Connected to DZMM WebSocket");
@@ -314,12 +315,12 @@ impl WsClient {
             .boxed()
         });
 
-        let account_id = self.account_id.clone();
+        let account_id = self.account_id;
         let on_event_disconnect = on_event.clone();
         let disconnect_notify_disconnect = disconnect_notify.clone();
         let disconnect_state_disconnect = disconnect_state.clone();
         builder = builder.on("disconnect", move |_, _| {
-            let account_id = account_id.clone();
+            let account_id = account_id;
             let on_event = on_event_disconnect.clone();
             let disconnect_notify = disconnect_notify_disconnect.clone();
             let disconnect_state = disconnect_state_disconnect.clone();
@@ -342,12 +343,12 @@ impl WsClient {
             .boxed()
         });
 
-        let account_id = self.account_id.clone();
+        let account_id = self.account_id;
         let on_event_error = on_event.clone();
         let disconnect_notify_error = disconnect_notify.clone();
         let disconnect_state_error = disconnect_state.clone();
         builder = builder.on("error", move |payload, _| {
-            let account_id = account_id.clone();
+            let account_id = account_id;
             let on_event = on_event_error.clone();
             let disconnect_notify = disconnect_notify_error.clone();
             let disconnect_state = disconnect_state_error.clone();
@@ -371,9 +372,9 @@ impl WsClient {
             .boxed()
         });
 
-        let account_id = self.account_id.clone();
+        let account_id = self.account_id;
         builder = builder.on_any(move |event, payload, _| {
-            let account_id = account_id.clone();
+            let account_id = account_id;
             let on_event = on_event.clone();
             async move {
                 let event_name: String = event.into();
@@ -767,7 +768,7 @@ mod tests {
     #[test]
     fn websocket_builder_matches_python_socketio_endpoint() {
         let client = WsClient::new(
-            "account-1".to_string(),
+            Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap(),
             crate::config::DZMM_SOCKETIO_URL.to_string(),
             Some("session=abc".to_string()),
         );
@@ -852,7 +853,7 @@ mod tests {
             "chatroomId": "room123",
             "message": {
                 "messageId": "msg456",
-                "sentBy": "user789",
+                "sentBy": "00000000-0000-4000-8000-000000000001",
                 "sentAt": "2026-01-01T00:00:00Z",
                 "content": {
                     "type": "text",
@@ -980,10 +981,10 @@ mod tests {
     #[test]
     fn test_decode_message() {
         let data = serde_json::json!({
-            "chatroomId": "room123",
+            "chatroomId": "00000000-0000-4000-8000-000000000021",
             "message": {
-                "messageId": "msg456",
-                "sentBy": "user789",
+                "messageId": "00000000-0000-4000-8000-000000000011",
+                "sentBy": "00000000-0000-4000-8000-000000000001",
                 "sentAt": "2026-01-01T00:00:00Z",
                 "content": {
                     "type": "text",
@@ -992,16 +993,22 @@ mod tests {
             }
         });
         let msg = WebSocketEventDecoder::decode_message(&data).unwrap();
-        assert_eq!(msg.message_id, "msg456");
-        assert_eq!(msg.room_id, "room123");
+        assert_eq!(
+            msg.message_id,
+            Uuid::parse_str("00000000-0000-4000-8000-000000000011").unwrap()
+        );
+        assert_eq!(
+            msg.room_id,
+            Uuid::parse_str("00000000-0000-4000-8000-000000000021").unwrap()
+        );
     }
 
     #[test]
     fn test_event_to_message_with_room_id() {
         let data = serde_json::json!({
             "message": {
-                "messageId": "msg789",
-                "sentBy": "user1",
+                "messageId": "00000000-0000-4000-8000-000000000012",
+                "sentBy": "00000000-0000-4000-8000-000000000001",
                 "sentAt": "2026-01-01T00:00:00Z",
                 "content": {
                     "type": "text",
@@ -1009,18 +1016,28 @@ mod tests {
                 }
             }
         });
-        let msg = WebSocketEventDecoder::event_to_message(&data, Some("room456")).unwrap();
-        assert_eq!(msg.message_id, "msg789");
-        assert_eq!(msg.room_id, "room456");
+        let msg = WebSocketEventDecoder::event_to_message(
+            &data,
+            Some("00000000-0000-4000-8000-000000000022"),
+        )
+        .unwrap();
+        assert_eq!(
+            msg.message_id,
+            Uuid::parse_str("00000000-0000-4000-8000-000000000012").unwrap()
+        );
+        assert_eq!(
+            msg.room_id,
+            Uuid::parse_str("00000000-0000-4000-8000-000000000022").unwrap()
+        );
     }
 
     #[test]
     fn test_event_to_message_from_envelope() {
         let data = serde_json::json!({
-            "roomId": "room789",
+            "roomId": "00000000-0000-4000-8000-000000000023",
             "message": {
-                "messageId": "msg101",
-                "sentBy": "user2",
+                "messageId": "00000000-0000-4000-8000-000000000013",
+                "sentBy": "00000000-0000-4000-8000-000000000001",
                 "sentAt": "2026-01-01T00:00:00Z",
                 "content": {
                     "type": "text",
@@ -1029,8 +1046,14 @@ mod tests {
             }
         });
         let msg = WebSocketEventDecoder::event_to_message(&data, None).unwrap();
-        assert_eq!(msg.message_id, "msg101");
-        assert_eq!(msg.room_id, "room789");
+        assert_eq!(
+            msg.message_id,
+            Uuid::parse_str("00000000-0000-4000-8000-000000000013").unwrap()
+        );
+        assert_eq!(
+            msg.room_id,
+            Uuid::parse_str("00000000-0000-4000-8000-000000000023").unwrap()
+        );
     }
 
     #[test]

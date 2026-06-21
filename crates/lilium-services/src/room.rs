@@ -10,6 +10,7 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set,
 };
 use tracing::instrument;
+use uuid::Uuid;
 
 /// Filters for [`get_all_rooms`]. Mirrors Python `services/types.py::RoomFilters`.
 #[derive(Debug, Clone, Default)]
@@ -19,31 +20,29 @@ pub struct RoomFilters {
     pub is_public: Option<bool>,
     pub search_query: Option<String>,
     pub has_messages: Option<bool>,
-    pub account_id: Option<String>,
+    pub account_id: Option<Uuid>,
 }
 
 /// Parsed room fields extracted from a DZMM API chat dict (`Room.from_api`).
 struct ParsedRoom {
-    room_id: String,
+    room_id: Uuid,
     title: String,
     chat_type: Option<String>,
     avatar_url: Option<String>,
     member_count: Option<i32>,
     tags: Option<Vec<String>>,
     is_public: Option<bool>,
-    creator_id: Option<String>,
+    creator_id: Option<Uuid>,
     last_message_at: Option<DateTime<Utc>>,
     dissolved_at: Option<DateTime<Utc>>,
 }
 
 #[instrument(level = "debug", skip(db), fields(room_id = %room_id))]
-pub async fn get_by_id<C>(db: &C, room_id: &str) -> Result<Option<Room>>
+pub async fn get_by_id<C>(db: &C, room_id: Uuid) -> Result<Option<Room>>
 where
     C: ConnectionTrait,
 {
-    let room = rooms::Entity::find_by_id(room_id.to_owned())
-        .one(db)
-        .await?;
+    let room = rooms::Entity::find_by_id(room_id).one(db).await?;
     Ok(room)
 }
 
@@ -73,7 +72,7 @@ where
         // custom-expression placeholder handling does not reliably bind array
         // params, and room counts are modest.
     }
-    let account_id_filter = filters.and_then(|f| f.account_id.clone());
+    let account_id_filter = filters.and_then(|f| f.account_id);
     let rooms: Vec<Room> = query
         .order_by_desc(rooms::Column::MessageCount)
         .all(db)
@@ -94,7 +93,7 @@ where
 pub async fn upsert_room_from_dict<C>(
     db: &C,
     data: &serde_json::Value,
-    _account_user_id: Option<&str>,
+    _account_user_id: Option<Uuid>,
 ) -> Result<bool>
 where
     C: ConnectionTrait,
@@ -107,7 +106,7 @@ where
     })?;
 
     let now = Utc::now();
-    if let Some(existing) = get_by_id(db, &parsed.room_id).await? {
+    if let Some(existing) = get_by_id(db, parsed.room_id).await? {
         // Update existing room (update_from_api semantics: always re-activate).
         let mut active: rooms::ActiveModel = existing.into();
         active.title = Set(parsed.title);
@@ -139,18 +138,18 @@ where
         // Append account_user_id if not already present.
         if let Some(account_id) = _account_user_id {
             let current = active.account_ids.clone().unwrap(); // Unchanged value
-            let mut ids: Vec<String> = current.clone();
-            if !ids.contains(&account_id.to_owned()) {
-                ids.push(account_id.to_owned());
+            let mut ids: Vec<Uuid> = current.clone();
+            if !ids.contains(&account_id) {
+                ids.push(account_id);
                 active.account_ids = Set(ids);
             }
         }
         active.update(db).await?;
         Ok(false)
     } else {
-        let mut account_ids: Vec<String> = Vec::new();
+        let mut account_ids: Vec<Uuid> = Vec::new();
         if let Some(account_id) = _account_user_id {
-            account_ids.push(account_id.to_owned());
+            account_ids.push(account_id);
         }
         let model = rooms::ActiveModel {
             room_id: Set(parsed.room_id),
@@ -188,15 +187,15 @@ where
 #[instrument(level = "debug", skip(db, active_room_ids), fields(active_count = active_room_ids.len(), account_user_id = _account_user_id.is_some()))]
 pub async fn mark_inactive_rooms<C>(
     db: &C,
-    active_room_ids: &[String],
-    _account_user_id: Option<&str>,
+    active_room_ids: &[Uuid],
+    _account_user_id: Option<Uuid>,
 ) -> Result<i64>
 where
     C: ConnectionTrait,
 {
     let mut query = rooms::Entity::find().filter(rooms::Column::IsActive.eq(true));
     if !active_room_ids.is_empty() {
-        query = query.filter(rooms::Column::RoomId.is_not_in(active_room_ids.iter().cloned()));
+        query = query.filter(rooms::Column::RoomId.is_not_in(active_room_ids.iter().copied()));
     }
 
     // When an account is syncing, only consider rooms that contain this account
@@ -207,7 +206,7 @@ where
     let mut inactive_count: i64 = 0;
     for room in candidates {
         if let Some(account_id) = _account_user_id {
-            let concerns_account = room.account_ids.iter().any(|id| id == account_id);
+            let concerns_account = room.account_ids.contains(&account_id);
             let is_zombie = room.account_ids.is_empty();
             if !concerns_account && !is_zombie {
                 continue;
@@ -215,7 +214,7 @@ where
         }
         let mut ids = room.account_ids.clone();
         if let Some(account_id) = _account_user_id {
-            ids.retain(|id| id != account_id);
+            ids.retain(|id| *id != account_id);
         }
         let mut active: rooms::ActiveModel = room.into();
         active.account_ids = Set(ids.clone());
@@ -230,7 +229,7 @@ where
 }
 
 #[instrument(level = "debug", skip(db), fields(room_id = %room_id))]
-pub async fn update_backfill_progress<C>(db: &C, room_id: &str, until: DateTime<Utc>) -> Result<()>
+pub async fn update_backfill_progress<C>(db: &C, room_id: Uuid, until: DateTime<Utc>) -> Result<()>
 where
     C: ConnectionTrait,
 {
@@ -244,7 +243,7 @@ where
 }
 
 #[instrument(level = "debug", skip(db), fields(room_id = %room_id))]
-pub async fn mark_history_complete<C>(db: &C, room_id: &str) -> Result<()>
+pub async fn mark_history_complete<C>(db: &C, room_id: Uuid) -> Result<()>
 where
     C: ConnectionTrait,
 {
@@ -262,8 +261,8 @@ fn parse_room_fields(data: &serde_json::Value) -> Option<ParsedRoom> {
     let room_id = data
         .get("id")
         .and_then(|v| v.as_str())
-        .or_else(|| data.get("chatroomId").and_then(|v| v.as_str()))?
-        .to_owned();
+        .or_else(|| data.get("chatroomId").and_then(|v| v.as_str()))
+        .and_then(|s| Uuid::parse_str(s).ok())?;
     let title = data
         .get("title")
         .and_then(|v| v.as_str())
@@ -291,7 +290,7 @@ fn parse_room_fields(data: &serde_json::Value) -> Option<ParsedRoom> {
     let creator_id = data
         .get("creatorId")
         .and_then(|v| v.as_str())
-        .map(str::to_owned);
+        .and_then(|s| Uuid::parse_str(s).ok());
     let last_message_at = parse_datetime(data.get("lastMessageAt").and_then(|v| v.as_str()));
     let dissolved_at = parse_datetime(data.get("dissolvedAt").and_then(|v| v.as_str()));
 
@@ -320,10 +319,11 @@ pub(crate) fn parse_datetime(value: Option<&str>) -> Option<DateTime<Utc>> {
 mod tests {
     use super::*;
     use lilium_test_fixtures::FixtureProfile;
+    use lilium_test_fixtures::test_uuid;
 
-    fn chat_data(room_id: &str, title: &str) -> serde_json::Value {
+    fn chat_data(room_id: Uuid, title: &str) -> serde_json::Value {
         serde_json::json!({
-            "chatroomId": room_id,
+            "chatroomId": room_id.to_string(),
             "title": title,
             "chatType": "group",
             "memberCount": 5,
@@ -339,15 +339,18 @@ mod tests {
             .expect("acquire room db");
 
         lilium_database::transaction!(test_db.database(), |tx| {
-            let is_new =
-                upsert_room_from_dict(tx, &chat_data("room-1", "Room One"), Some("acct-a"))
-                    .await
-                    .unwrap();
+            let is_new = upsert_room_from_dict(
+                tx,
+                &chat_data(test_uuid("room-1"), "Room One"),
+                Some(test_uuid("acct-a")),
+            )
+            .await
+            .unwrap();
             assert!(is_new);
-            let room = get_by_id(tx, "room-1").await.unwrap().unwrap();
+            let room = get_by_id(tx, test_uuid("room-1")).await.unwrap().unwrap();
             assert_eq!(room.title, "Room One");
             assert_eq!(room.chat_type.as_deref(), Some("group"));
-            assert_eq!(room.account_ids, vec!["acct-a".to_string()]);
+            assert_eq!(room.account_ids, vec![test_uuid("acct-a")]);
             assert!(room.is_active);
             Ok(())
         })
@@ -362,19 +365,26 @@ mod tests {
             .expect("acquire room db");
 
         lilium_database::transaction!(test_db.database(), |tx| {
-            upsert_room_from_dict(tx, &chat_data("room-2", "Room Two"), Some("acct-a"))
-                .await
-                .unwrap();
-            let is_new =
-                upsert_room_from_dict(tx, &chat_data("room-2", "Room Two Updated"), Some("acct-b"))
-                    .await
-                    .unwrap();
+            upsert_room_from_dict(
+                tx,
+                &chat_data(test_uuid("room-2"), "Room Two"),
+                Some(test_uuid("acct-a")),
+            )
+            .await
+            .unwrap();
+            let is_new = upsert_room_from_dict(
+                tx,
+                &chat_data(test_uuid("room-2"), "Room Two Updated"),
+                Some(test_uuid("acct-b")),
+            )
+            .await
+            .unwrap();
             assert!(!is_new);
-            let room = get_by_id(tx, "room-2").await.unwrap().unwrap();
+            let room = get_by_id(tx, test_uuid("room-2")).await.unwrap().unwrap();
             assert_eq!(room.title, "Room Two Updated");
             assert_eq!(
                 room.account_ids,
-                vec!["acct-a".to_string(), "acct-b".to_string()]
+                vec![test_uuid("acct-a"), test_uuid("acct-b")]
             );
             Ok(())
         })
@@ -389,13 +399,19 @@ mod tests {
             .expect("acquire room db");
 
         lilium_database::transaction!(test_db.database(), |tx| {
-            upsert_room_from_dict(tx, &chat_data("room-3", "Room Three"), Some("acct-a"))
+            upsert_room_from_dict(
+                tx,
+                &chat_data(test_uuid("room-3"), "Room Three"),
+                Some(test_uuid("acct-a")),
+            )
+            .await
+            .unwrap();
+            // acct-a no longer sees room-3 → mark inactive.
+            let inactive = mark_inactive_rooms(tx, &[], Some(test_uuid("acct-a")))
                 .await
                 .unwrap();
-            // acct-a no longer sees room-3 → mark inactive.
-            let inactive = mark_inactive_rooms(tx, &[], Some("acct-a")).await.unwrap();
             assert_eq!(inactive, 1);
-            let room = get_by_id(tx, "room-3").await.unwrap().unwrap();
+            let room = get_by_id(tx, test_uuid("room-3")).await.unwrap().unwrap();
             assert!(!room.is_active);
             assert!(room.account_ids.is_empty());
             Ok(())
@@ -411,18 +427,28 @@ mod tests {
             .expect("acquire room db");
 
         lilium_database::transaction!(test_db.database(), |tx| {
-            upsert_room_from_dict(tx, &chat_data("room-4", "Room Four"), Some("acct-a"))
-                .await
-                .unwrap();
-            upsert_room_from_dict(tx, &chat_data("room-4", "Room Four"), Some("acct-b"))
-                .await
-                .unwrap();
+            upsert_room_from_dict(
+                tx,
+                &chat_data(test_uuid("room-4"), "Room Four"),
+                Some(test_uuid("acct-a")),
+            )
+            .await
+            .unwrap();
+            upsert_room_from_dict(
+                tx,
+                &chat_data(test_uuid("room-4"), "Room Four"),
+                Some(test_uuid("acct-b")),
+            )
+            .await
+            .unwrap();
             // acct-a leaves, but acct-b remains.
-            let inactive = mark_inactive_rooms(tx, &[], Some("acct-a")).await.unwrap();
+            let inactive = mark_inactive_rooms(tx, &[], Some(test_uuid("acct-a")))
+                .await
+                .unwrap();
             assert_eq!(inactive, 0);
-            let room = get_by_id(tx, "room-4").await.unwrap().unwrap();
+            let room = get_by_id(tx, test_uuid("room-4")).await.unwrap().unwrap();
             assert!(room.is_active);
-            assert_eq!(room.account_ids, vec!["acct-b".to_string()]);
+            assert_eq!(room.account_ids, vec![test_uuid("acct-b")]);
             Ok(())
         })
         .await
@@ -436,19 +462,27 @@ mod tests {
             .expect("acquire room db");
 
         lilium_database::transaction!(test_db.database(), |tx| {
-            upsert_room_from_dict(tx, &chat_data("room-5", "Room Five"), Some("acct-a"))
-                .await
-                .unwrap();
-            upsert_room_from_dict(tx, &chat_data("room-6", "Room Six"), Some("acct-b"))
-                .await
-                .unwrap();
+            upsert_room_from_dict(
+                tx,
+                &chat_data(test_uuid("room-5"), "Room Five"),
+                Some(test_uuid("acct-a")),
+            )
+            .await
+            .unwrap();
+            upsert_room_from_dict(
+                tx,
+                &chat_data(test_uuid("room-6"), "Room Six"),
+                Some(test_uuid("acct-b")),
+            )
+            .await
+            .unwrap();
             let filters = RoomFilters {
-                account_id: Some("acct-a".to_string()),
+                account_id: Some(test_uuid("acct-a")),
                 ..Default::default()
             };
             let rooms = get_all_rooms(tx, Some(&filters)).await.unwrap();
             assert_eq!(rooms.len(), 1);
-            assert_eq!(rooms[0].room_id, "room-5");
+            assert_eq!(rooms[0].room_id, test_uuid("room-5"));
             Ok(())
         })
         .await
@@ -462,16 +496,24 @@ mod tests {
             .expect("acquire room db");
 
         lilium_database::transaction!(test_db.database(), |tx| {
-            upsert_room_from_dict(tx, &chat_data("room-7", "Room Seven"), Some("acct-a"))
+            upsert_room_from_dict(
+                tx,
+                &chat_data(test_uuid("room-7"), "Room Seven"),
+                Some(test_uuid("acct-a")),
+            )
+            .await
+            .unwrap();
+            let ts = parse_datetime(Some("2024-01-01T00:00:00Z")).unwrap();
+            update_backfill_progress(tx, test_uuid("room-7"), ts)
                 .await
                 .unwrap();
-            let ts = parse_datetime(Some("2024-01-01T00:00:00Z")).unwrap();
-            update_backfill_progress(tx, "room-7", ts).await.unwrap();
-            let room = get_by_id(tx, "room-7").await.unwrap().unwrap();
+            let room = get_by_id(tx, test_uuid("room-7")).await.unwrap().unwrap();
             assert_eq!(room.backfill_until, Some(ts));
             assert!(!room.history_complete);
-            mark_history_complete(tx, "room-7").await.unwrap();
-            let room = get_by_id(tx, "room-7").await.unwrap().unwrap();
+            mark_history_complete(tx, test_uuid("room-7"))
+                .await
+                .unwrap();
+            let room = get_by_id(tx, test_uuid("room-7")).await.unwrap().unwrap();
             assert!(room.history_complete);
             Ok(())
         })

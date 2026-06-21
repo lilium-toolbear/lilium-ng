@@ -20,6 +20,8 @@ pub async fn run(config: Config, db: Database) -> Result<()> {
 /// shutdown signal. This is the entry point spawned by the arbiter process
 /// when it forks a worker for an individual account.
 pub async fn run_worker(account: String, config: Config, db: Database) -> Result<()> {
+    let account = uuid::Uuid::parse_str(&account)
+        .map_err(|e| anyhow::anyhow!("invalid account id '{account}': {e}"))?;
     let worker = worker::Worker::new(account, db, build_worker_runtime(&config));
     let shutdown = Arc::new(tokio::sync::Notify::new());
     worker.run(shutdown).await

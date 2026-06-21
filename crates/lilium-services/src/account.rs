@@ -11,11 +11,12 @@ use sea_orm::{
 };
 use std::borrow::Cow;
 use tracing::instrument;
+use uuid::Uuid;
 
 type DzmmAccount = dzmm_account::Model;
 
 pub struct CreateAccountParams<'a> {
-    pub user_id: &'a str,
+    pub user_id: Uuid,
     pub user_profile: serde_json::Value,
     pub email: Option<&'a str>,
     pub password: Option<&'a str>,
@@ -33,7 +34,7 @@ pub fn create_auth_client(account: DzmmAccount) -> Result<DzmmApi> {
         signin_code_image: account.signin_code_image,
         signin_code_image_mime: account.signin_code_image_mime.map(Cow::Owned),
         cookies: account.cookies.map(Cow::Owned),
-        user_id: Some(Cow::Owned(account.user_id)),
+        user_id: Some(Cow::Owned(account.user_id.to_string())),
         auto_refresh: true,
         on_cookies_refreshed: None,
     })
@@ -98,7 +99,7 @@ where
 
     let now = Utc::now();
     let account = dzmm_account::ActiveModel {
-        user_id: Set(user_id.to_owned()),
+        user_id: Set(user_id),
         user_profile: Set(user_profile),
         email: Set(email.map(str::to_owned)),
         password: Set(password.map(str::to_owned)),
@@ -117,13 +118,11 @@ where
 }
 
 #[instrument(level = "debug" skip(db), fields(user_id = %user_id))]
-pub async fn get_account<C>(db: &C, user_id: &str) -> Result<Option<DzmmAccount>>
+pub async fn get_account<C>(db: &C, user_id: Uuid) -> Result<Option<DzmmAccount>>
 where
     C: ConnectionTrait,
 {
-    let account = dzmm_account::Entity::find_by_id(user_id.to_owned())
-        .one(db)
-        .await?;
+    let account = dzmm_account::Entity::find_by_id(user_id).one(db).await?;
 
     Ok(account)
 }
@@ -150,7 +149,7 @@ where
 }
 
 #[instrument(level = "debug" skip(db, new_password), fields(user_id = %user_id))]
-pub async fn update_password<C>(db: &C, user_id: &str, new_password: &str) -> Result<DzmmAccount>
+pub async fn update_password<C>(db: &C, user_id: Uuid, new_password: &str) -> Result<DzmmAccount>
 where
     C: ConnectionTrait,
 {
@@ -177,7 +176,7 @@ where
 
     let now = Utc::now();
     let updated = dzmm_account::ActiveModel {
-        user_id: Set(user_id.to_owned()),
+        user_id: Set(user_id),
         password: Set(Some(new_password.to_owned())),
         updated_at: Set(now),
         ..Default::default()
@@ -189,7 +188,7 @@ where
 }
 
 #[instrument(level = "debug" skip(db, cookies), fields(user_id = %user_id))]
-pub async fn update_cookies<C>(db: &C, user_id: &str, cookies: &str) -> Result<()>
+pub async fn update_cookies<C>(db: &C, user_id: Uuid, cookies: &str) -> Result<()>
 where
     C: ConnectionTrait,
 {
@@ -203,7 +202,7 @@ where
 
     let now = Utc::now();
     dzmm_account::ActiveModel {
-        user_id: Set(user_id.to_owned()),
+        user_id: Set(user_id),
         cookies: Set(Some(cookies.to_owned())),
         updated_at: Set(now),
         ..Default::default()
@@ -217,7 +216,7 @@ where
 #[instrument(level = "debug" skip(db, user_profile), fields(user_id = %user_id))]
 pub async fn update_user_profile<C>(
     db: &C,
-    user_id: &str,
+    user_id: Uuid,
     user_profile: serde_json::Value,
 ) -> Result<DzmmAccount>
 where
@@ -233,7 +232,7 @@ where
 
     let now = Utc::now();
     let updated = dzmm_account::ActiveModel {
-        user_id: Set(user_id.to_owned()),
+        user_id: Set(user_id),
         user_profile: Set(user_profile),
         updated_at: Set(now),
         ..Default::default()
@@ -245,7 +244,7 @@ where
 }
 
 #[instrument(level = "debug" skip(db), fields(user_id = %user_id))]
-pub async fn activate_account<C>(db: &C, user_id: &str) -> Result<DzmmAccount>
+pub async fn activate_account<C>(db: &C, user_id: Uuid) -> Result<DzmmAccount>
 where
     C: ConnectionTrait,
 {
@@ -259,7 +258,7 @@ where
 
     let now = Utc::now();
     let updated = dzmm_account::ActiveModel {
-        user_id: Set(user_id.to_owned()),
+        user_id: Set(user_id),
         is_enabled: Set(true),
         updated_at: Set(now),
         ..Default::default()
@@ -271,7 +270,7 @@ where
 }
 
 #[instrument(level = "debug" skip(db), fields(user_id = %user_id))]
-pub async fn deactivate_account<C>(db: &C, user_id: &str) -> Result<DzmmAccount>
+pub async fn deactivate_account<C>(db: &C, user_id: Uuid) -> Result<DzmmAccount>
 where
     C: ConnectionTrait,
 {
@@ -285,7 +284,7 @@ where
 
     let now = Utc::now();
     let updated = dzmm_account::ActiveModel {
-        user_id: Set(user_id.to_owned()),
+        user_id: Set(user_id),
         is_enabled: Set(false),
         updated_at: Set(now),
         ..Default::default()
@@ -297,7 +296,7 @@ where
 }
 
 #[instrument(level = "debug" skip(db), fields(user_id = %user_id))]
-pub async fn delete_account<C>(db: &C, user_id: &str) -> Result<()>
+pub async fn delete_account<C>(db: &C, user_id: Uuid) -> Result<()>
 where
     C: ConnectionTrait,
 {
@@ -326,9 +325,7 @@ where
         ));
     }
 
-    dzmm_account::Entity::delete_by_id(user_id.to_owned())
-        .exec(db)
-        .await?;
+    dzmm_account::Entity::delete_by_id(user_id).exec(db).await?;
 
     Ok(())
 }
@@ -362,14 +359,10 @@ mod tests {
                 .expect("init account db");
 
         lilium_database::transaction!(test_db.database(), |tx| {
-            let user_id = format!(
-                "account_{}_{}",
-                Utc::now().timestamp_micros(),
-                std::process::id()
-            );
+            let user_id = Uuid::new_v4();
             let now = Utc::now();
             users::Entity::insert(users::ActiveModel {
-                user_id: Set(user_id.clone()),
+                user_id: Set(user_id),
                 message_count: Set(0),
                 deleted_count: Set(0),
                 recalled_count: Set(0),
@@ -384,7 +377,7 @@ mod tests {
             let created = create_account(
                 tx,
                 CreateAccountParams {
-                    user_id: &user_id,
+                    user_id,
                     user_profile: profile.clone(),
                     email: Some("test@example.com"),
                     password: Some("password"),
@@ -397,13 +390,13 @@ mod tests {
             .await
             .expect("create account");
             assert_eq!(created.user_id, user_id);
-            let fetched = get_account(tx, &user_id)
+            let fetched = get_account(tx, user_id)
                 .await
                 .expect("fetch account")
                 .expect("account exists");
             assert_eq!(fetched.user_id, user_id);
             assert_eq!(fetched.user_profile, profile);
-            delete_account(tx, &user_id).await.expect("delete account");
+            delete_account(tx, user_id).await.expect("delete account");
             Ok(())
         })
         .await
