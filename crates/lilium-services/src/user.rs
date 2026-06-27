@@ -1,5 +1,5 @@
 // Python parity source: dzmm_archive@18fdefbc0b6979178d7f1eb4ce0624ec4a60a2f2 services/user_service.py
-// Python parity source: dzmm_archive@18fdefbc0b6979178d7f1eb4ce0624ec4a60a2f2 core/user_sync.py
+// Python parity source: dzmm_archive@f74b76bdd605117ea31aa19db37a47aafc3f84fa core/user_sync.py
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use lilium_api_client::http::DzmmApi;
@@ -160,6 +160,10 @@ pub fn avatar_url_changed(existing: Option<&str>, candidate: Option<&str>) -> bo
         Some(candidate_url) => existing != Some(candidate_url),
         None => false,
     }
+}
+
+fn has_cached_profile(user: &User) -> bool {
+    user.full_name.is_some() || user.avatar_url.is_some() || user.raw_data.is_some()
 }
 
 pub fn apply_avatar_sync_plan(
@@ -604,7 +608,9 @@ where
         .filter(|user_id| {
             existing_users
                 .get(user_id)
-                .map(|existing| now - existing.updated_at > cache_cutoff)
+                .map(|existing| {
+                    !has_cached_profile(existing) || now - existing.updated_at > cache_cutoff
+                })
                 .unwrap_or(true)
         })
         .collect::<Vec<_>>();
@@ -742,7 +748,9 @@ where
         .filter(|user_id| {
             existing_users_map
                 .get(user_id)
-                .map(|existing| now - existing.updated_at > cache_cutoff)
+                .map(|existing| {
+                    !has_cached_profile(existing) || now - existing.updated_at > cache_cutoff
+                })
                 .unwrap_or(true)
         })
         .collect();
@@ -895,6 +903,88 @@ mod tests {
 
     mod user_integration {
         use super::*;
+        use lilium_api_client::{
+            config::ApiClientConfig,
+            http::{DzmmApi, DzmmApiAuth},
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::time::{Duration, timeout};
+
+        struct RecordedRequest {
+            method: String,
+            target: String,
+        }
+
+        async fn read_request(stream: &mut tokio::net::TcpStream) -> RecordedRequest {
+            let mut data = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                let n = stream.read(&mut buf).await.unwrap();
+                assert_ne!(n, 0, "connection closed before headers");
+                data.extend_from_slice(&buf[..n]);
+                if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&data[..pos + 4]);
+                    let mut lines = headers.lines();
+                    let request_line = lines.next().unwrap();
+                    let mut parts = request_line.split_whitespace();
+                    let method = parts.next().unwrap().to_string();
+                    let target = parts.next().unwrap().to_string();
+                    return RecordedRequest { method, target };
+                }
+            }
+        }
+
+        async fn write_json_response(stream: &mut tokio::net::TcpStream, body: &serde_json::Value) {
+            let body = serde_json::to_vec(body).unwrap();
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(header.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+        }
+
+        async fn spawn_single_request_server(
+            expected_target_prefix: &'static str,
+            response: serde_json::Value,
+        ) -> (String, tokio::task::JoinHandle<usize>) {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let handle = tokio::spawn(async move {
+                let mut request_count = 0usize;
+                if let Ok(Ok((mut stream, _))) =
+                    timeout(Duration::from_secs(1), listener.accept()).await
+                {
+                    let request = read_request(&mut stream).await;
+                    assert_eq!(request.method, "GET");
+                    assert!(
+                        request.target.starts_with(expected_target_prefix),
+                        "unexpected request target: {}",
+                        request.target
+                    );
+                    write_json_response(&mut stream, &response).await;
+                    request_count = 1;
+                }
+                request_count
+            });
+            (base_url, handle)
+        }
+
+        async fn seed_placeholder_user<C>(db: &C, user_id: Uuid) -> Result<()>
+        where
+            C: ConnectionTrait,
+        {
+            upsert_user(
+                db,
+                &UpsertUserData {
+                    user_id,
+                    ..Default::default()
+                },
+            )
+            .await?;
+            Ok(())
+        }
 
         #[tokio::test]
         async fn get_by_id_existing() {
@@ -1318,6 +1408,111 @@ mod tests {
             })
             .await
             .expect("batch fetch and update");
+        }
+
+        #[tokio::test]
+        async fn batch_fetch_and_update_refreshes_placeholder_profiles() {
+            let test_db =
+                lilium_test_fixtures::TestDb::acquire(lilium_test_fixtures::FixtureProfile::Empty)
+                    .await
+                    .expect("init empty db");
+
+            let user_id = test_uuid("placeholder-room-user");
+            let room_id = test_uuid("room-1");
+            let response = json!([{
+                "result": {
+                    "data": {
+                        "json": {
+                            "id": user_id.to_string(),
+                            "fullName": "Room Refreshed"
+                        }
+                    }
+                }
+            }]);
+            let (base_url, server) =
+                spawn_single_request_server("/api/trpc/user.getChatroomUser?", response).await;
+            let api = DzmmApi::new_with_config(
+                ApiClientConfig {
+                    base_url,
+                    ..Default::default()
+                },
+                DzmmApiAuth::default(),
+            )
+            .expect("api");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                seed_placeholder_user(session, user_id).await?;
+
+                let result =
+                    batch_fetch_and_update_with_auth(session, &api, &[(user_id, room_id)], 1)
+                        .await
+                        .expect("batch fetch");
+                assert_eq!(result.new_count, 0);
+                assert_eq!(result.updated_count, 1);
+
+                let refreshed = get_by_id(session, user_id)
+                    .await
+                    .expect("query")
+                    .expect("refreshed user");
+                assert_eq!(refreshed.full_name.as_deref(), Some("Room Refreshed"));
+                Ok(())
+            })
+            .await
+            .expect("batch fetch placeholder profile");
+
+            assert_eq!(server.await.expect("server"), 1);
+        }
+
+        #[tokio::test]
+        async fn batch_fetch_and_update_public_users_refreshes_placeholder_profiles() {
+            let test_db =
+                lilium_test_fixtures::TestDb::acquire(lilium_test_fixtures::FixtureProfile::Empty)
+                    .await
+                    .expect("init empty db");
+
+            let user_id = test_uuid("placeholder-public-user");
+            let response = json!([{
+                "result": {
+                    "data": {
+                        "json": {
+                            "profile": {
+                                "fullName": "Public Refreshed"
+                            }
+                        }
+                    }
+                }
+            }]);
+            let (base_url, server) =
+                spawn_single_request_server("/api/trpc/user.getProfilePage?", response).await;
+            let api = DzmmApi::new_with_config(
+                ApiClientConfig {
+                    base_url,
+                    ..Default::default()
+                },
+                DzmmApiAuth::default(),
+            )
+            .expect("api");
+
+            lilium_database::transaction!(test_db.database(), |session| {
+                seed_placeholder_user(session, user_id).await?;
+
+                let result = batch_fetch_and_update_public_users(session, &api, &[user_id], 1)
+                    .await
+                    .expect("public batch fetch");
+                assert_eq!(result.new_count, 0);
+                assert_eq!(result.updated_count, 1);
+
+                let refreshed = get_by_id(session, user_id)
+                    .await
+                    .expect("query")
+                    .expect("refreshed user");
+                assert_eq!(refreshed.full_name.as_deref(), Some("Public Refreshed"));
+                Ok(())
+            })
+            .await
+            .expect("public batch fetch placeholder profile");
+
+            assert_eq!(server.await.expect("server"), 1);
         }
     }
 
