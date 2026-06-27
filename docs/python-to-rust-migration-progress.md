@@ -17,6 +17,39 @@ covers, and what remains to migrate.
 - Move completed gaps into the verified scenario list when code and tests land.
 - Delete obsolete one-off notes after their content is represented here.
 
+## 2026-06-27: User-sync placeholder profile refresh parity (Python `f74b76bdd`)
+
+Python commit: `dzmm_archive@f74b76bdd605117ea31aa19db37a47aafc3f84fa` ("fix(user-sync): fetch placeholder user profiles").
+
+Python changed the user-sync cache gate so rows with no cached profile data
+(`full_name`, `avatar_url`, `raw_data` all empty) are refreshed even when
+`updated_at` is recent. The same rule applies to both room-scoped member sync
+and public profile sync.
+
+Python sources read (for behavior verification):
+
+- `core/user_sync.py` — added `_has_cached_profile()` and used it in `batch_fetch_and_update_users`, `batch_fetch_and_update_public_users`, and `should_fetch_user`.
+- `scripts/backfill_null_user_names_from_public_profiles.py` — one-off public-profile backfill script for null `full_name` rows.
+
+Rust files changed:
+
+- `crates/lilium-services/src/user.rs` — added the shared cached-profile gate and covered both batch fetch paths with placeholder-profile refresh tests.
+
+Tracking docs updated:
+
+- `docs/python-to-rust-migration-progress.md`
+
+Verification commands:
+
+```bash
+cargo test -p lilium-services user::tests::user_integration::batch_fetch_and_update_refreshes_placeholder_profiles
+cargo test -p lilium-services user::tests::user_integration::batch_fetch_and_update_public_users_refreshes_placeholder_profiles
+```
+
+Remaining gap:
+
+- `scripts/backfill_null_user_names_from_public_profiles.py` stays Python-only as an operational backfill helper.
+
 ## 2026-06-19: Room/message/explore UUID migration (parity with Python `227bc1179`)
 
 Python commit: `dzmm_archive@227bc1179` ("refactor(uuid): complete room and message id cleanup"), Alembic revision `c4e5f6a7b8c9_uuid_migration_room_message_content.py` (+ `e5f6a7b8c9d0` fixing the message-insert notify trigger to cast `NEW.message_id::text`). Runs after the user-chain migration.
