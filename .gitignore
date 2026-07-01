@@ -6,3 +6,7 @@
 data
 runtime
 .claude
+
+# nix build outputs
+result
+result-*
