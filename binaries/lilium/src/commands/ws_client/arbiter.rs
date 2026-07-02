@@ -473,6 +473,9 @@ mod tests {
             notification: crate::config::NotificationConfig {
                 url: "postgres://localhost/lilium_test_notify".to_string(),
             },
+            lock: crate::config::LockConfig {
+                url: "postgres://localhost/lilium_test_lock".to_string(),
+            },
             spider: crate::config::SpiderConfig {
                 queue_size: 100,
                 batch_size: 10,
