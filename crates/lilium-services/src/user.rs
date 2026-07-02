@@ -254,6 +254,49 @@ where
     Ok(users)
 }
 
+/// Insert bare-bones placeholder `users` rows for the given IDs if they do not
+/// yet exist.
+///
+/// Mirrors Python `RoomMemberService._ensure_users_exist`. `room_members` has a
+/// foreign key to `users(user_id)`, so a member row cannot be written before its
+/// user row exists. This inserts profile-less user rows (counts zeroed, profile
+/// fields NULL) with `ON CONFLICT DO NOTHING`, making it a cheap no-op for users
+/// that are already known. The real profile is backfilled later by
+/// [`batch_fetch_and_update_with_auth`].
+pub async fn ensure_users_exist<C>(db: &C, user_ids: &[Uuid]) -> crate::Result<()>
+where
+    C: ConnectionTrait,
+{
+    let mut seen = HashSet::new();
+    let unique: Vec<Uuid> = user_ids
+        .iter()
+        .copied()
+        .filter(|id| seen.insert(*id))
+        .collect();
+    if unique.is_empty() {
+        return Ok(());
+    }
+
+    let now = Utc::now();
+    let models: Vec<users::ActiveModel> = unique
+        .into_iter()
+        .map(|user_id| users::ActiveModel {
+            user_id: Set(user_id),
+            message_count: Set(0),
+            deleted_count: Set(0),
+            recalled_count: Set(0),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        })
+        .collect();
+    users::Entity::insert_many(models)
+        .on_conflict_do_nothing()
+        .exec(db)
+        .await?;
+    Ok(())
+}
+
 #[instrument(level = "debug" skip(db, data), fields(user_id = %data.user_id, has_full_name = data.full_name.is_some(), has_avatar_url = data.avatar_url.is_some(), has_raw_data = data.raw_data.is_some()))]
 pub async fn upsert_user<C>(db: &C, data: &UpsertUserData) -> Result<User>
 where
