@@ -66,6 +66,30 @@ enum WsClientWorker {
     },
 }
 
+/// Install a SIGINT watchdog so the process can always be terminated.
+///
+/// Each long-running command installs its own Ctrl-C handler that triggers a
+/// graceful shutdown via a `CancellationToken`. If that graceful path ever hangs
+/// (a stuck transaction, an unresponsive child worker, etc.), a second Ctrl-C
+/// forces an immediate `exit(130)`. Multiple `tokio::signal::ctrl_c()` futures
+/// coexist safely, so this does not interfere with the per-command handlers.
+fn install_force_exit_watchdog() {
+    tokio::spawn(async move {
+        let mut interrupts = 0u32;
+        loop {
+            if tokio::signal::ctrl_c().await.is_err() {
+                return;
+            }
+            interrupts += 1;
+            if interrupts >= 2 {
+                tracing::warn!("second SIGINT received, forcing immediate exit");
+                std::process::exit(130);
+            }
+            tracing::warn!("shutdown requested; press Ctrl-C again to force exit");
+        }
+    });
+}
+
 fn sentry_name(verb: &Verb) -> &'static str {
     match verb {
         Verb::WsClient { .. } => "ws_arbiter",
@@ -83,6 +107,8 @@ async fn async_main() -> Result<u8> {
 
     let sentry_name = sentry_name(&cli.command);
     let _sentry_guard = lilium_common::observability::init_backend_sentry(sentry_name);
+
+    install_force_exit_watchdog();
 
     if let Verb::Completion { shell } = cli.command {
         let mut app = Cli::command();

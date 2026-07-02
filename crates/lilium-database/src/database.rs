@@ -326,6 +326,7 @@ impl Database {
         F: for<'a> FnOnce(&'a DbTransaction) -> TransactionFuture<'a, T> + Send,
     {
         let span = tracing::info_span!(
+            target: "lilium.db.transaction",
             "lilium-database.transaction",
             sentry.name = "db transaction",
             sentry.op = "db.transaction",
