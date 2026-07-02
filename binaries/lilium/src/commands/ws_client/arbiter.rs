@@ -8,8 +8,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UnixListener;
 use tokio::process::Child;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::RwLock;
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -23,7 +24,7 @@ pub struct Arbiter {
     database: Database,
     workers: Arc<RwLock<HashMap<Uuid, WorkerHandle>>>,
     worker_spawner: Arc<dyn WorkerSpawner>,
-    shutdown: Arc<tokio::sync::Notify>,
+    shutdown: CancellationToken,
 }
 
 struct WorkerHandle {
@@ -83,7 +84,7 @@ impl Arbiter {
             database,
             workers: Arc::new(RwLock::new(HashMap::new())),
             worker_spawner,
-            shutdown: Arc::new(tokio::sync::Notify::new()),
+            shutdown: CancellationToken::new(),
         }
     }
 
@@ -119,7 +120,7 @@ impl Arbiter {
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    _ = restart_shutdown.notified() => break,
+                    _ = restart_shutdown.cancelled() => break,
                     _ = sleep(Duration::from_secs(1)) => {
                         let mut workers = restart_workers.write().await;
                         let mut to_restart = Vec::new();
@@ -160,16 +161,16 @@ impl Arbiter {
         let shutdown = self.shutdown.clone();
         tokio::spawn(async move {
             tokio::signal::ctrl_c().await.ok();
-            shutdown.notify_waiters();
+            shutdown.cancel();
         });
 
         tokio::select! {
-            _ = self.shutdown.notified() => {
+            _ = self.shutdown.cancelled() => {
                 info!("Shutting down arbiter");
             }
             _ = &mut control_task => {
                 warn!("Control server exited; shutting down arbiter");
-                self.shutdown.notify_waiters();
+                self.shutdown.cancel();
             }
         }
 
@@ -315,11 +316,11 @@ impl Arbiter {
         }
     }
 
-    async fn run_control_server(self, listener: UnixListener, shutdown: Arc<Notify>) -> Result<()> {
+    async fn run_control_server(self, listener: UnixListener, shutdown: CancellationToken) -> Result<()> {
         info!("Control server starting");
         loop {
             tokio::select! {
-                _ = shutdown.notified() => {
+                _ = shutdown.cancelled() => {
                     info!("Control server shutting down");
                     break;
                 }

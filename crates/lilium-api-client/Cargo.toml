@@ -9,6 +9,7 @@ lilium-models.workspace = true
 reqwest = { workspace = true, features = ["cookies", "multipart", "gzip", "deflate", "brotli"] }
 rand.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true

@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::net::{TcpSocket, TcpStream, lookup_host};
 use tokio::sync::{Notify, RwLock, oneshot};
+use tokio_util::sync::CancellationToken;
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, client_async, client_async_tls_with_config, connect_async,
     tungstenite::{handshake::client::Response, http::Request},
@@ -430,12 +431,12 @@ impl WsClient {
         .context("Timed out while connecting to Socket.IO")?
     }
 
-    #[instrument(level = "debug" skip(self, on_event, shutdown, shutdown_notify, reconnect_notify, command_executor), fields(account_id = %self.account_id))]
+    #[instrument(level = "debug" skip(self, on_event, shutdown, shutdown_token, reconnect_notify, command_executor), fields(account_id = %self.account_id))]
     pub async fn run<F>(
         &mut self,
         on_event: F,
         shutdown: Arc<AtomicBool>,
-        shutdown_notify: Arc<Notify>,
+        shutdown_token: CancellationToken,
         reconnect_notify: Arc<Notify>,
         command_executor: Option<SocketCommandExecutor>,
     ) -> Result<()>
@@ -473,7 +474,7 @@ impl WsClient {
 
         loop {
             tokio::select! {
-                _ = shutdown_notify.notified() => {
+                _ = shutdown_token.cancelled() => {
                     info!(account = %self.account_id, "WebSocket shutdown signalled");
                     break;
                 }

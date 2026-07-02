@@ -5,7 +5,7 @@ pub mod worker;
 
 use anyhow::Result;
 use lilium_database::Database;
-use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 
@@ -23,7 +23,12 @@ pub async fn run_worker(account: String, config: Config, db: Database) -> Result
     let account = uuid::Uuid::parse_str(&account)
         .map_err(|e| anyhow::anyhow!("invalid account id '{account}': {e}"))?;
     let worker = worker::Worker::new(account, db, build_worker_runtime(&config));
-    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown = CancellationToken::new();
+    let shutdown_for_signal = shutdown.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        shutdown_for_signal.cancel();
+    });
     worker.run(shutdown).await
 }
 

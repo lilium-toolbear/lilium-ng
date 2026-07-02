@@ -2,9 +2,8 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::Notify;
 use tokio::time::{Duration, Instant, sleep};
+use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, error, info, warn};
 
 use lilium_common::LiliumError;
@@ -36,7 +35,7 @@ pub struct EventProcessor {
     initial_retry_delay: Duration,
     max_retry_delay: Duration,
     retry_backoff_factor: f64,
-    shutdown: Arc<Notify>,
+    shutdown: CancellationToken,
     notification_config: Option<NotificationDatabaseConfig>,
     data_path: PathBuf,
 }
@@ -58,7 +57,7 @@ impl EventProcessor {
             initial_retry_delay: Duration::from_secs(1),
             max_retry_delay: Duration::from_secs(60),
             retry_backoff_factor: 2.0,
-            shutdown: Arc::new(Notify::new()),
+            shutdown: CancellationToken::new(),
             notification_config: None,
             data_path,
         }
@@ -69,8 +68,8 @@ impl EventProcessor {
         self
     }
 
-    pub fn shutdown_handle(&self) -> Arc<Notify> {
-        Arc::clone(&self.shutdown)
+    pub fn shutdown_handle(&self) -> CancellationToken {
+        self.shutdown.clone()
     }
 
     pub async fn run(&self) -> Result<()> {
@@ -91,7 +90,7 @@ impl EventProcessor {
 
         loop {
             tokio::select! {
-                _ = self.shutdown.notified() => {
+                _ = self.shutdown.cancelled() => {
                     info!("Shutting down event processor");
                     break;
                 }
@@ -152,6 +151,7 @@ impl EventProcessor {
 
     async fn process_next_batch(&self) -> Result<()> {
         let batch_span = tracing::info_span!(
+            target: "lilium.processor.batch",
             "lilium-event-processor.batch",
             sentry.name = "event_processor batch",
             sentry.op = "queue.process",
@@ -839,7 +839,7 @@ pub async fn run(config: Config, db: Database) -> Result<()> {
     let shutdown = processor.shutdown_handle();
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
-        shutdown.notify_waiters();
+        shutdown.cancel();
     });
 
     processor.run().await

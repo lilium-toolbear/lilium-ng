@@ -9,6 +9,7 @@ use std::borrow::Cow;
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -41,16 +42,31 @@ fn init_backend_tracing_subscriber() {
             // Capture everything else as both a breadcrumb and a log
             _ => EventFilter::Breadcrumb | EventFilter::Log,
         });
+
+    // Global filter gates every layer (including sentry) and respects RUST_LOG.
+    let global_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info".into());
+
+    // Console-only filter: by default the same as `global_filter`, but silences the
+    // high-cardinality db / event-processor transaction spans. Their span names and
+    // span fields (`sentry.name`, `sentry.op`, `db.system`, ...) would otherwise prefix
+    // every event line emitted inside a transaction, which is the bulk of console noise.
+    // These spans still reach the sentry layer through `global_filter`.
+    //
+    // When RUST_LOG is set explicitly we defer to the user's value (debugging should see
+    // everything); suppression only applies to the default `info` case.
+    let console_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info,lilium.db.transaction=warn,lilium.processor.batch=warn".into());
+
     let _ = tracing_subscriber::registry()
         .with(sentry_layer)
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
+        .with(global_filter)
         .with(
             tracing_subscriber::fmt::layer()
                 .with_level(true) // don't include levels in formatted output
                 .with_target(false)
-                .compact(),
+                .compact()
+                .with_filter(console_filter),
         )
         .try_init();
 }

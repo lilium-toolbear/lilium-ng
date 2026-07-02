@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::net::UnixListener;
 use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, instrument, warn};
 use uuid::Uuid;
 
@@ -46,7 +47,7 @@ struct WebsocketRunContext {
     reconnect_delay_ms: u64,
     ingestor: Arc<EventIngestor>,
     stop_event: Arc<AtomicBool>,
-    shutdown: Arc<Notify>,
+    shutdown: CancellationToken,
     reconnect_notify: Arc<Notify>,
     socket_executor: SocketCommandExecutor,
 }
@@ -58,7 +59,7 @@ struct WorkerControlContext {
     socket_executor: SocketCommandExecutor,
     reconnect_notify: Arc<Notify>,
     stop_event: Arc<AtomicBool>,
-    shutdown: Arc<Notify>,
+    shutdown: CancellationToken,
 }
 
 impl Worker {
@@ -72,7 +73,7 @@ impl Worker {
 }
 
 impl Worker {
-    pub async fn run(&self, shutdown: Arc<Notify>) -> Result<()> {
+    pub async fn run(&self, shutdown: CancellationToken) -> Result<()> {
         info!(account = %self.account_id, "Worker starting");
 
         // Create disk spill buffer
@@ -182,7 +183,7 @@ impl Worker {
         );
 
         tokio::select! {
-            _ = shutdown.notified() => {
+            _ = shutdown.cancelled() => {
                 info!(account = %self.account_id, "Shutdown requested");
                 ingestor.stop_accepting();
                 stop_event.store(true, Ordering::Relaxed);
@@ -389,7 +390,7 @@ impl Worker {
         socket_executor: SocketCommandExecutor,
         reconnect_notify: Arc<Notify>,
         stop_event: Arc<AtomicBool>,
-        shutdown: Arc<Notify>,
+        shutdown: CancellationToken,
     ) -> Result<()> {
         // Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 spider/ws_runtime.py
         const OUTGOING_COMMAND_INSERTED_CHANNEL: &str = "outgoing_command_inserted";
@@ -413,7 +414,7 @@ impl Worker {
             }
 
             tokio::select! {
-                _ = shutdown.notified() => {
+                _ = shutdown.cancelled() => {
                     break;
                 }
                 payload = listener.recv_payload() => {
@@ -455,7 +456,7 @@ impl Worker {
         // Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 spider/ws_runtime.py
         loop {
             tokio::select! {
-                _ = context.shutdown.notified() => {
+                _ = context.shutdown.cancelled() => {
                     break;
                 }
                 accept = listener.accept() => {
@@ -486,13 +487,13 @@ impl Worker {
         lock_connection: Arc<tokio::sync::Mutex<DedicatedDbConnection>>,
         socket_executor: SocketCommandExecutor,
         stop_event: Arc<AtomicBool>,
-        shutdown: Arc<Notify>,
+        shutdown: CancellationToken,
     ) -> Result<()> {
         // Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 spider/ws_runtime.py
         let mut heartbeat = tokio::time::interval(Duration::from_secs(2));
         loop {
             tokio::select! {
-                _ = shutdown.notified() => break,
+                _ = shutdown.cancelled() => break,
                 _ = heartbeat.tick() => {
                     if stop_event.load(Ordering::Relaxed) {
                         break;
@@ -576,7 +577,7 @@ impl Worker {
             ControlAction::Stop => {
                 context.ingestor.stop_accepting();
                 context.stop_event.store(true, Ordering::Relaxed);
-                context.shutdown.notify_waiters();
+                context.shutdown.cancel();
                 ControlResponse::success("stopping")
                     .with_data(serde_json::json!({ "account_user_id": context.account_id }))
             }
