@@ -78,6 +78,7 @@ pub async fn upsert_member(
     joined_at: Option<DateTime<Utc>>,
 ) -> Result<()> {
     let now = Utc::now();
+    crate::user::ensure_users_exist(db, std::slice::from_ref(&user_id)).await?;
     room_members::Entity::insert(room_members::ActiveModel {
         room_id: Set(room_id),
         user_id: Set(user_id),
@@ -218,6 +219,11 @@ where
     if members_to_upsert.is_empty() {
         return Ok(BatchUpsertResult::default());
     }
+
+    // Ensure placeholder user rows exist before writing room_members, which has a
+    // FK to users(user_id). Mirrors Python _ensure_users_exist.
+    let api_user_ids_vec: Vec<Uuid> = api_user_ids.iter().copied().collect();
+    crate::user::ensure_users_exist(db, &api_user_ids_vec).await?;
 
     // Step 3: mark members who left (in DB active set but not in API response).
     let left_user_ids: Vec<Uuid> = existing_active_ids
