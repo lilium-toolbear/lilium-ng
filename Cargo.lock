@@ -1954,6 +1954,7 @@ dependencies = [
  "dotenvy",
  "lilium-common",
  "lilium-models",
+ "percent-encoding",
  "rust_decimal",
  "sea-orm",
  "sentry",
@@ -1961,6 +1962,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

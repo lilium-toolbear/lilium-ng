@@ -8,6 +8,7 @@ use std::path::PathBuf;
 pub struct Config {
     pub database: DatabaseConfig,
     pub notification: NotificationConfig,
+    pub lock: LockConfig,
     pub spider: SpiderConfig,
     pub processor: ProcessorConfig,
     pub cli: CliConfig,
@@ -21,6 +22,18 @@ pub struct DatabaseConfig {
 
 #[derive(Debug, Clone)]
 pub struct NotificationConfig {
+    pub url: String,
+}
+
+/// Connection URL for session-scoped advisory locks (websocket ownership etc.).
+///
+/// Mirrors Python `database.async_engine::_get_lock_db_url`: advisory locks need a
+/// stable backend session, so they must go through PgBouncer's **session** pool
+/// (`DATABASE_LOCK_URL`, typically the `dzmm_session` database), not the
+/// transaction pool used by ordinary app queries (`DATABASE_URL`, `dzmm`).
+/// Falls back to `DATABASE_URL` when unset.
+#[derive(Debug, Clone)]
+pub struct LockConfig {
     pub url: String,
 }
 
@@ -157,6 +170,9 @@ impl Config {
             notification: NotificationConfig {
                 url: env_fallback_string("DATABASE_NOTIFICATION_URL", "DATABASE_URL")?,
             },
+            lock: LockConfig {
+                url: env_fallback_string("DATABASE_LOCK_URL", "DATABASE_URL")?,
+            },
             spider: SpiderConfig {
                 queue_size: env_usize("SPIDER_QUEUE_SIZE", default_queue_size())?,
                 batch_size: env_usize("SPIDER_BATCH_SIZE", default_batch_size())?,
@@ -188,8 +204,8 @@ impl From<DatabaseConfig> for lilium_database::DatabaseConfig {
     }
 }
 
-impl From<DatabaseConfig> for lilium_database::DedicatedDatabaseConfig {
-    fn from(value: DatabaseConfig) -> Self {
+impl From<LockConfig> for lilium_database::DedicatedDatabaseConfig {
+    fn from(value: LockConfig) -> Self {
         lilium_database::DedicatedDatabaseConfig::from_url(value.url)
     }
 }
@@ -224,5 +240,14 @@ mod tests {
         };
         let db_config: lilium_database::NotificationDatabaseConfig = config.into();
         assert_eq!(db_config.normalized_url(), "postgres://notify");
+    }
+
+    #[test]
+    fn lock_config_converts_url() {
+        let config = LockConfig {
+            url: "postgresql://lock".into(),
+        };
+        let db_config: lilium_database::DedicatedDatabaseConfig = config.into();
+        assert_eq!(db_config.normalized_url(), "postgres://lock");
     }
 }

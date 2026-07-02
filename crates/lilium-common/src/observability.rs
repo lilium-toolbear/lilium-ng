@@ -25,7 +25,7 @@ fn env_string(name: &str) -> Option<String> {
 }
 
 fn get_backend_sentry_dsn() -> Option<String> {
-    env_string("SENTRY_BACKEND_DSN").or_else(|| env_string("SENTRY_DSN"))
+    env_string("LILIUM_NG_SENTRY_DSN").or_else(|| env_string("SENTRY_DSN"))
 }
 
 fn backend_sentry_release() -> Option<Cow<'static, str>> {
@@ -199,7 +199,7 @@ pub fn init_backend_sentry(service_name: &str) -> Option<ClientInitGuard> {
         Some(dsn) => dsn,
         None => {
             init_backend_tracing_subscriber();
-            tracing::info!("Sentry disabled: no SENTRY_BACKEND_DSN or SENTRY_DSN configured");
+            tracing::info!("Sentry disabled: no LILIUM_NG_SENTRY_DSN or SENTRY_DSN configured");
             return None;
         }
     };

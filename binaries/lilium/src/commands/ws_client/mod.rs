@@ -35,7 +35,7 @@ pub async fn run_worker(account: String, config: Config, db: Database) -> Result
 pub fn build_worker_runtime(config: &Config) -> worker::WorkerRuntimeConfig {
     worker::WorkerRuntimeConfig {
         notification_config: config.notification.clone().into(),
-        lock_config: config.database.clone().into(),
+        lock_config: config.lock.clone().into(),
         queue_size: config.spider.queue_size,
         batch_size: config.spider.batch_size,
         buffer_dir: config.spider.buffer_dir.clone(),
