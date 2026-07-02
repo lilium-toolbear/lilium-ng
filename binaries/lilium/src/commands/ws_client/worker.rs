@@ -178,6 +178,7 @@ impl Worker {
             lock_id,
             lock_connection.clone(),
             socket_executor.clone(),
+            reconnect_notify.clone(),
             stop_event.clone(),
             shutdown.clone(),
         );
@@ -486,6 +487,7 @@ impl Worker {
         lock_id: i64,
         lock_connection: Arc<tokio::sync::Mutex<DedicatedDbConnection>>,
         socket_executor: SocketCommandExecutor,
+        reconnect_notify: Arc<Notify>,
         stop_event: Arc<AtomicBool>,
         shutdown: CancellationToken,
     ) -> Result<()> {
@@ -525,8 +527,19 @@ impl Worker {
                         }
                         Err(SocketCommandError::NotConnected) => {}
                         Err(error) => {
-                            return Err(anyhow::anyhow!(error))
-                                .context("emit websocket heartbeat");
+                            // A non-NotConnected emit failure means the socket
+                            // is dying but the executor hasn't been cleared yet
+                            // (the ws task's disconnect callback clears it after
+                            // it observes the disconnect). Don't tear the worker
+                            // down over this race — request a hot-swap reconnect
+                            // and let the next tick retry, mirroring Python's
+                            // hot_swap_connection on disconnection.
+                            warn!(
+                                account = %account_id,
+                                error = %error,
+                                "websocket heartbeat emit failed; requesting reconnect"
+                            );
+                            reconnect_notify.notify_waiters();
                         }
                     }
                 }
