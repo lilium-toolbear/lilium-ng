@@ -192,7 +192,19 @@ pub async fn release_dedicated_connection_lock(
         .execute(conn.as_mut_pg_connection())
         .await?;
 
-    let _ = dedicated_query_bool(conn, "SELECT pg_advisory_unlock($1) AS value", lock_id).await;
+    // Only unlock when this session actually holds the advisory lock. The
+    // dedicated connection is a single long-lived PostgreSQL session; if the
+    // server closed it (idle timeout, restart, network blip) the session-level
+    // advisory lock is gone, and calling pg_advisory_unlock anyway makes
+    // Postgres log `you don't own a lock of type ExclusiveLock`. Mirrors Python
+    // websocket_connection_service, which tolerates a dropped/recreated raw
+    // lock connection.
+    let holds_lock = current_dedicated_connection_holds_lock(conn, lock_id)
+        .await
+        .unwrap_or(false);
+    if holds_lock {
+        let _ = dedicated_query_bool(conn, "SELECT pg_advisory_unlock($1) AS value", lock_id).await;
+    }
     Ok(())
 }
 
