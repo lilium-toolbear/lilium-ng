@@ -207,62 +207,72 @@ struct RateLimiter {
     request_count: u64,
 }
 
+/// Maximum number of reactive retries on `429 Too Many Requests` within a
+/// single `_request` call.
+const MAX_429_RETRIES: u32 = 5;
+/// Upper bound on a single `Retry-After` sleep so an absurd server value can't
+/// hang the client.
+const MAX_RETRY_AFTER_SECS: u64 = 60;
+/// Escalating backoff (seconds) used when the server omits `Retry-After`.
+const FALLBACK_429_BACKOFF_SECS: &[u64] = &[2, 4, 8, 16, 32];
+
+/// Parse a `Retry-After` header as delta-seconds. HTTP-date form is not
+/// supported (the upstream API uses delta-seconds).
+fn parse_retry_after(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get("retry-after")?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
 impl RateLimiter {
-    fn new(
-        min_delay: Option<f64>,
-        max_delay: Option<f64>,
-        batch_size: Option<u64>,
-        batch_delay: Option<f64>,
-    ) -> Self {
+    fn new(min_delay: f64, max_delay: f64, batch_size: u64, batch_delay: f64) -> Self {
         Self {
-            min_delay: min_delay.unwrap_or_else(|| {
-                std::env::var("MIN_REQUEST_DELAY")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0.2)
-            }),
-            max_delay: max_delay.unwrap_or_else(|| {
-                std::env::var("MAX_REQUEST_DELAY")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0.5)
-            }),
-            batch_size: batch_size.unwrap_or_else(|| {
-                std::env::var("BATCH_SIZE")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(50)
-            }),
-            batch_delay: batch_delay.unwrap_or_else(|| {
-                std::env::var("BATCH_DELAY")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(1.0)
-            }),
+            min_delay,
+            max_delay,
+            batch_size,
+            batch_delay,
             request_count: 0,
         }
     }
 
-    async fn wait(&mut self) {
+    /// Increment the request counter and return the delay to apply before the
+    /// next request.
+    ///
+    /// The caller must release the rate-limiter lock *before* sleeping for the
+    /// returned duration; otherwise the lock is held across the sleep and all
+    /// requests are silently serialized (concurrency cap of 1).
+    fn next_delay(&mut self) -> f64 {
         self.request_count += 1;
+
+        let delay = if self.request_count.is_multiple_of(self.batch_size) {
+            self.batch_delay
+        } else if self.min_delay >= self.max_delay {
+            // `rand::random_range` panics on an empty/inverted range, so when
+            // the configured bounds are equal (or inverted) fall back to the
+            // fixed minimum instead of sampling.
+            self.min_delay
+        } else {
+            let mut rng = rand::rng();
+            rng.random_range(self.min_delay..self.max_delay)
+        };
 
         if self.request_count.is_multiple_of(self.batch_size) {
             debug!(
                 "Batch delay after {} requests: {:.2}s",
-                self.request_count, self.batch_delay
+                self.request_count, delay
             );
-            tokio::time::sleep(Duration::from_secs_f64(self.batch_delay)).await;
         } else {
-            let delay = {
-                let mut rng = rand::rng();
-                rng.random_range(self.min_delay..self.max_delay)
-            };
             debug!(
                 "Rate limit delay (request #{}): {:.2}s",
                 self.request_count, delay
             );
-            tokio::time::sleep(Duration::from_secs_f64(delay)).await;
         }
+
+        delay
     }
 }
 
@@ -405,7 +415,12 @@ impl DzmmApi {
             client,
             base_url,
             auth,
-            rate_limiter: Arc::new(Mutex::new(RateLimiter::new(None, None, None, None))),
+            rate_limiter: Arc::new(Mutex::new(RateLimiter::new(
+                config.min_request_delay,
+                config.max_request_delay,
+                config.request_batch_size,
+                config.request_batch_delay,
+            ))),
             refresh_lock: Arc::new(Mutex::new(())),
             cookie_map: Arc::new(Mutex::new(cookie_map)),
             cookie_jar,
@@ -821,9 +836,16 @@ impl DzmmApi {
     #[instrument(level = "debug" skip(self, request), fields(method = ?request.method, endpoint = %request.endpoint))]
     async fn _request(&self, mut request: ApiRequest<'_>) -> Result<Value> {
         let mut retried = false;
+        let mut retry_429_count: u32 = 0;
 
         loop {
-            self.rate_limiter.lock().await.wait().await;
+            // Compute the proactive delay under the lock, then sleep *after*
+            // the guard is dropped. Sleeping while holding the mutex would
+            // serialize every request through the client.
+            let delay = self.rate_limiter.lock().await.next_delay();
+            if delay > 0.0 {
+                tokio::time::sleep(Duration::from_secs_f64(delay)).await;
+            }
 
             let (status, body_bytes, resp_headers) = self._request_inner(&mut request).await?;
 
@@ -840,6 +862,25 @@ impl DzmmApi {
             }
 
             let body_text = String::from_utf8_lossy(&body_bytes);
+
+            // Reactive backoff on 429: honor Retry-After (delta-seconds) when
+            // present, otherwise use an escalating fallback. Capped to avoid
+            // hanging on absurd server values; bounded retry count.
+            if status == StatusCode::TOO_MANY_REQUESTS && retry_429_count < MAX_429_RETRIES {
+                let backoff = parse_retry_after(&resp_headers)
+                    .unwrap_or(FALLBACK_429_BACKOFF_SECS[retry_429_count as usize])
+                    .min(MAX_RETRY_AFTER_SECS);
+                warn!(
+                    "429 Too Many Requests for {}, backing off {}s (attempt {})",
+                    request.endpoint,
+                    backoff,
+                    retry_429_count + 1
+                );
+                tokio::time::sleep(Duration::from_secs(backoff)).await;
+                retry_429_count += 1;
+                continue;
+            }
+
             let is_biz_forbidden = is_trpc_business_forbidden(&body_text);
             let is_auth = matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN);
 
@@ -2621,6 +2662,53 @@ mod tests {
             Some("::".parse().unwrap())
         );
         assert!(parse_dzmm_local_address(Some("127.0.0.1")).is_err());
+    }
+
+    #[test]
+    fn rate_limiter_next_delay_equal_bounds_does_not_panic() {
+        // batch_size > 1 so request #1 is not a batch boundary → exercises the
+        // random-delay branch with min == max, which previously panicked on an
+        // empty `random_range` range.
+        let mut limiter = RateLimiter::new(0.3, 0.3, 10, 1.0);
+        let delay = limiter.next_delay();
+        assert_eq!(delay, 0.3);
+    }
+
+    #[tokio::test]
+    async fn request_retries_after_429_using_retry_after() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let target_path = "/api/trpc/test.endpoint";
+        let handle = tokio::spawn(async move {
+            let mut targets = Vec::new();
+            // First attempt: 429 with Retry-After: 1.
+            {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut stream).await;
+                let resp = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                stream.write_all(resp.as_bytes()).await.unwrap();
+                targets.push(request.target);
+            }
+            // Second attempt: 200 OK with JSON.
+            {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut stream).await;
+                write_json_response(&mut stream, json!({"ok": true})).await;
+                targets.push(request.target);
+            }
+            targets
+        });
+
+        let api = test_api(base_url);
+        let request = ApiRequest::get(target_path).query(trpc_batch_query(&json!({
+            "0": {"json": Value::Null}
+        })));
+        let value = api._request(request).await.unwrap();
+        let targets = handle.await.unwrap();
+
+        assert_eq!(value, json!({"ok": true}));
+        assert_eq!(targets.len(), 2, "should have retried once after 429");
+        assert_eq!(targets[0], targets[1]);
     }
 
     #[tokio::test]
