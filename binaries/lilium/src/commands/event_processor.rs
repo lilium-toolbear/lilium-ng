@@ -31,10 +31,6 @@ pub struct EventProcessor {
     database: Database,
     batch_size: usize,
     polling_interval: Duration,
-    max_retries: u32,
-    initial_retry_delay: Duration,
-    max_retry_delay: Duration,
-    retry_backoff_factor: f64,
     shutdown: CancellationToken,
     notification_config: Option<NotificationDatabaseConfig>,
     data_path: PathBuf,
@@ -53,10 +49,6 @@ impl EventProcessor {
             database,
             batch_size,
             polling_interval: Duration::from_secs(polling_interval_secs),
-            max_retries: 3,
-            initial_retry_delay: Duration::from_secs(1),
-            max_retry_delay: Duration::from_secs(60),
-            retry_backoff_factor: 2.0,
             shutdown: CancellationToken::new(),
             notification_config: None,
             data_path,
@@ -167,7 +159,7 @@ impl EventProcessor {
 
             info!(count = events.len(), "Processing batch");
             let side_effects = self
-                .process_batch_with_retry(&events, cursor_id, cursor_timestamp)
+                .process_batch_with_fallback(&events, cursor_id, cursor_timestamp)
                 .await?;
             self.spawn_media_download(side_effects.media_message_ids);
             self.spawn_avatar_download(side_effects.avatar_downloads);
@@ -186,44 +178,26 @@ impl EventProcessor {
         .await
     }
 
-    async fn process_batch_with_retry(
+    async fn process_batch_with_fallback(
         &self,
         events: &[WebSocketEvent],
         cursor_id: i64,
         cursor_timestamp: Option<DateTime<Utc>>,
     ) -> Result<BatchSideEffects> {
-        let mut attempt = 0;
-        loop {
-            match self
-                .process_batch(events, cursor_id, cursor_timestamp)
-                .await
-            {
-                Ok(side_effects) => {
-                    return Ok(side_effects);
-                }
-                Err(e) => {
-                    attempt += 1;
-                    if attempt > self.max_retries {
-                        error!(
-                            attempts = attempt,
-                            error = %e,
-                            "Max retries exceeded, falling back to per-event processing"
-                        );
-                        return self
-                            .process_batch_individually(events, cursor_id, cursor_timestamp)
-                            .await;
-                    }
-
-                    let delay = self.calculate_retry_delay(attempt);
-                    warn!(
-                        attempt = attempt,
-                        max_retries = self.max_retries,
-                        delay_secs = delay.as_secs_f64(),
-                        error = %e,
-                        "Batch failed, retrying"
-                    );
-                    tokio::time::sleep(delay).await;
-                }
+        match self
+            .process_batch(events, cursor_id, cursor_timestamp)
+            .await
+        {
+            Ok(side_effects) => Ok(side_effects),
+            Err(error) => {
+                error!(
+                    event_count = events.len(),
+                    failure_phase = "batch",
+                    error = %error,
+                    "Batch failed, falling back to per-event processing"
+                );
+                self.process_batch_individually(events, cursor_id, cursor_timestamp)
+                    .await
             }
         }
     }
@@ -338,15 +312,6 @@ impl EventProcessor {
             media_message_ids,
             avatar_downloads,
         })
-    }
-
-    fn calculate_retry_delay(&self, attempt: u32) -> Duration {
-        let initial_delay: f64 = self.initial_retry_delay.as_secs_f64();
-        let backoff_factor: f64 = self.retry_backoff_factor;
-        let delay = initial_delay * backoff_factor.powi(attempt as i32 - 1);
-        let capped_delay = delay.min(self.max_retry_delay.as_secs_f64());
-        let jitter = 0.5 + rand::random::<f64>();
-        Duration::from_secs_f64(capped_delay * jitter)
     }
 
     async fn process_batch(
@@ -1091,20 +1056,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batch_retry_falls_back_to_per_event_processing() {
+    async fn batch_failure_falls_back_to_per_event_processing_without_retry_delay() {
         let test_db = TestDb::acquire(FixtureProfile::Event)
             .await
             .expect("init event db");
 
-        let mut processor = EventProcessor::new(
+        let processor = EventProcessor::new(
             test_db.database().clone(),
             "test_processor".to_string(),
             10,
             60,
             PathBuf::from("./data"),
         );
-        processor.max_retries = 0;
-
         let events = vec![
             websocket_event(
                 21,
@@ -1125,10 +1088,13 @@ mod tests {
             ),
         ];
 
-        processor
-            .process_batch_with_retry(&events, 0, None)
-            .await
-            .expect("fallback processing");
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            processor.process_batch_with_fallback(&events, 0, None),
+        )
+        .await
+        .expect("batch failure should fall back without waiting for retry backoff")
+        .expect("fallback processing");
 
         let offset = test_db
             .database()
@@ -1150,14 +1116,13 @@ mod tests {
             .await
             .expect("init shared db");
 
-        let mut processor = EventProcessor::new(
+        let processor = EventProcessor::new(
             test_db.database().clone(),
             "test_processor".to_string(),
             10,
             60,
             PathBuf::from("./data"),
         );
-        processor.max_retries = 0;
 
         let event = websocket_event(
             31,
@@ -1180,7 +1145,7 @@ mod tests {
         );
 
         processor
-            .process_batch_with_retry(&[event], 0, None)
+            .process_batch_with_fallback(&[event], 0, None)
             .await
             .expect("fallback processing");
 
