@@ -112,6 +112,15 @@ impl MediaService {
         let mut updates = Vec::new();
 
         for download in downloads.iter().cloned() {
+            if should_skip_media_url(&download.attachment_url) {
+                info!(
+                    message_id = %download.message_id,
+                    url = %download.attachment_url,
+                    "Skipping media download for excluded host"
+                );
+                continue;
+            }
+
             let permit = semaphore.clone().acquire_owned().await?;
             let data_path = self.data_path.clone();
             let client = self.client.clone();
@@ -218,6 +227,9 @@ where
                 return None;
             }
             let attachment_url = message.attachment_url?;
+            if should_skip_media_url(&attachment_url) {
+                return None;
+            }
             let content_type = message.content_type;
             let ext = content_type_ext(&content_type).to_string();
             Some(MediaDownload {
@@ -320,6 +332,21 @@ pub fn normalize_url(url: &str) -> String {
     sanitized.trim().to_string()
 }
 
+/// Hosts whose media is already local/CDN-owned and must not be re-downloaded.
+const SKIPPED_MEDIA_DOWNLOAD_HOSTS: &[&str] = &["s3.kuma.homes"];
+
+/// Returns true when `url` points at a host that the media pipeline should skip.
+pub fn should_skip_media_url(url: &str) -> bool {
+    let Ok(parsed) = Url::parse(&normalize_url(url)) else {
+        return false;
+    };
+    parsed.host_str().is_some_and(|host| {
+        SKIPPED_MEDIA_DOWNLOAD_HOSTS
+            .iter()
+            .any(|skipped| host.eq_ignore_ascii_case(skipped))
+    })
+}
+
 pub fn is_public_ip_address(ip: &str) -> bool {
     match ip.parse::<IpAddr>() {
         Ok(addr) => is_public_ip_addr(addr),
@@ -382,6 +409,13 @@ pub async fn validate_remote_url(url: &str) -> Result<Url> {
     let host = parsed
         .host_str()
         .context("Media download URL is missing hostname")?;
+
+    if SKIPPED_MEDIA_DOWNLOAD_HOSTS
+        .iter()
+        .any(|skipped| host.eq_ignore_ascii_case(skipped))
+    {
+        bail!("Skipped media download for host: {}", host);
+    }
 
     if let Ok(ip) = host.parse::<IpAddr>() {
         if !is_public_ip_addr(ip) {
@@ -1190,6 +1224,52 @@ mod tests {
             .expect_err("loopback must be blocked");
         let msg = err.to_string();
         assert!(msg.contains("non-public") || msg.contains("Unsupported"));
+    }
+
+    #[test]
+    fn should_skip_media_url_matches_s3_kuma_homes_host() {
+        assert!(should_skip_media_url(
+            "https://s3.kuma.homes/bucket/path/image.jpg"
+        ));
+        assert!(should_skip_media_url(
+            " https://S3.KUMA.HOMES/bucket/path/image.jpg "
+        ));
+        assert!(!should_skip_media_url(
+            "https://cdn.example.com/bucket/path/image.jpg"
+        ));
+        assert!(!should_skip_media_url("https://kuma.homes/image.jpg"));
+        assert!(!should_skip_media_url("not-a-url"));
+    }
+
+    #[tokio::test]
+    async fn validate_remote_url_rejects_s3_kuma_homes() {
+        let err = validate_remote_url("https://s3.kuma.homes/bucket/a.png")
+            .await
+            .expect_err("s3.kuma.homes must be skipped");
+        assert!(
+            err.to_string().contains("s3.kuma.homes"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_media_batch_skips_s3_kuma_homes_without_failure() {
+        let media_service = MediaService::with_data_path(PathBuf::from("/tmp/data"));
+        let downloads = [MediaDownload {
+            message_id: test_uuid("message-s3-skip"),
+            sent_at: Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap(),
+            content_type: "image".into(),
+            attachment_url: "https://s3.kuma.homes/bucket/a.png".into(),
+            ext: "png".into(),
+            sticker_id: None,
+        }];
+
+        let (updates, failure_count) = media_service
+            .download_media_batch(&downloads)
+            .await
+            .unwrap();
+        assert!(updates.is_empty());
+        assert_eq!(failure_count, 0);
     }
 
     #[test]
