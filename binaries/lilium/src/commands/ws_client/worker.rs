@@ -52,6 +52,17 @@ struct WebsocketRunContext {
     socket_executor: SocketCommandExecutor,
 }
 
+struct HeartbeatLoopContext {
+    account_id: Uuid,
+    lock_id: i64,
+    lock_connection: Arc<tokio::sync::Mutex<DedicatedDbConnection>>,
+    lock_config: DedicatedDatabaseConfig,
+    socket_executor: SocketCommandExecutor,
+    reconnect_notify: Arc<Notify>,
+    stop_event: Arc<AtomicBool>,
+    shutdown: CancellationToken,
+}
+
 struct WorkerControlContext {
     account_id: Uuid,
     ingestor: Arc<EventIngestor>,
@@ -173,15 +184,16 @@ impl Worker {
             },
         );
 
-        let heartbeat_fut = Self::run_heartbeat_loop(
-            self.account_id,
+        let heartbeat_fut = Self::run_heartbeat_loop(HeartbeatLoopContext {
+            account_id: self.account_id,
             lock_id,
-            lock_connection.clone(),
-            socket_executor.clone(),
-            reconnect_notify.clone(),
-            stop_event.clone(),
-            shutdown.clone(),
-        );
+            lock_connection: lock_connection.clone(),
+            lock_config: self.runtime.lock_config.clone(),
+            socket_executor: socket_executor.clone(),
+            reconnect_notify: reconnect_notify.clone(),
+            stop_event: stop_event.clone(),
+            shutdown: shutdown.clone(),
+        });
 
         tokio::select! {
             _ = shutdown.cancelled() => {
@@ -393,61 +405,139 @@ impl Worker {
         stop_event: Arc<AtomicBool>,
         shutdown: CancellationToken,
     ) -> Result<()> {
-        // Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 spider/ws_runtime.py
+        // Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655
+        // spider/ws_runtime.py + database/notification.py NotificationListener reconnect
+        // + services/notification_service.py stream_with_polling error handling.
         const OUTGOING_COMMAND_INSERTED_CHANNEL: &str = "outgoing_command_inserted";
         const POLLING_INTERVAL: Duration = Duration::from_secs(30);
 
-        let mut listener = NotificationConnection::connect(notification_config)
-            .await
-            .context("connect outgoing command notification listener")?;
-        listener
-            .listen(OUTGOING_COMMAND_INSERTED_CHANNEL)
-            .await
-            .context("listen for outgoing command notifications")?;
-
-        Self::process_pending_commands(account_id, &database, &socket_executor, &reconnect_notify)
-            .await?;
-
-        let mut polling = tokio::time::interval(POLLING_INTERVAL);
         loop {
-            if stop_event.load(Ordering::Relaxed) {
-                break;
+            if should_stop_db_infra_recovery(&stop_event, &shutdown) {
+                return Ok(());
             }
 
-            tokio::select! {
-                _ = shutdown.cancelled() => {
-                    break;
+            let mut listener =
+                match NotificationConnection::connect(notification_config.clone()).await {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        warn!(
+                            account = %account_id,
+                            error = %error,
+                            "Failed to connect outgoing command notification listener; retrying"
+                        );
+                        if Self::wait_for_db_infra_reconnect(&stop_event, &shutdown).await {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                };
+
+            if let Err(error) = listener.listen(OUTGOING_COMMAND_INSERTED_CHANNEL).await {
+                warn!(
+                    account = %account_id,
+                    error = %error,
+                    "Failed to listen for outgoing command notifications; reconnecting"
+                );
+                if Self::wait_for_db_infra_reconnect(&stop_event, &shutdown).await {
+                    return Ok(());
                 }
-                payload = listener.recv_payload() => {
-                    let payload = payload.context("receive outgoing command notification")?;
-                    tracing::debug!(
-                        account = %account_id,
-                        channel = OUTGOING_COMMAND_INSERTED_CHANNEL,
-                        payload = %payload,
-                        "received outgoing command notification"
-                    );
-                    Self::process_pending_commands(
-                        account_id,
-                        &database,
-                        &socket_executor,
-                        &reconnect_notify,
-                    )
-                    .await?;
+                continue;
+            }
+
+            Self::process_pending_commands_best_effort(
+                account_id,
+                &database,
+                &socket_executor,
+                &reconnect_notify,
+                "Initial outgoing command poll failed; continuing",
+            )
+            .await;
+
+            let mut polling = tokio::time::interval(POLLING_INTERVAL);
+            loop {
+                if should_stop_db_infra_recovery(&stop_event, &shutdown) {
+                    return Ok(());
                 }
-                _ = polling.tick() => {
-                    Self::process_pending_commands(
-                        account_id,
-                        &database,
-                        &socket_executor,
-                        &reconnect_notify,
-                    )
-                    .await?;
+
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        return Ok(());
+                    }
+                    payload = listener.recv_payload() => {
+                        match payload {
+                            Ok(payload) => {
+                                tracing::debug!(
+                                    account = %account_id,
+                                    channel = OUTGOING_COMMAND_INSERTED_CHANNEL,
+                                    payload = %payload,
+                                    "received outgoing command notification"
+                                );
+                                Self::process_pending_commands_best_effort(
+                                    account_id,
+                                    &database,
+                                    &socket_executor,
+                                    &reconnect_notify,
+                                    "Outgoing command poll after NOTIFY failed; continuing",
+                                )
+                                .await;
+                            }
+                            Err(error) => {
+                                warn!(
+                                    account = %account_id,
+                                    error = %error,
+                                    "Outgoing command notification listener failed; reconnecting"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    _ = polling.tick() => {
+                        Self::process_pending_commands_best_effort(
+                            account_id,
+                            &database,
+                            &socket_executor,
+                            &reconnect_notify,
+                            "Outgoing command polling failed; continuing",
+                        )
+                        .await;
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
                 }
-                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+            }
+
+            if Self::wait_for_db_infra_reconnect(&stop_event, &shutdown).await {
+                return Ok(());
             }
         }
+    }
 
-        Ok(())
+    /// Wait for [`DB_INFRA_RECONNECT_DELAY`], returning `true` when the worker
+    /// should stop instead of reconnecting.
+    async fn wait_for_db_infra_reconnect(
+        stop_event: &Arc<AtomicBool>,
+        shutdown: &CancellationToken,
+    ) -> bool {
+        tokio::select! {
+            _ = shutdown.cancelled() => true,
+            _ = tokio::time::sleep(DB_INFRA_RECONNECT_DELAY) => {
+                should_stop_db_infra_recovery(stop_event, shutdown)
+            }
+        }
+    }
+
+    async fn process_pending_commands_best_effort(
+        account_id: Uuid,
+        database: &Database,
+        socket_executor: &SocketCommandExecutor,
+        reconnect_notify: &Arc<Notify>,
+        failure_message: &str,
+    ) {
+        if let Err(error) =
+            Self::process_pending_commands(account_id, database, socket_executor, reconnect_notify)
+                .await
+        {
+            warn!(account = %account_id, error = %error, "{}", failure_message);
+        }
     }
 
     async fn run_control_server(
@@ -482,16 +572,18 @@ impl Worker {
         Ok(())
     }
 
-    async fn run_heartbeat_loop(
-        account_id: Uuid,
-        lock_id: i64,
-        lock_connection: Arc<tokio::sync::Mutex<DedicatedDbConnection>>,
-        socket_executor: SocketCommandExecutor,
-        reconnect_notify: Arc<Notify>,
-        stop_event: Arc<AtomicBool>,
-        shutdown: CancellationToken,
-    ) -> Result<()> {
+    async fn run_heartbeat_loop(context: HeartbeatLoopContext) -> Result<()> {
         // Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 spider/ws_runtime.py
+        let HeartbeatLoopContext {
+            account_id,
+            mut lock_id,
+            lock_connection,
+            lock_config,
+            socket_executor,
+            reconnect_notify,
+            stop_event,
+            shutdown,
+        } = context;
         let mut heartbeat = tokio::time::interval(Duration::from_secs(2));
         loop {
             tokio::select! {
@@ -511,19 +603,27 @@ impl Worker {
                     {
                         Ok(_) => {
                             let mut connection = lock_connection.lock().await;
-                            websocket_connection::ensure_dedicated_connection_lock(
-                                &mut connection,
+                            if let Err(error) = Self::refresh_advisory_lock_heartbeat(
                                 account_id,
-                                Some(lock_id),
-                            )
-                            .await
-                            .context("ensure websocket advisory lock during heartbeat")?;
-                            websocket_connection::update_dedicated_heartbeat(
+                                &mut lock_id,
                                 &mut connection,
-                                lock_id,
                             )
                             .await
-                            .context("update websocket heartbeat")?;
+                            {
+                                warn!(
+                                    account = %account_id,
+                                    lock_id,
+                                    error = %error,
+                                    "Failed to refresh websocket advisory lock during heartbeat; attempting recovery"
+                                );
+                                Self::recover_advisory_lock_session(
+                                    account_id,
+                                    &mut lock_id,
+                                    &mut connection,
+                                    &lock_config,
+                                )
+                                .await;
+                            }
                         }
                         Err(SocketCommandError::NotConnected) => {}
                         Err(error) => {
@@ -547,6 +647,63 @@ impl Worker {
         }
 
         Ok(())
+    }
+
+    async fn refresh_advisory_lock_heartbeat(
+        account_id: Uuid,
+        lock_id: &mut i64,
+        connection: &mut DedicatedDbConnection,
+    ) -> Result<()> {
+        *lock_id = websocket_connection::ensure_dedicated_connection_lock(
+            connection,
+            account_id,
+            Some(*lock_id),
+        )
+        .await
+        .context("ensure websocket advisory lock during heartbeat")?;
+        websocket_connection::update_dedicated_heartbeat(connection, *lock_id)
+            .await
+            .context("update websocket heartbeat")?;
+        Ok(())
+    }
+
+    async fn recover_advisory_lock_session(
+        account_id: Uuid,
+        lock_id: &mut i64,
+        connection: &mut DedicatedDbConnection,
+        lock_config: &DedicatedDatabaseConfig,
+    ) {
+        let fresh = match DedicatedDbConnection::connect(lock_config.clone()).await {
+            Ok(fresh) => fresh,
+            Err(error) => {
+                warn!(
+                    account = %account_id,
+                    error = %error,
+                    "Failed to reconnect websocket advisory-lock session"
+                );
+                return;
+            }
+        };
+        *connection = fresh;
+
+        match websocket_connection::acquire_dedicated_connection_lock(connection, account_id).await
+        {
+            Ok(new_lock_id) => {
+                *lock_id = new_lock_id;
+                info!(
+                    account = %account_id,
+                    lock_id = new_lock_id,
+                    "Reacquired websocket advisory lock after database recovery"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    account = %account_id,
+                    error = %error,
+                    "Failed to reacquire websocket advisory lock after reconnect"
+                );
+            }
+        }
     }
 
     async fn handle_control_command(
@@ -768,10 +925,34 @@ fn ack_failure_message(ack_response: Option<&serde_json::Value>) -> Option<Strin
     })
 }
 
+/// Whether LISTEN / advisory-lock recovery loops should exit cleanly instead of
+/// reconnecting (stop flag or cancellation token requested).
+fn should_stop_db_infra_recovery(stop_event: &AtomicBool, shutdown: &CancellationToken) -> bool {
+    db_infra_recovery_should_stop(stop_event.load(Ordering::Relaxed), shutdown.is_cancelled())
+}
+
+/// Pure stop-vs-reconnect decision for DB infrastructure failures.
+fn db_infra_recovery_should_stop(stop_requested: bool, shutdown_requested: bool) -> bool {
+    stop_requested || shutdown_requested
+}
+
+const DB_INFRA_RECONNECT_DELAY: Duration = Duration::from_secs(5);
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use anyhow::Context;
+
+    #[test]
+    fn db_infra_error_reconnects_while_worker_should_stay_up() {
+        assert!(!db_infra_recovery_should_stop(false, false));
+    }
+
+    #[test]
+    fn db_infra_error_stops_when_shutdown_or_stop_requested() {
+        assert!(db_infra_recovery_should_stop(true, false));
+        assert!(db_infra_recovery_should_stop(false, true));
+    }
 
     #[test]
     fn error_chain_includes_root_cause() {
