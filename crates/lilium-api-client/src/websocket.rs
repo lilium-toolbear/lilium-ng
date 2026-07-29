@@ -12,11 +12,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::net::{TcpSocket, TcpStream, lookup_host};
 use tokio::sync::{Notify, RwLock, oneshot};
-use tokio_util::sync::CancellationToken;
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, client_async, client_async_tls_with_config, connect_async,
     tungstenite::{handshake::client::Response, http::Request},
 };
+use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 use tracing::{error, info, warn};
 use url::Url;
