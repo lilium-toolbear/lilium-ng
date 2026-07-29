@@ -16,6 +16,8 @@ use tokio::signal;
 use tokio::time::{Duration, sleep};
 use uuid::Uuid;
 
+const INITIAL_SYNC_RETRY_DELAY: Duration = Duration::from_secs(15);
+
 #[derive(Args)]
 pub struct SyncRoomsArgs {
     /// Account user_id to use for sync (default: sync all enabled accounts)
@@ -338,14 +340,37 @@ async fn poll_mode(
     tracing::info!("{}", "=".repeat(60));
 
     tracing::info!("\n📋 Initial sync...");
-    let current = match sync_once(db, account_id).await? {
-        Some(set) => set,
-        None => {
-            tracing::error!("❌ Initial sync failed");
-            return Ok(1);
+    known_room_ids = loop {
+        match sync_once(db, account_id).await {
+            Ok(Some(set)) => break set,
+            Ok(None) => {
+                tracing::warn!(
+                    "⚠️  Initial sync returned no room set; retrying in {}s",
+                    INITIAL_SYNC_RETRY_DELAY.as_secs()
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "⚠️  Initial sync failed; retrying in {}s",
+                    INITIAL_SYNC_RETRY_DELAY.as_secs()
+                );
+            }
+        }
+        tokio::select! {
+            _ = signal::ctrl_c() => {
+                shutdown = true;
+                break HashSet::new();
+            }
+            _ = sleep(INITIAL_SYNC_RETRY_DELAY) => {}
         }
     };
-    known_room_ids = current.clone();
+    if shutdown {
+        tracing::info!("\n{}", "=".repeat(60));
+        tracing::info!("🛑 Polling mode stopped gracefully");
+        tracing::info!("{}", "=".repeat(60));
+        return Ok(0);
+    }
     tracing::info!("\n📊 Tracking {} room(s)", known_room_ids.len());
 
     let mut poll_count = 0u32;
@@ -369,10 +394,17 @@ async fn poll_mode(
         tracing::info!("🔄 Poll #{poll_count}");
         tracing::info!("{}", "=".repeat(60));
 
-        let current = match sync_once(db, account_id).await? {
-            Some(set) => set,
-            None => {
-                tracing::warn!("⚠️  Sync failed, will retry next cycle");
+        let current = match sync_once(db, account_id).await {
+            Ok(Some(set)) => set,
+            Ok(None) => {
+                tracing::warn!("⚠️  Sync returned no room set, will retry next cycle");
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "⚠️  Sync failed, will retry next cycle"
+                );
                 continue;
             }
         };
