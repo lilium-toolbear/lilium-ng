@@ -44,8 +44,8 @@ fn init_backend_tracing_subscriber() {
         });
 
     // Global filter gates every layer (including sentry) and respects RUST_LOG.
-    let global_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "info".into());
+    let global_filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
 
     // Console-only filter: by default the same as `global_filter`, but silences the
     // high-cardinality db / event-processor transaction spans. Their span names and
