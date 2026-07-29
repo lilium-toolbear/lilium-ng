@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 // Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 spider/event_processor.py
 const WEBSOCKET_EVENT_INSERTED_CHANNEL: &str = "websocket_event_inserted";
+const NOTIFICATION_RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Default)]
 struct BatchSideEffects {
@@ -72,7 +73,16 @@ impl EventProcessor {
             "Event processor starting"
         );
 
-        let mut notification = self.connect_notification_listener().await?;
+        let mut notification = match self.connect_notification_listener().await {
+            Ok(listener) => listener,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "Event processor failed to attach notification listener; running polling-only until reconnect"
+                );
+                None
+            }
+        };
 
         if let Err(error) = self.process_next_batch().await {
             error!(error = %error, "Initial event processor poll failed");
@@ -86,8 +96,8 @@ impl EventProcessor {
                     info!("Shutting down event processor");
                     break;
                 }
-                notification = Self::recv_notification(&mut notification) => {
-                    match notification {
+                notification_payload = Self::recv_notification(&mut notification) => {
+                    match notification_payload {
                         Ok(Some(payload)) => {
                             info!(
                                 channel = WEBSOCKET_EVENT_INSERTED_CHANNEL,
@@ -101,14 +111,37 @@ impl EventProcessor {
                         }
                         Ok(None) => {}
                         Err(error) => {
-                            error!(error = %error, "Event processor notification listener failed");
-                            break;
+                            warn!(
+                                error = %error,
+                                "Event processor notification listener failed; falling back to polling and reconnect"
+                            );
+                            notification = None;
+                            poll_sleep
+                                .as_mut()
+                                .reset(Instant::now() + NOTIFICATION_RECONNECT_DELAY);
                         }
                     }
                 }
                 _ = &mut poll_sleep => {
                     if let Err(error) = self.process_next_batch().await {
                         error!(error = %error, "Event processor poll failed");
+                    }
+                    if should_retry_notification_listener(
+                        self.notification_config.is_some(),
+                        notification.is_some(),
+                    ) {
+                        match self.connect_notification_listener().await {
+                            Ok(Some(listener)) => {
+                                notification = Some(listener);
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                warn!(
+                                    error = %error,
+                                    "Event processor notification reconnect failed; continuing polling"
+                                );
+                            }
+                        }
                     }
                     poll_sleep.as_mut().reset(Instant::now() + self.polling_interval);
                 }
@@ -789,6 +822,13 @@ impl EventProcessor {
     }
 }
 
+fn should_retry_notification_listener(
+    notification_configured: bool,
+    listener_attached: bool,
+) -> bool {
+    notification_configured && !listener_attached
+}
+
 use crate::config::Config;
 
 pub async fn run(config: Config, db: Database) -> Result<()> {
@@ -818,6 +858,13 @@ mod tests {
     use lilium_services::event;
     use lilium_services::message;
     use lilium_test_fixtures::{FixtureProfile, TestDb, test_uuid};
+
+    #[test]
+    fn retries_listener_only_when_configured_and_missing() {
+        assert!(should_retry_notification_listener(true, false));
+        assert!(!should_retry_notification_listener(false, false));
+        assert!(!should_retry_notification_listener(true, true));
+    }
 
     fn utc(ts: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(ts)

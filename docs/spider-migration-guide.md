@@ -157,6 +157,10 @@ This prevents missed work when a notification is lost, coalesced, delayed, or
 received before a listener reaches the steady-state loop. It also keeps the
 websocket + disk-spill path alive across database outages.
 
+For long-running consumers (ws-client outgoing-command listener and
+event-processor), LISTEN connection loss is not fatal: log, keep polling, and
+retry attaching a fresh notification listener.
+
 ### Worker Runtime Is A Task Set
 
 Python `AccountWorker.run` starts a writer task plus three background tasks:

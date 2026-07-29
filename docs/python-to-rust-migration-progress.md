@@ -402,6 +402,9 @@ Verified scenarios:
   a dedicated notification listener connection.
 - Event processor loads the same notification URL contract and listens for
   `websocket_event_inserted` outside the normal application pool.
+- Event processor no longer exits when the notification listener connection
+  drops. It falls back to polling and keeps retrying listener attachment,
+  matching Python's LISTEN auto-reconnect behavior.
 - Worker starts four runtime tasks matching Python `AccountWorker.run`: event
   writer, websocket runtime, outgoing command listener, and worker control
   socket.
@@ -438,6 +441,9 @@ Verified scenarios:
 - Programmatic reconnect performs a hot-swap: connect a new Socket.IO client,
   switch the command executor to the new client, then disconnect the old client.
   If the new connection fails, the old socket remains active.
+- `sync-rooms --poll` now retries initial sync failures instead of exiting
+  immediately. This is an intentional hardening difference from Python so
+  transient database outages at startup do not stop the long-running poll loop.
 
 Remaining gaps:
 
