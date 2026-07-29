@@ -10,3 +10,4 @@ runtime
 # nix build outputs
 result
 result-*
+/.nix-cache
