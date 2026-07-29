@@ -406,7 +406,9 @@ Verified scenarios:
   writer, websocket runtime, outgoing command listener, and worker control
   socket.
 - Worker listens to `outgoing_command_inserted`, runs an initial pending-command
-  poll, and keeps a 30 second polling fallback.
+  poll, and keeps a 30 second polling fallback. LISTEN connection loss and
+  poll/NOTIFY database errors reconnect or continue instead of shutting the
+  worker down (Python `NotificationListener` + `stream_with_polling` parity).
 - Pending outgoing commands are fetched by `account_user_id`, ordered by id,
   capped at 100, and processed only when ready according to service rules.
 - Socket commands use the current live Socket.IO client. When no socket is
@@ -428,7 +430,11 @@ Verified scenarios:
   bind failure path after lock acquisition.
 - Worker emits Socket.IO `heartbeat` periodically while the socket is connected,
   verifies the dedicated connection still owns the advisory lock, and updates
-  `websocket_connections.last_heartbeat` on the same connection.
+  `websocket_connections.last_heartbeat` on the same connection. Advisory-lock
+  session death during heartbeat reconnects the dedicated connection and
+  reacquires the lock instead of exiting the worker.
+- Arbiter restart watcher treats any exit while a worker is still tracked as
+  unexpected and restarts it (intentional stops remove the handle first).
 - Programmatic reconnect performs a hot-swap: connect a new Socket.IO client,
   switch the command executor to the new client, then disconnect the old client.
   If the new connection fails, the old socket remains active.

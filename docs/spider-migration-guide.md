@@ -148,9 +148,14 @@ signal, then polls the database for the real data. Keep this contract in Rust:
 - poll again after every NOTIFY
 - keep a timed polling fallback, currently 30 seconds for outgoing commands
 - fetch durable rows from the database rather than trusting the NOTIFY payload
+- on LISTEN connection loss (broken pipe, server restart), reconnect the
+  dedicated notification session and resume; do not tear down the worker
+- treat poll/NOTIFY-triggered database errors as transient: log and continue,
+  mirroring Python `stream_with_polling` / `NotificationListener` reconnect
 
 This prevents missed work when a notification is lost, coalesced, delayed, or
-received before a listener reaches the steady-state loop.
+received before a listener reaches the steady-state loop. It also keeps the
+websocket + disk-spill path alive across database outages.
 
 ### Worker Runtime Is A Task Set
 

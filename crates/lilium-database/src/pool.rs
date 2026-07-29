@@ -1,6 +1,6 @@
 // Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 database/async_engine.py database/database_url.py
 
-use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
+use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
 use sqlx::PgPool;
 use std::fmt::Write as _;
 use url::ParseError;
@@ -114,10 +114,7 @@ fn rewrite_libpq_host_query(input: &str) -> Option<String> {
     let authority = &authority_and_path[scheme_end..authority_end];
     let path = &authority_and_path[authority_end..];
 
-    let userinfo = match authority.rsplit_once('@') {
-        Some((user, _)) => Some(user),
-        None => None,
-    };
+    let userinfo = authority.rsplit_once('@').map(|(user, _)| user);
 
     let encoded_host = utf8_percent_encode(&host, HOST_AUTHORITY_ENCODE_SET);
 
@@ -214,8 +211,7 @@ mod tests {
 
     #[test]
     fn rewrites_libpq_tcp_host_query() {
-        let out =
-            normalize_database_url("postgres://user:pass@/db?host=db.example.com&port=6543");
+        let out = normalize_database_url("postgres://user:pass@/db?host=db.example.com&port=6543");
         assert_eq!(out, "postgres://user:pass@db.example.com:6543/db");
         assert!(out.parse::<url::Url>().is_ok());
     }

@@ -39,6 +39,16 @@ fn backoff_delay(restart_count: u32) -> Duration {
     Duration::from_millis(std::cmp::min(millis, max))
 }
 
+/// Policy for a worker that exited while still tracked by the arbiter.
+///
+/// Intentional stops remove the handle via [`Arbiter::stop_worker`] before the
+/// child exits, so any exit observed by the restart watcher is unexpected.
+/// Always restart (success and failure alike) so DB-outage clean exits are not
+/// permanent — matching Python's arbiter scan of still-desired dead workers.
+fn tracked_worker_exit_should_restart(_exit_success: bool) -> bool {
+    true
+}
+
 trait WorkerSpawner: Send + Sync {
     fn spawn_worker(&self, account: String) -> WorkerHandle;
 }
@@ -125,31 +135,31 @@ impl Arbiter {
                         let mut workers = restart_workers.write().await;
                         let mut to_restart = Vec::new();
                         for (account, handle) in workers.iter_mut() {
-                            match handle.child.try_wait() {
-                                Ok(Some(status)) if !status.success() => {
-                                    warn!(account = %account, status = ?status, "worker exited; will restart");
-                                    to_restart.push((*account, false));
+                            if let Ok(Some(status)) = handle.child.try_wait() {
+                                let exit_success = status.success();
+                                if tracked_worker_exit_should_restart(exit_success) {
+                                    warn!(
+                                        account = %account,
+                                        status = ?status,
+                                        exit_success,
+                                        "worker exited; will restart"
+                                    );
+                                    to_restart.push(*account);
                                 }
-                                Ok(Some(status)) if status.success() => {
-                                    info!(account = %account, "worker exited cleanly; removing");
-                                    to_restart.push((*account, true));
-                                }
-                                _ => {}
                             }
                         }
-                        for (account, clean_exit) in to_restart {
-                            if clean_exit {
-                                workers.remove(&account);
-                                continue;
-                            }
+                        for account in to_restart {
                             if let Some(mut handle) = workers.remove(&account) {
                                 let _ = handle.child.start_kill();
                                 let delay = backoff_delay(handle.restart_count);
                                 let new_handle = restart_spawner.spawn_worker(account.to_string());
-                                workers.insert(account, WorkerHandle {
-                                    child: new_handle.child,
-                                    restart_count: handle.restart_count + 1,
-                                });
+                                workers.insert(
+                                    account,
+                                    WorkerHandle {
+                                        child: new_handle.child,
+                                        restart_count: handle.restart_count + 1,
+                                    },
+                                );
                                 sleep(delay).await;
                             }
                         }
@@ -316,7 +326,11 @@ impl Arbiter {
         }
     }
 
-    async fn run_control_server(self, listener: UnixListener, shutdown: CancellationToken) -> Result<()> {
+    async fn run_control_server(
+        self,
+        listener: UnixListener,
+        shutdown: CancellationToken,
+    ) -> Result<()> {
         info!("Control server starting");
         loop {
             tokio::select! {
@@ -456,6 +470,12 @@ mod tests {
         impl WorkerSpawner for WorkerSpawner {
             fn spawn_worker(&self, account: String) -> WorkerHandle;
         }
+    }
+
+    #[test]
+    fn unexpected_success_exit_still_restarts() {
+        assert!(tracked_worker_exit_should_restart(true));
+        assert!(tracked_worker_exit_should_restart(false));
     }
 
     #[tokio::test]
