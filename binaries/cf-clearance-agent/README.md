@@ -13,11 +13,14 @@ profile must stay on the same release.
 
 ```sh
 docker compose -f compose.cf-clearance-agent.yaml up -d --build
-curl --fail http://127.0.0.1:8787/readyz
+curl --fail http://127.0.0.1:8787/healthz
 ```
 
 The named `cf-clearance-profile` volume preserves the anonymous browser profile
 across restarts. The agent and all clients must use the same fixed egress IP.
+The supervisor is lazy: startup does not contact DZMM or solve a challenge.
+`/readyz` therefore returns `503` until a consumer observes
+`cf-mitigated: challenge` and calls `POST /v1/refresh`.
 
 For a host process, the Rust client default is already:
 
@@ -41,3 +44,6 @@ The API is intentionally small:
 
 There is no manual verification fallback. A failed solve returns a retryable
 unavailable error and the supervisor retries with capped exponential backoff.
+Consumers use their normal Python-parity UA and account cookies while no
+challenge is observed. They activate the returned browser UA and Cloudflare
+cookies only after a successful refresh.

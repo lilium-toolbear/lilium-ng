@@ -6,6 +6,34 @@ import { RefreshSupervisor } from "../src/supervisor.mjs";
 
 const NOW_MS = Date.parse("2026-07-31T04:00:00.000Z");
 
+test("starting the supervisor is idle until an external refresh", () => {
+  const timers = [];
+  let solveCalls = 0;
+  const state = new ClearanceAgentState({
+    solve: async () => {
+      solveCalls += 1;
+      throw new Error("unexpected solve");
+    },
+    clock: () => NOW_MS,
+  });
+  const supervisor = new RefreshSupervisor({
+    state,
+    clock: () => NOW_MS,
+    setTimer: (callback, delay) => {
+      const timer = { callback, delay, cancelled: false };
+      timers.push(timer);
+      return timer;
+    },
+  });
+
+  supervisor.start();
+
+  assert.equal(solveCalls, 0);
+  assert.equal(timers.length, 0);
+  assert.equal(state.status, "starting");
+  supervisor.stop();
+});
+
 test("failed solves enter capped exponential backoff", async () => {
   const timers = [];
   const state = new ClearanceAgentState({
@@ -30,7 +58,12 @@ test("failed solves enter capped exponential backoff", async () => {
   });
 
   supervisor.start();
-  await runLastLiveTimer(timers);
+  await assert.rejects(
+    state.refresh({
+      observed_generation: 0,
+      reason: "cf-mitigated",
+    }),
+  );
   assert.equal(lastLiveTimer(timers).delay, 1000);
   await runLastLiveTimer(timers);
   assert.equal(lastLiveTimer(timers).delay, 2000);
@@ -74,7 +107,10 @@ test("successful solves schedule refresh before clearance expiry", async () => {
   });
 
   supervisor.start();
-  await runLastLiveTimer(timers);
+  await state.refresh({
+    observed_generation: 0,
+    reason: "cf-mitigated",
+  });
 
   assert.equal(state.status, "ready");
   assert.equal(lastLiveTimer(timers).delay, 3_300_000);
@@ -118,7 +154,10 @@ test("unchanged near-expiry identity enters backoff without advancing generation
   });
 
   supervisor.start();
-  await runLastLiveTimer(timers);
+  await state.refresh({
+    observed_generation: 0,
+    reason: "cf-mitigated",
+  });
   assert.equal(state.generation, 1);
   assert.equal(lastLiveTimer(timers).delay, 1_000);
 
@@ -176,7 +215,10 @@ test("auxiliary cookie rotation with unchanged clearance expiry uses renewal bac
   });
 
   supervisor.start();
-  await runLastLiveTimer(timers);
+  await state.refresh({
+    observed_generation: 0,
+    reason: "cf-mitigated",
+  });
   assert.equal(state.generation, 1);
   assert.equal(lastLiveTimer(timers).delay, 1_000);
 

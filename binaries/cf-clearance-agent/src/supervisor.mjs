@@ -37,7 +37,6 @@ export class RefreshSupervisor {
     this.unsubscribe = this.state.subscribe((transition) =>
       this.#onTransition(transition),
     );
-    this.#schedule(0, "startup");
   }
 
   stop() {

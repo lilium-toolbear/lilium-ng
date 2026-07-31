@@ -79,8 +79,7 @@ Ordinary DZMM HTTP and Socket.IO traffic stays in the existing Rust clients.
 │                                                              │
 │  lilium and other microservices                              │
 │      │                                                       │
-│      │ GET /v1/snapshot                                      │
-│      │ POST /v1/refresh                                      │
+│      │ POST /v1/refresh after cf-mitigated challenge         │
 │      ▼                                                       │
 │  cf-clearance-agent                                          │
 │  Node.js + playwright-core                                   │
