@@ -479,12 +479,15 @@ fn merge_payloads(payload: &serde_json::Value, detailed: &serde_json::Value) -> 
 
 /// Resolve the next available enabled account + auth client for the explore
 /// CLI. Mirrors Python `AccountService.get_next_available_account`.
-pub async fn next_auth_client<C>(db: &C) -> crate::Result<Option<DzmmApi>>
+pub async fn next_auth_client<C>(
+    db: &C,
+    auth_clients: &account::AuthClientFactory,
+) -> crate::Result<Option<DzmmApi>>
 where
     C: ConnectionTrait,
 {
     let Some(account) = account::get_next_available_account(db).await? else {
         return Ok(None);
     };
-    Ok(Some(account::create_auth_client(account)?))
+    Ok(Some(auth_clients.create(account)?))
 }

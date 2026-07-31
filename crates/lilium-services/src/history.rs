@@ -7,7 +7,10 @@
 // with attachments. This port saves messages and records progress but does not
 // download media (the spider/media pipeline handles attachment enrichment
 // separately). Media download for backfilled messages is a remaining gap.
-use crate::{account, message, room};
+use crate::{
+    account::{self, AuthClientFactory},
+    message, room,
+};
 use anyhow::Result as AnyhowResult;
 use lilium_api_client::http::DzmmApi;
 use lilium_models::dzmm::message::Message;
@@ -56,7 +59,11 @@ impl HistoryFetcher {
 
     /// Select an authenticated API client for a room from `room.account_ids`
     /// (first enabled account, else any). Mirrors Python `_get_auth_for_room`.
-    pub async fn auth_for_room<C>(db: &C, room_id: Uuid) -> crate::Result<DzmmApi>
+    pub async fn auth_for_room<C>(
+        db: &C,
+        auth_clients: &AuthClientFactory,
+        room_id: Uuid,
+    ) -> crate::Result<DzmmApi>
     where
         C: ConnectionTrait,
     {
@@ -78,13 +85,13 @@ impl HistoryFetcher {
             if let Some(account) = account::get_account(db, *acc_uid).await?
                 && account.is_enabled
             {
-                return account::create_auth_client(account);
+                return auth_clients.create(account);
             }
         }
         // Fall back to any account with access.
         for acc_uid in &account_ids {
             if let Some(account) = account::get_account(db, *acc_uid).await? {
-                return account::create_auth_client(account);
+                return auth_clients.create(account);
             }
         }
         Err(lilium_common::LiliumError::domain_service_with_code(
@@ -95,15 +102,19 @@ impl HistoryFetcher {
 
     /// Ensure a room record exists; fetch from API and upsert if missing.
     /// Mirrors Python `ensure_room_info`.
-    #[instrument(level = "debug", skip(db), fields(room_id = %room_id))]
-    pub async fn ensure_room_info<C>(db: &C, room_id: Uuid) -> crate::Result<Option<Room>>
+    #[instrument(level = "debug", skip(db, auth_clients), fields(room_id = %room_id))]
+    pub async fn ensure_room_info<C>(
+        db: &C,
+        auth_clients: &AuthClientFactory,
+        room_id: Uuid,
+    ) -> crate::Result<Option<Room>>
     where
         C: ConnectionTrait,
     {
         if let Some(existing) = room::get_by_id(db, room_id).await? {
             return Ok(Some(existing));
         }
-        let api = Self::auth_for_room(db, room_id).await?;
+        let api = Self::auth_for_room(db, auth_clients, room_id).await?;
         let room_info = api_err(api.get_room_info(&room_id.to_string()).await)?;
         let Some(room_info) = room_info else {
             tracing::warn!(room_id = %room_id, "Could not fetch room info");
@@ -170,8 +181,12 @@ impl HistoryFetcher {
     /// Backfill room history to the beginning, saving progress every 10 batches
     /// and marking `history_complete` on completion. Mirrors Python
     /// `backfill_to_start`.
-    #[instrument(level = "debug", skip(db), fields(room_id = %room_id))]
-    pub async fn backfill_to_start<C>(db: &C, room_id: Uuid) -> crate::Result<()>
+    #[instrument(level = "debug", skip(db, auth_clients), fields(room_id = %room_id))]
+    pub async fn backfill_to_start<C>(
+        db: &C,
+        auth_clients: &AuthClientFactory,
+        room_id: Uuid,
+    ) -> crate::Result<()>
     where
         C: ConnectionTrait,
     {
@@ -193,8 +208,8 @@ impl HistoryFetcher {
             tracing::info!(room_id = %room_id, "Continuing backfill from {ts}");
         }
 
-        let api = Self::auth_for_room(db, room_id).await?;
-        Self::ensure_room_info(db, room_id).await?;
+        let api = Self::auth_for_room(db, auth_clients, room_id).await?;
+        Self::ensure_room_info(db, auth_clients, room_id).await?;
 
         let mut before = start_before;
         let mut batch_count: u32 = 0;
@@ -269,8 +284,10 @@ mod tests {
             .await
             .expect("acquire room db");
         let db = test_db.database().orm();
+        let auth_clients = AuthClientFactory::new(test_db.database().clone());
         // Room doesn't exist and no accounts seeded → should error cleanly.
-        let err = HistoryFetcher::auth_for_room(db, test_uuid("nonexistent-room")).await;
+        let err =
+            HistoryFetcher::auth_for_room(db, &auth_clients, test_uuid("nonexistent-room")).await;
         assert!(err.is_err());
     }
 }
