@@ -49,6 +49,8 @@ Ordinary DZMM HTTP and Socket.IO traffic stays in the existing Rust clients.
   generation, exact user agent, Cloudflare cookies, and expiry.
 - Let every microservice reuse that identity without proxying business traffic
   through Chrome.
+- Keep ordinary traffic on the existing default HTTP and Socket.IO user agents
+  while Cloudflare does not challenge it.
 - Detect `cf-mitigated: challenge` before DZMM authentication retry logic.
 - Refresh clearance once through a process-wide singleflight operation and
   retry the challenged request once with the new generation.
@@ -202,6 +204,11 @@ refresh.
 All refresh callers share one Promise. This is the only singleflight owner;
 Rust processes do not coordinate refreshes among themselves.
 
+The supervisor is lazy. Starting the sidecar does not launch a solve or contact
+DZMM. The first `POST /v1/refresh`, triggered by an observed challenge, starts
+the browser flow. After the first verified identity exists, the supervisor owns
+proactive renewal and retry backoff.
+
 ## Agent HTTP Contract
 
 ### `GET /healthz`
@@ -267,23 +274,38 @@ through this API.
 `http://127.0.0.1:8787`; deployments with both services in one Docker network
 set it to `http://cf-clearance-agent:8787`.
 
-Every DZMM request obtains a snapshot immediately before building its headers.
-The request uses:
+Each `DzmmApi` owns a two-state edge identity:
 
-- `User-Agent` from the snapshot
-- existing stable `Accept`, language, fetch metadata, origin, referer, and
-  request ID headers
-- account cookies from the `DzmmApi` cookie store
-- Cloudflare cookies from the snapshot
+```text
+Default -> Clearance { generation, user_agent, cookies, expires_at }
+```
+
+The initial `Default` state never calls the agent. HTTP uses the Python-parity
+Chrome 148 user agent and client hints; Socket.IO uses the Python-parity
+Edge/Chrome 143 user agent. Both paths carry account cookies only.
+
+Only a response classified as `cf-mitigated: challenge` calls
+`POST /v1/refresh`. The first call uses observed generation zero. A successful
+response atomically activates the returned generation, exact browser user
+agent, and Cloudflare cookies, then rebuilds and retries the challenged request
+once. Later HTTP requests and the Socket.IO handshake use the cached active
+identity without querying the agent.
 
 Cloudflare cookies overwrite same-named stale values from the account cookie
 store for the outgoing request only. They are not inserted into the account
 cookie jar and are not persisted to the account row.
 
-The hard-coded HTTP and Socket.IO user agents and all hard-coded client hint
-headers are removed. The successful non-browser POC did not send synthetic
-client hints, so Rust does not manufacture values that can contradict the
-browser identity.
+Default client hints are sent only in `Default` state. They are omitted in
+`Clearance` state because the successful non-browser POC did not send synthetic
+client hints, and Rust must not manufacture values that contradict the browser
+identity.
+
+An expired cached identity is discarded before the next request. That request
+uses the default identity without Cloudflare cookies. If Cloudflare still
+requires mitigation, the resulting challenge reacquires clearance through the
+same single retry path. Once a challenge has been observed, agent failure is a
+semantic clearance error; Rust does not retry that challenged request with the
+default identity.
 
 All DZMM endpoints, including token refresh, password login, QR login, avatar
 updates, and multipart uploads, use the same clearance-aware request path.
@@ -306,9 +328,10 @@ The response classifier runs in this order:
 
 For a Cloudflare challenge:
 
-1. Capture the snapshot generation used by the failed request.
+1. Capture the active generation, or zero when the request used the default
+   identity.
 2. Call `POST /v1/refresh` with that generation.
-3. Rebuild and retry the request once with the returned snapshot.
+3. Cache the returned atomic identity and rebuild the request once.
 4. Return a semantic, retryable clearance error after a second challenge.
 
 Cloudflare challenge retries do not consume the existing one-time DZMM
@@ -321,15 +344,18 @@ After `DzmmApi::authenticate()` succeeds, the worker asks the same `DzmmApi` for
 connection credentials:
 
 ```text
-generation + exact user agent + merged outgoing cookie header
+generation + selected user agent + selected outgoing cookie header
 ```
 
 `WsClient` receives these typed credentials instead of a standalone cookie
-string. The opening handshake uses their user agent and cookie header.
+string. Generation zero means the default Socket.IO user agent and account
+cookies. A positive generation means the exact browser user agent and merged
+account plus Cloudflare cookies.
 
 A disconnected socket returns to the worker reconnect loop. The next
-connection obtains a fresh snapshot. No background mutation of a live
-Socket.IO client's headers is attempted.
+connection authenticates over HTTP first and then uses the edge identity
+selected by that `DzmmApi`. No background mutation of a live Socket.IO client's
+headers is attempted.
 
 ## Account Cookie Persistence
 
@@ -425,9 +451,11 @@ branch.
 ### Rust tests
 
 - snapshot response parsing and expiry validation
+- default HTTP requests do not call the clearance provider
+- default HTTP and Socket.IO credentials retain their Python-parity user agents
 - account and Cloudflare cookie merge precedence
-- snapshot user agent replaces hard-coded HTTP identity
 - first `cf-mitigated` response refreshes and retries with the new generation
+- the activated generation is reused without another provider call
 - second `cf-mitigated` response returns a semantic error
 - business forbidden never triggers clearance refresh
 - authentication refresh starts only after clearance handling
@@ -445,9 +473,11 @@ fixed-egress DZMM probe. Completion requires:
 
 1. No manual input.
 2. `navigator.webdriver == false`.
-3. Agent readiness.
-4. A published non-expired snapshot.
-5. A Rust request receiving HTTP 200 JSON with that snapshot.
+3. An unchallenged Rust request completes with generation zero while the agent
+   remains unready.
+4. A challenged request activates agent readiness and publishes a non-expired
+   snapshot.
+5. The retried Rust request receives HTTP 200 JSON with that snapshot.
 
 The test runs once per relevant image change. Repeating it without a code,
 profile, image, or challenge-state change is not useful evidence.
@@ -455,7 +485,7 @@ profile, image, or challenge-state change is not useful evidence.
 ## Rollout
 
 1. Build and start `cf-clearance-agent` with its persistent volume.
-2. Wait for `/readyz`.
+2. Verify `/healthz`; `/readyz` remains unavailable until the first challenge.
 3. Point one Rust consumer at the agent.
 4. Verify `user.getMe`, one authenticated API request, and a Socket.IO
    connection.
@@ -465,4 +495,6 @@ profile, image, or challenge-state change is not useful evidence.
 
 Rollback stops Rust consumers before stopping the agent, restores the previous
 application image, and leaves the browser profile volume intact for diagnosis.
-The old hard-coded identity is not retained as a compatibility mode.
+The default Python-parity identities are normal operating state, not a
+compatibility fallback. The browser identity becomes mandatory only after a
+challenge is observed.
