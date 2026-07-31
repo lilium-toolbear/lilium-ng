@@ -6,7 +6,7 @@
 use anyhow::Result;
 use clap::Args;
 use lilium_database::Database;
-use lilium_services::explore;
+use lilium_services::{account::AuthClientFactory, explore};
 use std::path::PathBuf;
 
 #[derive(Args)]
@@ -46,6 +46,7 @@ impl SyncExploreArgs {
     pub async fn run(self, db: &Database, data_path: &str) -> Result<u8> {
         let data_path = PathBuf::from(data_path);
         std::fs::create_dir_all(&data_path).ok();
+        let auth_clients = AuthClientFactory::new(db.clone());
 
         // Python: --backfill store_false → backfill = not args.backfill.
         let backfill = !self.backfill;
@@ -70,7 +71,7 @@ impl SyncExploreArgs {
             loop {
                 poll_count += 1;
                 tracing::info!("[Poll #{poll_count}] starting fetch");
-                if let Err(e) = run_fetch(db, &data_path, &config, backfill).await {
+                if let Err(e) = run_fetch(db, &auth_clients, &data_path, &config, backfill).await {
                     tracing::error!("❌ Fetch error: {e}");
                 }
                 tracing::info!("Waiting 5 minutes until next fetch...");
@@ -83,7 +84,7 @@ impl SyncExploreArgs {
                 }
             }
         } else {
-            run_fetch(db, &data_path, &config, backfill)
+            run_fetch(db, &auth_clients, &data_path, &config, backfill)
                 .await
                 .map(|_| 0u8)
                 .or_else(|e| {
@@ -96,6 +97,7 @@ impl SyncExploreArgs {
 
 async fn run_fetch(
     db: &Database,
+    auth_clients: &AuthClientFactory,
     data_path: &std::path::Path,
     config: &explore::ExploreFetchConfig,
     backfill: bool,
@@ -104,7 +106,7 @@ async fn run_fetch(
     tracing::debug!(sort = %config.sort, max_pages = ?config.max_pages, "Config");
 
     let conn = db.orm();
-    let Some(api) = explore::next_auth_client(conn)
+    let Some(api) = explore::next_auth_client(conn, auth_clients)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?
     else {

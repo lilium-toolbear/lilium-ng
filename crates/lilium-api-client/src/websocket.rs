@@ -24,6 +24,13 @@ use uuid::Uuid;
 
 pub struct WebSocketEventDecoder;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SocketIoCredentials {
+    pub generation: u64,
+    pub user_agent: String,
+    pub cookie_header: String,
+}
+
 impl WebSocketEventDecoder {
     pub fn decode_data(data: &serde_json::Value) -> Option<serde_json::Value> {
         match data {
@@ -134,7 +141,7 @@ impl WebSocketEventDecoder {
 pub struct WsClient {
     account_id: Uuid,
     url: String,
-    cookie_header: Option<String>,
+    credentials: SocketIoCredentials,
 }
 
 struct SocketCommandState {
@@ -251,12 +258,16 @@ impl SocketCommandExecutor {
 }
 
 impl WsClient {
-    #[instrument(level = "debug" fields(account_id = %account_id, has_cookie_header = cookie_header.is_some()))]
-    pub fn new(account_id: Uuid, url: String, cookie_header: Option<String>) -> Self {
+    #[instrument(
+        level = "debug",
+        skip(credentials),
+        fields(account_id = %account_id, clearance_generation = credentials.generation)
+    )]
+    pub fn new(account_id: Uuid, url: String, credentials: SocketIoCredentials) -> Self {
         Self {
             account_id,
             url,
-            cookie_header,
+            credentials,
         }
     }
 
@@ -273,7 +284,7 @@ impl WsClient {
             .transport_type(rust_socketio::TransportType::Websocket)
             .reconnect(false);
 
-        let cookie_header = self.cookie_header.clone().unwrap_or_default();
+        let cookie_header = self.credentials.cookie_header.clone();
         let mut origin_url = Url::parse(&self.url).context("Invalid websocket URL")?;
         origin_url.set_path("");
         origin_url.set_query(None);
@@ -285,10 +296,7 @@ impl WsClient {
             .opening_header("Cookie", cookie_header)
             .opening_header("Origin", origin)
             .opening_header("Referer", referer)
-            .opening_header(
-                "User-Agent",
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0",
-            )
+            .opening_header("User-Agent", self.credentials.user_agent.clone())
             .opening_header("Accept-Encoding", "gzip, deflate, br")
             .opening_header("Accept-Language", "en-US,en;q=0.9")
             .opening_header("Cache-Control", "no-cache")
@@ -771,7 +779,11 @@ mod tests {
         let client = WsClient::new(
             Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap(),
             crate::config::DZMM_SOCKETIO_URL.to_string(),
-            Some("session=abc".to_string()),
+            SocketIoCredentials {
+                generation: 41,
+                user_agent: "browser-ua-generation-41".to_string(),
+                cookie_header: "session=abc; cf_clearance=current".to_string(),
+            },
         );
         let on_event = Arc::new(tokio::sync::Mutex::new(
             |_: EventEnvelope| -> BoxFuture<'static, ()> { Box::pin(async {}) },
@@ -817,6 +829,20 @@ mod tests {
                 .get("Referer")
                 .and_then(|value| value.to_str().ok()),
             Some("https://www.dzmm.ai/chat")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("User-Agent")
+                .and_then(|value| value.to_str().ok()),
+            Some("browser-ua-generation-41")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("Cookie")
+                .and_then(|value| value.to_str().ok()),
+            Some("session=abc; cf_clearance=current")
         );
     }
 

@@ -98,7 +98,8 @@ service. It is not added to the Rust workspace and is not a `lilium` subcommand.
 ## Browser Runtime
 
 The container uses a Playwright image and `playwright-core` pinned to the same
-exact version.
+exact version. Chromium runs as the image's unprivileged `pwuser` with its
+sandbox enabled through the matching Playwright seccomp profile.
 
 The Node process owns the following child processes:
 
@@ -117,6 +118,10 @@ anonymous and never performs DZMM account login.
 The CDP port listens only on the container loopback interface. The agent API
 listens on `0.0.0.0:8787` inside the internal Docker network. Host deployments
 publish it only on `127.0.0.1:8787`.
+
+Session recycling waits for Chromium to exit after `SIGTERM`, escalates to
+`SIGKILL` after a bounded grace period, and refuses to launch a replacement
+while the old process can still hold the CDP port or profile lock.
 
 ## Challenge Solver
 
@@ -146,7 +151,8 @@ The unattended solver follows one bounded flow:
 1. Wait for Cloudflare's JavaScript challenge to complete.
 2. Detect a visible Cloudflare iframe by its challenge host or title.
 3. Perform at most three paced coordinate clicks inside the visible widget.
-4. Stop after 90 seconds.
+4. Enforce a 90-second wall-clock deadline over the entire solve, including
+   Playwright calls, and recycle the browser session on timeout.
 
 There is no human fallback. A failed solve leaves the service unready, returns a
 typed `503` response, emits a structured error, and enters bounded exponential
@@ -186,6 +192,12 @@ Cookie values are never logged.
 Generation starts at one and increments only after all success checks pass.
 Failed refreshes never replace the last verified snapshot. A snapshot is not
 served after its expiry.
+
+The supervisor treats a refresh as a clearance renewal only when
+`cf_clearance` expiry advances. A changed auxiliary Cloudflare cookie is still
+published as a new atomic generation, but an unchanged clearance expiry enters
+capped exponential renewal backoff instead of scheduling another one-second
+refresh.
 
 All refresh callers share one Promise. This is the only singleflight owner;
 Rust processes do not coordinate refreshes among themselves.
@@ -454,4 +466,3 @@ profile, image, or challenge-state change is not useful evidence.
 Rollback stops Rust consumers before stopping the agent, restores the previous
 application image, and leaves the browser profile volume intact for diagnosis.
 The old hard-coded identity is not retained as a compatibility mode.
-
