@@ -34,6 +34,26 @@ use url::Url;
 const GENERATE_STRING_CHARSET: &[u8] =
     b"useandomp26T198340PX75pxJACKVERYMINDBUSHWOLFoGQZbfghjklqvwyzrict";
 
+const DEFAULT_HTTP_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36";
+const DEFAULT_SOCKET_IO_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0";
+const DEFAULT_HTTP_CLIENT_HINTS: &[(&str, &str)] = &[
+    (
+        "Sec-Ch-Ua",
+        "\"Chromium\";v=\"148\", \"Brave\";v=\"148\", \"Not/A)Brand\";v=\"99\"",
+    ),
+    ("Sec-Ch-Ua-Arch", "\"arm\""),
+    ("Sec-Ch-Ua-Bitness", "\"64\""),
+    (
+        "Sec-Ch-Ua-Full-Version-List",
+        "\"Chromium\";v=\"148.0.0.0\", \"Brave\";v=\"148.0.0.0\", \"Not/A)Brand\";v=\"99.0.0.0\"",
+    ),
+    ("Sec-Ch-Ua-Mobile", "?0"),
+    ("Sec-Ch-Ua-Model", "\"\""),
+    ("Sec-Ch-Ua-Platform", "\"macOS\""),
+    ("Sec-Ch-Ua-Platform-Version", "\"26.4.1\""),
+    ("Sec-Gpc", "1"),
+];
+
 fn generate_string(length: usize) -> String {
     let mut rng = rand::rng();
     (0..length)
@@ -482,6 +502,7 @@ pub struct DzmmApi {
     base_url: String,
     auth: DzmmApiAuth,
     clearance_provider: Arc<dyn ClearanceProvider>,
+    active_clearance: Arc<Mutex<Option<ClearanceSnapshot>>>,
     rate_limiter: Arc<Mutex<RateLimiter>>,
     refresh_lock: Arc<Mutex<()>>,
     cookie_map: Arc<Mutex<HashMap<String, String>>>,
@@ -546,6 +567,7 @@ impl DzmmApi {
             base_url,
             auth,
             clearance_provider,
+            active_clearance: Arc::new(Mutex::new(None)),
             rate_limiter: Arc::new(Mutex::new(RateLimiter::new(
                 config.min_request_delay,
                 config.max_request_delay,
@@ -576,25 +598,41 @@ impl DzmmApi {
         fields(clearance_generation = tracing::field::Empty)
     )]
     pub async fn socket_io_credentials(&self) -> Result<SocketIoCredentials> {
-        let snapshot = self
-            .clearance_provider
-            .snapshot()
-            .await
-            .map_err(anyhow::Error::new)?;
-        snapshot
-            .validate_at(chrono::Utc::now())
-            .map_err(anyhow::Error::new)?;
-        let generation = snapshot.generation;
-        tracing::Span::current().record("clearance_generation", generation);
         let account_cookie_header = self.get_cookie_string().await;
-        let cookie_header = snapshot.merge_cookie_header(
-            (!account_cookie_header.is_empty()).then_some(account_cookie_header.as_str()),
-        );
+        if let Some(snapshot) = self.active_clearance_snapshot().await {
+            let generation = snapshot.generation;
+            tracing::Span::current().record("clearance_generation", generation);
+            let cookie_header = snapshot.merge_cookie_header(
+                (!account_cookie_header.is_empty()).then_some(account_cookie_header.as_str()),
+            );
+            return Ok(SocketIoCredentials {
+                generation,
+                user_agent: snapshot.user_agent,
+                cookie_header,
+            });
+        }
+
+        tracing::Span::current().record("clearance_generation", 0);
         Ok(SocketIoCredentials {
-            generation,
-            user_agent: snapshot.user_agent,
-            cookie_header,
+            generation: 0,
+            user_agent: DEFAULT_SOCKET_IO_USER_AGENT.to_string(),
+            cookie_header: account_cookie_header,
         })
+    }
+
+    async fn active_clearance_snapshot(&self) -> Option<ClearanceSnapshot> {
+        let mut active = self.active_clearance.lock().await;
+        if active
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.validate_at(chrono::Utc::now()).is_err())
+        {
+            *active = None;
+        }
+        active.clone()
+    }
+
+    async fn activate_clearance_snapshot(&self, snapshot: ClearanceSnapshot) {
+        *self.active_clearance.lock().await = Some(snapshot);
     }
 
     async fn combined_cookie_map(&self) -> HashMap<String, String> {
@@ -861,13 +899,21 @@ impl DzmmApi {
         Ok(false)
     }
 
-    fn build_headers(&self, snapshot: &ClearanceSnapshot) -> Result<HeaderMap> {
+    fn build_headers(&self, snapshot: Option<&ClearanceSnapshot>) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
+        let user_agent = snapshot
+            .map(|snapshot| snapshot.user_agent.as_str())
+            .unwrap_or(DEFAULT_HTTP_USER_AGENT);
         headers.insert(
             USER_AGENT,
-            HeaderValue::from_str(&snapshot.user_agent)
-                .context("Clearance snapshot contains an invalid user agent")?,
+            HeaderValue::from_str(user_agent)
+                .context("Selected identity has an invalid user agent")?,
         );
+        if snapshot.is_none() {
+            for (name, value) in DEFAULT_HTTP_CLIENT_HINTS {
+                headers.insert(*name, HeaderValue::from_static(value));
+            }
+        }
         headers.insert(
             "Accept",
             HeaderValue::from_static("application/json, text/plain, */*"),
@@ -898,9 +944,18 @@ impl DzmmApi {
         Ok(headers)
     }
 
-    async fn build_cookie_header_value(&self, snapshot: &ClearanceSnapshot) -> Option<String> {
+    async fn build_cookie_header_value(
+        &self,
+        snapshot: Option<&ClearanceSnapshot>,
+    ) -> Option<String> {
         let cookie_str = self.get_cookie_string().await;
-        let merged = snapshot.merge_cookie_header((!cookie_str.is_empty()).then_some(&cookie_str));
+        let merged = snapshot.map_or_else(
+            || cookie_str.clone(),
+            |snapshot| {
+                snapshot
+                    .merge_cookie_header((!cookie_str.is_empty()).then_some(cookie_str.as_str()))
+            },
+        );
         if merged.is_empty() {
             return None;
         }
@@ -977,13 +1032,13 @@ impl DzmmApi {
             method = ?request.method,
             endpoint = %sanitize_logged_endpoint(request.endpoint.as_ref()),
             user_id = ?self.auth.user_id.as_deref(),
-            clearance_generation = snapshot.generation
+            clearance_generation = snapshot.map_or(0, |snapshot| snapshot.generation)
         )
     )]
     async fn _request_inner(
         &self,
         request: &ApiRequest<'_>,
-        snapshot: &ClearanceSnapshot,
+        snapshot: Option<&ClearanceSnapshot>,
     ) -> Result<(StatusCode, Vec<u8>, HeaderMap)> {
         let mut url = Url::parse(&format!("{}{}", self.base_url(), request.endpoint.as_ref()))?;
         if !request.query.is_empty() {
@@ -1052,40 +1107,40 @@ impl DzmmApi {
         request: &ApiRequest<'_>,
         clearance_retry_used: &mut bool,
     ) -> Result<(StatusCode, Vec<u8>, HeaderMap)> {
-        let mut snapshot = self
-            .clearance_provider
-            .snapshot()
-            .await
-            .map_err(anyhow::Error::new)?;
-        snapshot
-            .validate_at(chrono::Utc::now())
-            .map_err(anyhow::Error::new)?;
-        tracing::Span::current().record("clearance_generation", snapshot.generation);
+        let mut snapshot = self.active_clearance_snapshot().await;
+        tracing::Span::current().record(
+            "clearance_generation",
+            snapshot.as_ref().map_or(0, |snapshot| snapshot.generation),
+        );
 
         loop {
-            let (status, body, headers) = self._request_inner(request, &snapshot).await?;
+            let (status, body, headers) = self._request_inner(request, snapshot.as_ref()).await?;
             if is_cloudflare_challenge(status, &headers) {
                 if *clearance_retry_used {
                     return Err(anyhow::Error::new(ClearanceError::ChallengePersisted {
                         endpoint: sanitize_logged_endpoint(request.endpoint.as_ref()),
-                        generation: snapshot.generation,
+                        generation: snapshot.as_ref().map_or(0, |snapshot| snapshot.generation),
                     }));
                 }
 
+                let observed_generation =
+                    snapshot.as_ref().map_or(0, |snapshot| snapshot.generation);
                 warn!(
                     endpoint = %sanitize_logged_endpoint(request.endpoint.as_ref()),
-                    generation = snapshot.generation,
+                    generation = observed_generation,
                     "Cloudflare challenge detected; refreshing clearance"
                 );
-                snapshot = self
+                let refreshed = self
                     .clearance_provider
-                    .refresh(snapshot.generation, ClearanceRefreshReason::CfMitigated)
+                    .refresh(observed_generation, ClearanceRefreshReason::CfMitigated)
                     .await
                     .map_err(anyhow::Error::new)?;
-                snapshot
+                refreshed
                     .validate_at(chrono::Utc::now())
                     .map_err(anyhow::Error::new)?;
-                tracing::Span::current().record("refreshed_generation", snapshot.generation);
+                tracing::Span::current().record("refreshed_generation", refreshed.generation);
+                self.activate_clearance_snapshot(refreshed.clone()).await;
+                snapshot = Some(refreshed);
                 *clearance_retry_used = true;
                 continue;
             }
@@ -1093,7 +1148,7 @@ impl DzmmApi {
             if *clearance_retry_used {
                 info!(
                     endpoint = %sanitize_logged_endpoint(request.endpoint.as_ref()),
-                    generation = snapshot.generation,
+                    generation = snapshot.as_ref().map_or(0, |snapshot| snapshot.generation),
                     status = status.as_u16(),
                     "DZMM request completed after clearance refresh"
                 );
@@ -2454,7 +2509,7 @@ mod tests {
     use crate::config::parse_dzmm_local_address;
     use chrono::Utc;
     use serde_json::json;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -2708,6 +2763,7 @@ mod tests {
         refreshed_active: AtomicBool,
         snapshot_calls: AtomicUsize,
         refresh_calls: AtomicUsize,
+        last_observed_generation: AtomicU64,
     }
 
     impl FakeClearanceProvider {
@@ -2718,6 +2774,7 @@ mod tests {
                 refreshed_active: AtomicBool::new(false),
                 snapshot_calls: AtomicUsize::new(0),
                 refresh_calls: AtomicUsize::new(0),
+                last_observed_generation: AtomicU64::new(u64::MAX),
             }
         }
     }
@@ -2735,12 +2792,56 @@ mod tests {
 
         fn refresh(
             &self,
+            observed_generation: u64,
+            _reason: ClearanceRefreshReason,
+        ) -> ClearanceFuture<'_> {
+            self.refresh_calls.fetch_add(1, Ordering::SeqCst);
+            self.last_observed_generation
+                .store(observed_generation, Ordering::SeqCst);
+            self.refreshed_active.store(true, Ordering::SeqCst);
+            Box::pin(std::future::ready(Ok(self.refreshed.clone())))
+        }
+    }
+
+    struct FailingClearanceProvider {
+        snapshot_calls: AtomicUsize,
+        refresh_calls: AtomicUsize,
+    }
+
+    impl FailingClearanceProvider {
+        fn new() -> Self {
+            Self {
+                snapshot_calls: AtomicUsize::new(0),
+                refresh_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl ClearanceProvider for FailingClearanceProvider {
+        fn snapshot(&self) -> ClearanceFuture<'_> {
+            self.snapshot_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::ready(Err(ClearanceError::AgentUnavailable {
+                operation: "snapshot",
+                status: None,
+                code: None,
+                message: "unexpected snapshot query".to_string(),
+                retryable: true,
+            })))
+        }
+
+        fn refresh(
+            &self,
             _observed_generation: u64,
             _reason: ClearanceRefreshReason,
         ) -> ClearanceFuture<'_> {
             self.refresh_calls.fetch_add(1, Ordering::SeqCst);
-            self.refreshed_active.store(true, Ordering::SeqCst);
-            Box::pin(std::future::ready(Ok(self.refreshed.clone())))
+            Box::pin(std::future::ready(Err(ClearanceError::AgentUnavailable {
+                operation: "refresh",
+                status: Some(StatusCode::SERVICE_UNAVAILABLE),
+                code: Some("CLEARANCE_UNAVAILABLE".to_string()),
+                message: "solve failed".to_string(),
+                retryable: true,
+            })))
         }
     }
 
@@ -2970,7 +3071,7 @@ mod tests {
         let request = ApiRequest::get("/compressed");
         let snapshot = clearance_snapshot(1, "test-user-agent", "test-clearance");
         let (status, body, _) = api
-            ._request_inner(&request, &snapshot)
+            ._request_inner(&request, Some(&snapshot))
             .await
             .expect("request succeeds");
 
@@ -3022,17 +3123,15 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(
             requests[0].headers.get("user-agent").map(String::as_str),
-            Some("browser-ua-generation-1")
+            Some(DEFAULT_HTTP_USER_AGENT)
         );
         assert_eq!(
             requests[1].headers.get("user-agent").map(String::as_str),
             Some("browser-ua-generation-2")
         );
-        assert!(
-            requests[0]
-                .headers
-                .get("cookie")
-                .is_some_and(|value| value.contains("cf_clearance=clearance-1"))
+        assert_eq!(
+            requests[0].headers.get("cookie").map(String::as_str),
+            Some("session=account")
         );
         assert!(
             requests[1]
@@ -3040,18 +3139,11 @@ mod tests {
                 .get("cookie")
                 .is_some_and(|value| value.contains("cf_clearance=clearance-2"))
         );
-        assert!(
-            requests
-                .iter()
-                .all(|request| request.headers.contains_key("cookie"))
-        );
-        assert!(
-            requests
-                .iter()
-                .all(|request| !request.headers.contains_key("sec-ch-ua"))
-        );
-        assert_eq!(provider.snapshot_calls.load(Ordering::SeqCst), 1);
+        assert!(requests[0].headers.contains_key("sec-ch-ua"));
+        assert!(!requests[1].headers.contains_key("sec-ch-ua"));
+        assert_eq!(provider.snapshot_calls.load(Ordering::SeqCst), 0);
         assert_eq!(provider.refresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.last_observed_generation.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -3130,6 +3222,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unchallenged_request_uses_default_identity_without_provider_query() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            write_json_response(&mut stream, json!({"ok": true})).await;
+            request
+        });
+        let provider = Arc::new(FakeClearanceProvider::new());
+        let api = test_api_with_provider(
+            base_url,
+            DzmmApiAuth {
+                cookies: Some(Cow::Borrowed(
+                    "session=account; cf_clearance=stale-account-value",
+                )),
+                ..DzmmApiAuth::default()
+            },
+            provider.clone(),
+        );
+
+        let (status, _, _) = api
+            .request_with_clearance_retry(&ApiRequest::get("/unchallenged"))
+            .await
+            .expect("unchallenged request succeeds");
+        let request = handle.await.unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            request.headers.get("user-agent").map(String::as_str),
+            Some(DEFAULT_HTTP_USER_AGENT)
+        );
+        assert!(request.headers.contains_key("sec-ch-ua"));
+        assert_eq!(
+            request.headers.get("cookie").map(String::as_str),
+            Some("session=account")
+        );
+        assert_eq!(provider.snapshot_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.refresh_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn default_and_clearance_http_headers_use_their_own_atomic_identity() {
+        let api = test_api("http://127.0.0.1:1".to_string());
+
+        let default_headers = api.build_headers(None).unwrap();
+        assert_eq!(
+            default_headers
+                .get(USER_AGENT)
+                .and_then(|value| value.to_str().ok()),
+            Some(DEFAULT_HTTP_USER_AGENT)
+        );
+        assert!(default_headers.contains_key("sec-ch-ua"));
+
+        let snapshot = clearance_snapshot(3, "browser-ua-generation-3", "clearance-3");
+        let clearance_headers = api.build_headers(Some(&snapshot)).unwrap();
+        assert_eq!(
+            clearance_headers
+                .get(USER_AGENT)
+                .and_then(|value| value.to_str().ok()),
+            Some("browser-ua-generation-3")
+        );
+        assert!(!clearance_headers.contains_key("sec-ch-ua"));
+    }
+
+    #[tokio::test]
+    async fn clearance_agent_failure_does_not_retry_challenge_with_default_identity() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\ncf-mitigated: challenge\r\nContent-Length: 9\r\nConnection: close\r\n\r\nchallenge",
+                )
+                .await
+                .unwrap();
+            request
+        });
+        let provider = Arc::new(FailingClearanceProvider::new());
+        let api = test_api_with_provider(base_url, DzmmApiAuth::default(), provider.clone());
+
+        let error = api
+            .get_my_info(false)
+            .await
+            .expect_err("clearance failure is returned");
+        let clearance_error = error
+            .downcast_ref::<ClearanceError>()
+            .expect("typed clearance error");
+        assert!(matches!(
+            clearance_error,
+            ClearanceError::AgentUnavailable {
+                operation: "refresh",
+                ..
+            }
+        ));
+        assert!(clearance_error.retryable());
+        assert_eq!(provider.snapshot_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.refresh_calls.load(Ordering::SeqCst), 1);
+
+        let request = handle.await.unwrap();
+        assert_eq!(
+            request.headers.get("user-agent").map(String::as_str),
+            Some(DEFAULT_HTTP_USER_AGENT)
+        );
+        assert!(request.headers.contains_key("sec-ch-ua"));
+        assert!(!request.headers.contains_key("cookie"));
+    }
+
+    #[tokio::test]
     async fn authentication_refresh_starts_after_clearance_retry_finishes() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
@@ -3188,7 +3391,7 @@ mod tests {
         assert!(requests[3].target.starts_with("/api/trpc/user.getMe"));
         assert_eq!(
             requests[0].headers.get("user-agent").map(String::as_str),
-            Some("browser-ua-generation-1")
+            Some(DEFAULT_HTTP_USER_AGENT)
         );
         assert!(requests[1..].iter().all(|request| {
             request.headers.get("user-agent").map(String::as_str) == Some("browser-ua-generation-2")
@@ -3243,7 +3446,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn socket_io_credentials_use_one_clearance_generation_and_merged_cookie_header() {
+    async fn default_socket_io_credentials_use_python_identity_without_clearance() {
         let provider = Arc::new(FakeClearanceProvider::new());
         let api = test_api_with_provider(
             "http://127.0.0.1:1".to_string(),
@@ -3253,20 +3456,73 @@ mod tests {
                 )),
                 ..DzmmApiAuth::default()
             },
-            provider,
+            provider.clone(),
         );
 
         let credentials = api.socket_io_credentials().await.unwrap();
 
-        assert_eq!(credentials.generation, 1);
-        assert_eq!(credentials.user_agent, "browser-ua-generation-1");
+        assert_eq!(credentials.generation, 0);
+        assert_eq!(credentials.user_agent, DEFAULT_SOCKET_IO_USER_AGENT);
+        assert_eq!(credentials.cookie_header, "session=account");
+        assert!(!credentials.cookie_header.contains("stale-account-value"));
+        assert_eq!(provider.snapshot_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.refresh_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cached_clearance_identity_is_reused_by_socket_io_without_provider_query() {
+        let provider = Arc::new(FakeClearanceProvider::new());
+        let api = test_api_with_provider(
+            "http://127.0.0.1:1".to_string(),
+            DzmmApiAuth {
+                cookies: Some(Cow::Borrowed("session=account")),
+                ..DzmmApiAuth::default()
+            },
+            provider.clone(),
+        );
+        api.activate_clearance_snapshot(clearance_snapshot(
+            7,
+            "browser-ua-generation-7",
+            "clearance-7",
+        ))
+        .await;
+
+        let credentials = api.socket_io_credentials().await.unwrap();
+
+        assert_eq!(credentials.generation, 7);
+        assert_eq!(credentials.user_agent, "browser-ua-generation-7");
         assert!(credentials.cookie_header.contains("session=account"));
         assert!(
             credentials
                 .cookie_header
-                .contains("cf_clearance=clearance-1")
+                .contains("cf_clearance=clearance-7")
         );
-        assert!(!credentials.cookie_header.contains("stale-account-value"));
+        assert_eq!(provider.snapshot_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.refresh_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn expired_cached_clearance_falls_back_to_default_socket_io_identity() {
+        let provider = Arc::new(FakeClearanceProvider::new());
+        let api = test_api_with_provider(
+            "http://127.0.0.1:1".to_string(),
+            DzmmApiAuth {
+                cookies: Some(Cow::Borrowed("session=account")),
+                ..DzmmApiAuth::default()
+            },
+            provider.clone(),
+        );
+        let mut expired = clearance_snapshot(7, "expired-browser-ua", "expired-clearance");
+        expired.expires_at = Utc::now() - chrono::Duration::minutes(1);
+        api.activate_clearance_snapshot(expired).await;
+
+        let credentials = api.socket_io_credentials().await.unwrap();
+
+        assert_eq!(credentials.generation, 0);
+        assert_eq!(credentials.user_agent, DEFAULT_SOCKET_IO_USER_AGENT);
+        assert_eq!(credentials.cookie_header, "session=account");
+        assert_eq!(provider.snapshot_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.refresh_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
