@@ -7,6 +7,7 @@ use std::net::IpAddr;
 pub struct ApiClientConfig {
     pub base_url: String,
     pub ws_url: String,
+    pub clearance_agent_url: String,
     pub request_timeout_secs: u64,
     pub reconnect_delay_ms: u64,
     pub min_request_delay: f64,
@@ -37,6 +38,8 @@ impl Default for ApiClientConfig {
         Self {
             base_url: DZMM_BASE_URL.to_string(),
             ws_url: DZMM_SOCKETIO_URL.to_string(),
+            clearance_agent_url: std::env::var("CF_CLEARANCE_AGENT_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:8787".to_string()),
             request_timeout_secs: 30,
             reconnect_delay_ms: 5000,
             // Rate-limit defaults; env vars preserve the previous override

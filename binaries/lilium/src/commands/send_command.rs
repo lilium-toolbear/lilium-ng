@@ -9,10 +9,14 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 use lilium_api_client::http::DzmmApi;
 use lilium_database::{
-    NotificationConnection, NotificationDatabaseConfig, NotificationDatabaseConfig as NotifCfg,
+    Database, NotificationConnection, NotificationDatabaseConfig,
+    NotificationDatabaseConfig as NotifCfg,
 };
 use lilium_models::dzmm::outgoing_command::{self as outgoing_commands, status};
-use lilium_services::{account, outgoing_command as cmd_service};
+use lilium_services::{
+    account::{self, AuthClientFactory},
+    outgoing_command as cmd_service,
+};
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -227,9 +231,11 @@ impl SendCommand {
     /// Execute the send-command subcommand. Returns a process exit code.
     pub async fn run(
         self,
-        db: &impl ConnectionTrait,
+        db: &Database,
         notification_config: NotificationDatabaseConfig,
     ) -> Result<u8> {
+        let auth_clients = AuthClientFactory::new(db.clone());
+        let db = db.orm();
         match self {
             SendCommand::Send(a) => {
                 let data: Value = serde_json::from_str(&a.data)
@@ -505,8 +511,12 @@ impl SendCommand {
                 )
                 .await
             }
-            SendCommand::SendImage(a) => send_image(db, notification_config, a).await,
-            SendCommand::SendVoice(a) => send_voice(db, notification_config, a).await,
+            SendCommand::SendImage(a) => {
+                send_image(db, &auth_clients, notification_config, a).await
+            }
+            SendCommand::SendVoice(a) => {
+                send_voice(db, &auth_clients, notification_config, a).await
+            }
         }
     }
 }
@@ -688,6 +698,7 @@ async fn list_pending(
 
 async fn send_image(
     db: &impl ConnectionTrait,
+    auth_clients: &AuthClientFactory,
     notification_config: NotificationDatabaseConfig,
     a: SendImageArgs,
 ) -> Result<u8> {
@@ -706,7 +717,7 @@ async fn send_image(
 
     let account = Uuid::parse_str(&a.account)
         .with_context(|| format!("invalid account user id: {}", a.account))?;
-    let api = get_api_client(db, account).await?;
+    let api = get_api_client(db, auth_clients, account).await?;
     tracing::info!("Uploading image: {}", path.display());
     let image_url = api
         .upload_chat_image(&a.image_file)
@@ -739,6 +750,7 @@ async fn send_image(
 
 async fn send_voice(
     db: &impl ConnectionTrait,
+    auth_clients: &AuthClientFactory,
     notification_config: NotificationDatabaseConfig,
     a: SendVoiceArgs,
 ) -> Result<u8> {
@@ -756,7 +768,7 @@ async fn send_voice(
 
     let account = Uuid::parse_str(&a.account)
         .with_context(|| format!("invalid account user id: {}", a.account))?;
-    let api = get_api_client(db, account).await?;
+    let api = get_api_client(db, auth_clients, account).await?;
     tracing::info!("Uploading voice: {}", path.display());
     let result = api
         .upload_voice_message(&a.voice_file, Some(duration))
@@ -794,12 +806,16 @@ async fn send_voice(
 
 /// Build an authenticated DZMM API client for the given account.
 /// Mirrors Python `get_api_client`.
-async fn get_api_client(db: &impl ConnectionTrait, account_user_id: Uuid) -> Result<DzmmApi> {
+async fn get_api_client(
+    db: &impl ConnectionTrait,
+    auth_clients: &AuthClientFactory,
+    account_user_id: Uuid,
+) -> Result<DzmmApi> {
     let account = account::get_account(db, account_user_id)
         .await
         .context("fetch account")?
         .with_context(|| format!("Account '{}' not found", account_user_id))?;
-    account::create_auth_client(account).map_err(Into::into)
+    auth_clients.create(account).map_err(Into::into)
 }
 
 fn print_command(cmd: &outgoing_commands::Model) {

@@ -1,0 +1,16 @@
+{
+  "name": "@lilium/cf-clearance-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/main.mjs",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "playwright-core": "1.61.1"
+  }
+}

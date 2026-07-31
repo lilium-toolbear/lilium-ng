@@ -7,7 +7,10 @@ use anyhow::{Context, Result};
 use clap::Args;
 use lilium_api_client::http::DzmmApi;
 use lilium_database::Database;
-use lilium_services::{account, room, sync};
+use lilium_services::{
+    account::{self, AuthClientFactory},
+    room, sync,
+};
 use uuid::Uuid;
 
 #[derive(Args)]
@@ -23,6 +26,7 @@ impl SyncMembersArgs {
     /// Execute the sync-members subcommand. Returns a process exit code.
     pub async fn run(self, db: &Database) -> Result<u8> {
         tracing::info!("🔐 Auth clients selected dynamically per room from database");
+        let auth_clients = AuthClientFactory::new(db.clone());
 
         let room_id = match self.room_id {
             Some(s) => Some(Uuid::parse_str(&s).with_context(|| format!("invalid room id: {s}"))?),
@@ -32,7 +36,7 @@ impl SyncMembersArgs {
         match room_id {
             Some(room_id) => {
                 tracing::info!("Syncing specific room: {}", room_id);
-                let stats = sync_single_room(db, room_id, self.force).await?;
+                let stats = sync_single_room(db, &auth_clients, room_id, self.force).await?;
                 print_stats(&stats);
                 tracing::info!("✓ Sync complete");
                 Ok(0)
@@ -58,7 +62,7 @@ impl SyncMembersArgs {
                 for (idx, room) in rooms.iter().enumerate() {
                     let i = idx + 1;
                     tracing::info!("\n[{i}/{count}] 🏠 Room: {} ({})", room.title, room.room_id);
-                    match sync_single_room(db, room.room_id, self.force).await {
+                    match sync_single_room(db, &auth_clients, room.room_id, self.force).await {
                         Ok(stats) => {
                             total.rooms_processed += stats.rooms_processed;
                             total.members_new += stats.members_new;
@@ -97,10 +101,11 @@ impl SyncMembersArgs {
 
 async fn sync_single_room(
     db: &Database,
+    auth_clients: &AuthClientFactory,
     room_id: Uuid,
     force: bool,
 ) -> Result<sync::MemberSyncStats> {
-    let auth = auth_for_room(db, room_id).await?;
+    let auth = auth_for_room(db, auth_clients, room_id).await?;
     let config = sync::MemberSyncConfig {
         room_id: Some(room_id),
         force,
@@ -115,7 +120,11 @@ async fn sync_single_room(
 
 /// Select an enabled account with access to the room (first enabled, else any).
 /// Mirrors Python `get_auth_for_room`.
-async fn auth_for_room(db: &Database, room_id: Uuid) -> Result<DzmmApi> {
+async fn auth_for_room(
+    db: &Database,
+    auth_clients: &AuthClientFactory,
+    room_id: Uuid,
+) -> Result<DzmmApi> {
     let conn = db.orm();
     let room = room::get_by_id(conn, room_id)
         .await
@@ -137,7 +146,7 @@ async fn auth_for_room(db: &Database, room_id: Uuid) -> Result<DzmmApi> {
             && account.is_enabled
         {
             tracing::info!("🔑 Using account {uid} for room {room_id}");
-            return Ok(account::create_auth_client(account)?);
+            return Ok(auth_clients.create(account)?);
         }
     }
     let uid = room.account_ids[0];
@@ -146,7 +155,7 @@ async fn auth_for_room(db: &Database, room_id: Uuid) -> Result<DzmmApi> {
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?
         .context("account missing")?;
-    Ok(account::create_auth_client(account)?)
+    Ok(auth_clients.create(account)?)
 }
 
 fn print_stats(stats: &sync::MemberSyncStats) {
