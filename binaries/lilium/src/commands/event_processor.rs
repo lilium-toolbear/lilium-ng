@@ -9,7 +9,7 @@ use tracing::{Instrument, error, info, warn};
 use lilium_common::LiliumError;
 use lilium_database::{Database, NotificationConnection, NotificationDatabaseConfig};
 use lilium_models::ingestion::WebSocketEvent;
-use lilium_services::account;
+use lilium_services::account::{self, AuthClientFactory};
 use lilium_services::event;
 use lilium_services::media::MediaService;
 use lilium_services::message;
@@ -30,6 +30,7 @@ struct BatchSideEffects {
 pub struct EventProcessor {
     processor_id: String,
     database: Database,
+    auth_clients: AuthClientFactory,
     batch_size: usize,
     polling_interval: Duration,
     shutdown: CancellationToken,
@@ -45,9 +46,11 @@ impl EventProcessor {
         polling_interval_secs: u64,
         data_path: PathBuf,
     ) -> Self {
+        let auth_clients = AuthClientFactory::new(database.clone());
         Self {
             processor_id,
             database,
+            auth_clients,
             batch_size,
             polling_interval: Duration::from_secs(polling_interval_secs),
             shutdown: CancellationToken::new(),
@@ -323,9 +326,10 @@ impl EventProcessor {
         let avatar_downloads = if user_fetch_collector.is_empty() {
             Vec::new()
         } else {
+            let auth_clients = self.auth_clients.clone();
             match lilium_database::transaction!(self.database, |session| {
                 let user_fetch_collector = user_fetch_collector.clone();
-                Self::sync_users(session, &user_fetch_collector).await
+                Self::sync_users(session, &auth_clients, &user_fetch_collector).await
             })
             .await
             {
@@ -355,9 +359,11 @@ impl EventProcessor {
     ) -> Result<BatchSideEffects> {
         let processor_id = self.processor_id.clone();
         let events = events.to_vec();
+        let auth_clients = self.auth_clients.clone();
         lilium_database::transaction!(self.database, |session| {
             Self::process_batch_inner(
                 session,
+                &auth_clients,
                 events,
                 processor_id,
                 start_cursor_id,
@@ -402,6 +408,7 @@ impl EventProcessor {
 
     async fn process_batch_inner(
         session: &impl ConnectionTrait,
+        auth_clients: &AuthClientFactory,
         events: Vec<WebSocketEvent>,
         processor_id: String,
         start_cursor_id: i64,
@@ -417,7 +424,8 @@ impl EventProcessor {
             batch_cursor_id
         };
         let last_timestamp = batch_cursor_timestamp.or(start_cursor_timestamp);
-        let avatar_downloads = Self::sync_users(session, &user_fetch_collector).await?;
+        let avatar_downloads =
+            Self::sync_users(session, auth_clients, &user_fetch_collector).await?;
 
         event::update_offset(
             session,
@@ -492,6 +500,7 @@ impl EventProcessor {
 
     async fn sync_users(
         session: &impl ConnectionTrait,
+        auth_clients: &AuthClientFactory,
         user_fetch_collector: &[(Uuid, Uuid, Uuid)],
     ) -> Result<Vec<user::AvatarDownload>> {
         if user_fetch_collector.is_empty() {
@@ -523,7 +532,7 @@ impl EventProcessor {
                     )
                 })?;
 
-            let auth = account::create_auth_client(account)?;
+            let auth = auth_clients.create(account)?;
             let result =
                 user::batch_fetch_and_update_with_auth(session, &auth, &user_room_pairs, 1).await?;
             total_new += result.new_count;

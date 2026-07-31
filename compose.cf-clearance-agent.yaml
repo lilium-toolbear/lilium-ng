@@ -1,0 +1,27 @@
+name: lilium-cf-clearance
+
+services:
+  cf-clearance-agent:
+    image: lilium-cf-clearance-agent:local
+    build:
+      context: ./binaries/cf-clearance-agent
+    init: true
+    restart: unless-stopped
+    ipc: host
+    security_opt:
+      - seccomp=./binaries/cf-clearance-agent/seccomp_profile.json
+    environment:
+      CF_CLEARANCE_ORIGIN: https://www.dzmm.ai
+      CF_CLEARANCE_LISTEN_HOST: 0.0.0.0
+      CF_CLEARANCE_LISTEN_PORT: "8787"
+      CF_CLEARANCE_CDP_PORT: "9223"
+      CF_CLEARANCE_PROFILE_DIR: /data/chrome-profile
+      CF_CLEARANCE_SOLVE_TIMEOUT_MS: "90000"
+      DISPLAY: :99
+    ports:
+      - 127.0.0.1:8787:8787
+    volumes:
+      - cf-clearance-profile:/data/chrome-profile
+
+volumes:
+  cf-clearance-profile:

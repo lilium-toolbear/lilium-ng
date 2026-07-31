@@ -132,7 +132,7 @@ async fn async_main() -> Result<u8> {
             commands::event_processor::run(config, db).await?;
         }
         Verb::SendCommand { cmd } => {
-            return cmd.run(db.orm(), config.notification.into()).await;
+            return cmd.run(&db, config.notification.into()).await;
         }
         Verb::SyncMembers(args) => {
             args.run(&db).await?;
