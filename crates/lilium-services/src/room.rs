@@ -1,14 +1,16 @@
 // Python parity source: dzmm_archive@18fdefbc0b6979178d7f1eb4ce0624ec4a60a2f2 services/room_service.py
 // Ports the RoomService methods used by the sync/history CLIs: get_by_id,
-// get_all_rooms (RoomFilters), upsert_room_from_dict, mark_inactive_rooms,
-// update_backfill_progress, mark_history_complete. Member/stats methods are
-// covered by the room_member service and are not duplicated here.
+// get_all_rooms (RoomFilters), get_rooms_needing_backfill,
+// upsert_room_from_dict, mark_inactive_rooms, update_backfill_progress,
+// mark_history_complete. Member/stats methods are covered by the room_member
+// service and are not duplicated here.
 use crate::Result;
 use chrono::{DateTime, Utc};
 use lilium_models::dzmm::room::{self as rooms, Model as Room};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set,
 };
+use std::collections::HashSet;
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -84,6 +86,41 @@ where
         })
         .collect();
     Ok(rooms)
+}
+
+/// Select active rooms visible in the current API result that still need
+/// history backfill. The database state is the durable work queue: new rooms
+/// start with `history_complete = false`, and failed backfills remain eligible
+/// for the next sync iteration.
+#[instrument(
+    level = "debug",
+    skip(db, current_room_ids),
+    fields(candidate_count = current_room_ids.len(), account_filter = account_id.is_some())
+)]
+pub async fn get_rooms_needing_backfill<C>(
+    db: &C,
+    current_room_ids: &HashSet<Uuid>,
+    account_id: Option<Uuid>,
+) -> Result<Vec<Room>>
+where
+    C: ConnectionTrait,
+{
+    if current_room_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let rooms = rooms::Entity::find()
+        .filter(rooms::Column::IsActive.eq(true))
+        .filter(rooms::Column::HistoryComplete.eq(false))
+        .filter(rooms::Column::RoomId.is_in(current_room_ids.iter().copied()))
+        .order_by_desc(rooms::Column::MessageCount)
+        .all(db)
+        .await?;
+
+    Ok(rooms
+        .into_iter()
+        .filter(|room| account_id.is_none_or(|account_id| room.account_ids.contains(&account_id)))
+        .collect())
 }
 
 /// Insert or update a room from an API chat dict (`chat["data"]`).
@@ -320,6 +357,7 @@ mod tests {
     use super::*;
     use lilium_test_fixtures::FixtureProfile;
     use lilium_test_fixtures::test_uuid;
+    use std::collections::HashSet;
 
     fn chat_data(room_id: Uuid, title: &str) -> serde_json::Value {
         serde_json::json!({
@@ -519,6 +557,52 @@ mod tests {
         })
         .await
         .expect("backfill progress");
+    }
+
+    #[tokio::test]
+    async fn get_rooms_needing_backfill_selects_current_incomplete_rooms() {
+        let test_db = lilium_test_fixtures::TestDb::acquire(FixtureProfile::RoomMember)
+            .await
+            .expect("acquire room db");
+
+        lilium_database::transaction!(test_db.database(), |tx| {
+            upsert_room_from_dict(
+                tx,
+                &chat_data(test_uuid("room-backfill"), "Needs backfill"),
+                Some(test_uuid("acct-a")),
+            )
+            .await
+            .unwrap();
+            upsert_room_from_dict(
+                tx,
+                &chat_data(test_uuid("room-complete"), "Already complete"),
+                Some(test_uuid("acct-a")),
+            )
+            .await
+            .unwrap();
+            mark_history_complete(tx, test_uuid("room-complete"))
+                .await
+                .unwrap();
+            upsert_room_from_dict(
+                tx,
+                &chat_data(test_uuid("room-not-current"), "Not current"),
+                Some(test_uuid("acct-a")),
+            )
+            .await
+            .unwrap();
+
+            let current_room_ids =
+                HashSet::from([test_uuid("room-backfill"), test_uuid("room-complete")]);
+            let rooms = get_rooms_needing_backfill(tx, &current_room_ids, None)
+                .await
+                .unwrap();
+            let room_ids: HashSet<Uuid> = rooms.into_iter().map(|room| room.room_id).collect();
+
+            assert_eq!(room_ids, HashSet::from([test_uuid("room-backfill")]));
+            Ok(())
+        })
+        .await
+        .expect("select rooms needing backfill");
     }
 
     #[test]

@@ -237,9 +237,14 @@ Verified scenarios:
   via `room.account_ids`; `sync-members` (no arg) syncs all active group rooms
   and aggregates stats. `--force` clears members first.
 - `lilium-cli sync-rooms` syncs all enabled accounts (or `--account`),
-  `--list-accounts` lists profiles, `--poll` diffs the room-id set per cycle and
-  for new rooms: syncs members, backfills history, queues `system:reconnect`
-  commands (`require_ack=false`, `max_attempts=1`). Graceful shutdown on Ctrl-C.
+  `--list-accounts` lists profiles. One-shot mode invokes the complete sync
+  iteration once; poll mode loops over that same iteration. Each iteration
+  selects current active rooms whose `history_complete` is false, so new rooms
+  and unfinished backfills use the same database-backed work queue. Selected
+  rooms sync members and backfill history; after all selected rooms are
+  processed, one `system:reconnect` command is queued per affected account
+  (`require_ack=false`, `max_attempts=1`). Poll mode shuts down gracefully on
+  Ctrl-C.
 - `lilium-cli explore` fetches the feed, upserts tweets/cards/galleries/
   checkpoints/books(+chapters), prints stats; `--poll` loops every 5 min;
   backfill mode stops on known content (Python `--backfill` store_false

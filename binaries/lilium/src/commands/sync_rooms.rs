@@ -1,9 +1,10 @@
 // Python parity source: dzmm_archive@0efb507c6126a2638d3d38aca4018a804431291e cli/sync_rooms.py
 //
-// Ports the argparse CLI to clap. One-shot and poll modes mirror the Python.
-// Poll mode diffs the synced room-id set, and for new rooms: syncs members,
-// backfills history, and queues `system:reconnect` commands for affected
-// accounts.
+// Ports the argparse CLI to clap. `sync_once` is the single complete room-sync
+// iteration; one-shot mode calls it once and poll mode loops over it. Each
+// successful iteration selects current rooms that still need backfill, syncs
+// members, backfills history, and queues `system:reconnect` commands for
+// affected accounts.
 use std::collections::HashSet;
 
 use anyhow::{Context, Result};
@@ -19,8 +20,6 @@ use tokio::signal;
 use tokio::time::{Duration, sleep};
 use uuid::Uuid;
 
-const INITIAL_SYNC_RETRY_DELAY: Duration = Duration::from_secs(15);
-
 #[derive(Args)]
 pub struct SyncRoomsArgs {
     /// Account user_id to use for sync (default: sync all enabled accounts)
@@ -29,7 +28,7 @@ pub struct SyncRoomsArgs {
     /// List all available accounts and exit
     #[arg(short, long = "list-accounts")]
     pub list_accounts: bool,
-    /// Run in polling mode, syncing rooms periodically and processing new rooms
+    /// Run in polling mode, syncing rooms periodically and processing rooms needing backfill
     #[arg(short, long)]
     pub poll: bool,
     /// Interval between syncs in polling mode (minutes)
@@ -52,9 +51,10 @@ impl SyncRoomsArgs {
         if self.poll {
             return poll_mode(db, &auth_clients, account, self.poll_interval).await;
         }
-        match sync_once(db, &auth_clients, account).await? {
-            Some(_) => Ok(0),
-            None => Ok(1),
+        if sync_once(db, &auth_clients, account).await? {
+            Ok(0)
+        } else {
+            Ok(1)
         }
     }
 }
@@ -128,10 +128,11 @@ async fn get_accounts(
     Ok(Some(accounts))
 }
 
-/// Perform a single room sync iteration across the selected account(s).
-/// Returns the set of room IDs synced, or `None` on failure. Mirrors Python
-/// `sync_once`.
-async fn sync_once(
+/// Fetch and persist the room list for one iteration.
+/// Returns the set of room IDs visible to the selected account(s), or `None`
+/// when no account can be selected. The complete iteration, including selecting
+/// and processing rooms needing backfill, is implemented by [`sync_once`].
+async fn sync_room_ids_once(
     db: &Database,
     auth_clients: &AuthClientFactory,
     account_id: Option<Uuid>,
@@ -233,21 +234,51 @@ async fn sync_once(
     Ok(Some(all_room_ids))
 }
 
-/// Process newly detected rooms: sync members, backfill history, and queue
-/// reconnect commands for affected accounts. Mirrors Python `process_new_rooms`.
-async fn process_new_rooms(
+/// Execute one complete room-sync iteration for either one-shot or poll mode.
+/// The API result identifies rooms visible in this iteration; the database
+/// `history_complete` flag is the durable work queue for member sync/backfill.
+/// Returns `false` when no room set could be produced; callers decide whether
+/// that should terminate or retry.
+async fn sync_once(
     db: &Database,
     auth_clients: &AuthClientFactory,
-    new_room_ids: &HashSet<Uuid>,
+    account_id: Option<Uuid>,
+) -> Result<bool> {
+    let Some(current_room_ids) = sync_room_ids_once(db, auth_clients, account_id).await? else {
+        return Ok(false);
+    };
+    let rooms_needing_backfill =
+        room::get_rooms_needing_backfill(db.orm(), &current_room_ids, account_id)
+            .await
+            .context("select rooms needing backfill")?;
+    let room_ids: HashSet<Uuid> = rooms_needing_backfill
+        .into_iter()
+        .map(|room| room.room_id)
+        .collect();
+    process_rooms_needing_backfill(db, auth_clients, &room_ids).await;
+    Ok(true)
+}
+
+/// Process rooms selected from the durable backfill queue: sync members,
+/// backfill history, and queue reconnect commands for affected accounts.
+/// Reconnect is queued only once per affected account, after all rooms in this
+/// iteration have been processed.
+async fn process_rooms_needing_backfill(
+    db: &Database,
+    auth_clients: &AuthClientFactory,
+    room_ids: &HashSet<Uuid>,
 ) {
-    if new_room_ids.is_empty() {
+    if room_ids.is_empty() {
         return;
     }
-    tracing::info!("\n🆕 Processing {} new room(s)...", new_room_ids.len());
+    tracing::info!(
+        "\n📚 Processing {} room(s) needing backfill...",
+        room_ids.len()
+    );
     let mut accounts_to_reconnect: HashSet<Uuid> = HashSet::new();
 
-    for room_id in new_room_ids {
-        tracing::info!("\n📦 New room: {room_id}");
+    for room_id in room_ids {
+        tracing::info!("\n📦 Room needing backfill: {room_id}");
         if let Err(e) = sync_room_members(db, auth_clients, *room_id).await {
             tracing::error!("   ❌ Failed member sync for {room_id}: {e}");
         }
@@ -276,7 +307,7 @@ async fn process_new_rooms(
                 db.orm(),
                 *account_user_id,
                 "system:reconnect",
-                serde_json::json!({"reason": format!("new rooms detected: {}", new_room_ids.len())}),
+                serde_json::json!({"reason": format!("rooms needing backfill: {}", room_ids.len())}),
                 false,
                 Some(1),
             )
@@ -350,8 +381,6 @@ async fn poll_mode(
     poll_interval_minutes: u64,
 ) -> Result<u8> {
     let poll_interval = Duration::from_secs(poll_interval_minutes * 60);
-    let mut known_room_ids: HashSet<Uuid>;
-    let mut shutdown = false;
 
     tracing::info!("{}", "=".repeat(60));
     tracing::info!("🔄 Starting room sync in POLLING mode");
@@ -359,85 +388,28 @@ async fn poll_mode(
     tracing::info!("   Press Ctrl+C to stop");
     tracing::info!("{}", "=".repeat(60));
 
-    tracing::info!("\n📋 Initial sync...");
-    known_room_ids = loop {
-        match sync_once(db, auth_clients, account_id).await {
-            Ok(Some(set)) => break set,
-            Ok(None) => {
-                tracing::warn!(
-                    "⚠️  Initial sync returned no room set; retrying in {}s",
-                    INITIAL_SYNC_RETRY_DELAY.as_secs()
-                );
-            }
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "⚠️  Initial sync failed; retrying in {}s",
-                    INITIAL_SYNC_RETRY_DELAY.as_secs()
-                );
-            }
-        }
-        tokio::select! {
-            _ = signal::ctrl_c() => {
-                shutdown = true;
-                break HashSet::new();
-            }
-            _ = sleep(INITIAL_SYNC_RETRY_DELAY) => {}
-        }
-    };
-    if shutdown {
-        tracing::info!("\n{}", "=".repeat(60));
-        tracing::info!("🛑 Polling mode stopped gracefully");
-        tracing::info!("{}", "=".repeat(60));
-        return Ok(0);
-    }
-    tracing::info!("\n📊 Tracking {} room(s)", known_room_ids.len());
-
     let mut poll_count = 0u32;
     loop {
         poll_count += 1;
-        tracing::info!("\n⏱️  Waiting {poll_interval_minutes} minute(s) until next sync...");
-
-        // Wait in small increments for graceful shutdown.
-        let mut waited = Duration::ZERO;
-        while waited < poll_interval {
-            tokio::select! {
-                _ = signal::ctrl_c() => { shutdown = true; break; }
-                _ = sleep(Duration::from_secs(1)) => { waited += Duration::from_secs(1); }
-            }
-        }
-        if shutdown {
-            break;
-        }
-
         tracing::info!("\n{}", "=".repeat(60));
         tracing::info!("🔄 Poll #{poll_count}");
         tracing::info!("{}", "=".repeat(60));
 
-        let current = match sync_once(db, auth_clients, account_id).await {
-            Ok(Some(set)) => set,
-            Ok(None) => {
+        match sync_once(db, auth_clients, account_id).await {
+            Ok(true) => {}
+            Ok(false) => {
                 tracing::warn!("⚠️  Sync returned no room set, will retry next cycle");
-                continue;
             }
             Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "⚠️  Sync failed, will retry next cycle"
-                );
-                continue;
+                tracing::warn!(error = %error, "⚠️  Sync failed, will retry next cycle");
             }
-        };
-
-        let new_room_ids: HashSet<Uuid> = current.difference(&known_room_ids).copied().collect();
-        if new_room_ids.is_empty() {
-            tracing::info!("\n📊 No new rooms detected");
-        } else {
-            tracing::info!("\n🆕 Detected {} new room(s)!", new_room_ids.len());
-            process_new_rooms(db, auth_clients, &new_room_ids).await;
-            known_room_ids = current;
         }
-        tracing::info!("📊 Total tracked rooms: {}", known_room_ids.len());
+
+        tracing::info!("\n⏱️  Waiting {poll_interval_minutes} minute(s) until next sync...");
+        tokio::select! {
+            _ = signal::ctrl_c() => break,
+            _ = sleep(poll_interval) => {}
+        }
     }
 
     tracing::info!("\n{}", "=".repeat(60));

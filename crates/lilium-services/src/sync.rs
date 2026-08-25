@@ -18,7 +18,7 @@ fn api_err<T, E: std::fmt::Display>(result: std::result::Result<T, E>) -> crate:
 
 /// Statistics returned by [`RoomSyncer::sync_rooms`]. Mirrors Python
 /// `RoomSyncStats`. `user_chats` carries the raw API chat list so callers can
-/// derive the synced room-id set for gap detection.
+/// derive the room-id set visible in the current sync iteration.
 #[derive(Debug, Clone, Default)]
 pub struct RoomSyncStats {
     pub new_rooms: usize,
