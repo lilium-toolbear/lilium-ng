@@ -1,14 +1,16 @@
 // Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 spider/ws_runtime.py spider/ws_worker.py
 use anyhow::{Context, Result};
-use lilium_api_client::http::{CookieRefreshCallback, DzmmApi, DzmmApiAuth};
+use lilium_api_client::http::DzmmApi;
 use lilium_api_client::websocket::{SocketCommandError, SocketCommandExecutor, WsClient};
 use lilium_database::{
     Database, DedicatedDatabaseConfig, DedicatedDbConnection, NotificationConnection,
     NotificationDatabaseConfig,
 };
 use lilium_models::dzmm::outgoing_command::{self as outgoing_commands, status};
-use lilium_services::{account, outgoing_command, websocket_connection};
-use std::borrow::Cow;
+use lilium_services::{
+    account::{self, AuthClientFactory},
+    outgoing_command, websocket_connection,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -274,46 +276,9 @@ impl Worker {
         .await?
         .with_context(|| format!("Account '{}' not found", account_id))?;
 
-        let database_for_callback = database.clone();
-        let account_id_for_callback = account_id;
-        let on_cookies_refreshed: CookieRefreshCallback = Arc::new(move |cookies| {
-            let database = database_for_callback.clone();
-            let account_id = account_id_for_callback;
-            Box::pin(async move {
-                let update_account_id = account_id;
-                let result = lilium_database::transaction!(database, |session| {
-                    account::update_cookies(session, update_account_id, &cookies).await?;
-                    Ok(())
-                })
-                .await;
-
-                match result {
-                    Ok(()) => {
-                        info!(account = %account_id, "Persisted refreshed DZMM cookies");
-                    }
-                    Err(error) => {
-                        warn!(
-                            account = %account_id,
-                            error = %error,
-                            "Failed to persist refreshed DZMM cookies"
-                        );
-                    }
-                }
-            })
-        });
-
-        DzmmApi::new(DzmmApiAuth {
-            email: account.email.map(Cow::Owned),
-            password: account.password.map(Cow::Owned),
-            signin_code: account.signin_code.map(Cow::Owned),
-            signin_code_image: account.signin_code_image,
-            signin_code_image_mime: account.signin_code_image_mime.map(Cow::Owned),
-            cookies: account.cookies.map(Cow::Owned),
-            user_id: Some(Cow::Owned(account.user_id.to_string())),
-            auto_refresh: true,
-            on_cookies_refreshed: Some(on_cookies_refreshed),
-        })
-        .context("Failed to build DZMM auth client")
+        AuthClientFactory::new(database.clone())
+            .create(account)
+            .context("Failed to build DZMM auth client")
     }
 
     #[instrument(level = "debug" skip(context))]
@@ -342,10 +307,12 @@ impl Worker {
                 auth.authenticate()
                     .await
                     .context("DZMM authentication failed")?;
-                let cookie_header = auth.get_cookie_string().await;
+                let credentials = auth
+                    .socket_io_credentials()
+                    .await
+                    .context("Failed to obtain Socket.IO Cloudflare identity")?;
 
-                let mut client =
-                    WsClient::new(account_id, websocket_url.clone(), Some(cookie_header));
+                let mut client = WsClient::new(account_id, websocket_url.clone(), credentials);
                 let ingest = ingestor.clone();
                 let ws_stop = stop_event.clone();
                 let ws_shutdown = shutdown.clone();

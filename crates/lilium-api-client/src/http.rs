@@ -7,14 +7,21 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::clearance::{
+    ClearanceAgentClient, ClearanceError, ClearanceProvider, ClearanceRefreshReason,
+    ClearanceSnapshot, is_cloudflare_cookie_name,
+};
 use crate::config::{ApiClientConfig, dzmm_local_address_from_env};
+use crate::websocket::SocketIoCredentials;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use rand::RngExt;
 use reqwest::{
     Client, Method, StatusCode,
     cookie::{CookieStore, Jar},
-    header::{CONTENT_TYPE, COOKIE, HeaderMap, HeaderValue, ORIGIN, REFERER, SET_COOKIE},
+    header::{
+        CONTENT_TYPE, COOKIE, HeaderMap, HeaderValue, ORIGIN, REFERER, SET_COOKIE, USER_AGENT,
+    },
     multipart::{Form, Part},
     redirect::Policy,
 };
@@ -24,12 +31,12 @@ use tracing::instrument;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
-const DZMM_HEADERS: &[(&str, &str)] = &[
-    (
-        "User-Agent",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
-    ),
-    ("Accept-Language", "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7"),
+const GENERATE_STRING_CHARSET: &[u8] =
+    b"useandomp26T198340PX75pxJACKVERYMINDBUSHWOLFoGQZbfghjklqvwyzrict";
+
+const DEFAULT_HTTP_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36";
+const DEFAULT_SOCKET_IO_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0";
+const DEFAULT_HTTP_CLIENT_HINTS: &[(&str, &str)] = &[
     (
         "Sec-Ch-Ua",
         "\"Chromium\";v=\"148\", \"Brave\";v=\"148\", \"Not/A)Brand\";v=\"99\"",
@@ -46,9 +53,6 @@ const DZMM_HEADERS: &[(&str, &str)] = &[
     ("Sec-Ch-Ua-Platform-Version", "\"26.4.1\""),
     ("Sec-Gpc", "1"),
 ];
-
-const GENERATE_STRING_CHARSET: &[u8] =
-    b"useandomp26T198340PX75pxJACKVERYMINDBUSHWOLFoGQZbfghjklqvwyzrict";
 
 fn generate_string(length: usize) -> String {
     let mut rng = rand::rng();
@@ -93,6 +97,14 @@ fn is_trpc_business_forbidden(body_text: &str) -> bool {
     }
 
     false
+}
+
+fn is_cloudflare_challenge(status: StatusCode, headers: &HeaderMap) -> bool {
+    status == StatusCode::FORBIDDEN
+        && headers
+            .get("cf-mitigated")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case("challenge"))
 }
 
 fn parse_trpc_response(response: &Value, index: usize, default: Option<Value>) -> Value {
@@ -162,16 +174,58 @@ fn parse_cookie_header(cookie_header: &str) -> HashMap<String, String> {
 
 fn sanitize_logged_url(url: &Url) -> String {
     let path = url.path();
+    let mut sanitized = url.clone();
+    sanitized.set_query(None);
     if path.starts_with("/api/auth/sign-in-code/")
         && path != "/api/auth/sign-in-code/scan"
         && path.len() > "/api/auth/sign-in-code/".len()
     {
-        let mut sanitized = url.clone();
         sanitized.set_path("/api/auth/sign-in-code/<redacted>");
-        sanitized.set_query(None);
-        return sanitized.to_string();
     }
-    url.to_string()
+    sanitized.to_string()
+}
+
+fn sanitize_logged_endpoint(endpoint: &str) -> String {
+    let path = endpoint.split_once('?').map_or(endpoint, |(path, _)| path);
+    if path.starts_with("/api/auth/sign-in-code/")
+        && path != "/api/auth/sign-in-code/scan"
+        && path.len() > "/api/auth/sign-in-code/".len()
+    {
+        return "/api/auth/sign-in-code/<redacted>".to_string();
+    }
+    path.to_string()
+}
+
+#[derive(Default)]
+struct AccountCookieStore {
+    inner: Jar,
+}
+
+impl AccountCookieStore {
+    fn add_cookie_str(&self, cookie: &str, url: &Url) {
+        if extract_cookie_kv(cookie).is_some_and(|(name, _)| !is_cloudflare_cookie_name(&name)) {
+            self.inner.add_cookie_str(cookie, url);
+        }
+    }
+}
+
+impl CookieStore for AccountCookieStore {
+    fn set_cookies(&self, cookie_headers: &mut dyn Iterator<Item = &HeaderValue>, url: &Url) {
+        let allowed: Vec<&HeaderValue> = cookie_headers
+            .filter(|header| {
+                header
+                    .to_str()
+                    .ok()
+                    .and_then(extract_cookie_kv)
+                    .is_some_and(|(name, _)| !is_cloudflare_cookie_name(&name))
+            })
+            .collect();
+        self.inner.set_cookies(&mut allowed.into_iter(), url);
+    }
+
+    fn cookies(&self, url: &Url) -> Option<HeaderValue> {
+        self.inner.cookies(url)
+    }
 }
 
 fn guess_content_type(suffix: &str) -> &str {
@@ -311,7 +365,7 @@ struct ApiRequest<'a> {
     endpoint: Cow<'a, str>,
     query: Vec<(Cow<'a, str>, Cow<'a, str>)>,
     json_body: Option<Value>,
-    multipart_form: Option<Form>,
+    multipart_form: Option<MultipartSpec>,
     timeout: Option<Duration>,
 }
 
@@ -353,7 +407,7 @@ impl<'a> ApiRequest<'a> {
         self
     }
 
-    fn multipart(mut self, form: Form) -> Self {
+    fn multipart(mut self, form: MultipartSpec) -> Self {
         self.multipart_form = Some(form);
         self
     }
@@ -361,6 +415,77 @@ impl<'a> ApiRequest<'a> {
     fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
+    }
+}
+
+#[derive(Clone)]
+struct MultipartSpec {
+    fields: Vec<MultipartField>,
+}
+
+#[derive(Clone)]
+enum MultipartField {
+    Text {
+        name: String,
+        value: String,
+    },
+    File {
+        name: String,
+        data: Vec<u8>,
+        filename: String,
+        mime_type: String,
+    },
+}
+
+impl MultipartSpec {
+    fn new() -> Self {
+        Self { fields: Vec::new() }
+    }
+
+    fn text(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.fields.push(MultipartField::Text {
+            name: name.into(),
+            value: value.into(),
+        });
+        self
+    }
+
+    fn file(
+        mut self,
+        name: impl Into<String>,
+        data: Vec<u8>,
+        filename: impl Into<String>,
+        mime_type: impl Into<String>,
+    ) -> Self {
+        self.fields.push(MultipartField::File {
+            name: name.into(),
+            data,
+            filename: filename.into(),
+            mime_type: mime_type.into(),
+        });
+        self
+    }
+
+    fn build(&self) -> Result<Form> {
+        let mut form = Form::new();
+        for field in &self.fields {
+            form = match field {
+                MultipartField::Text { name, value } => form.text(name.clone(), value.clone()),
+                MultipartField::File {
+                    name,
+                    data,
+                    filename,
+                    mime_type,
+                } => {
+                    let part = Part::bytes(data.clone())
+                        .file_name(filename.clone())
+                        .mime_str(mime_type)
+                        .context("Failed to build multipart part")?;
+                    form.part(name.clone(), part)
+                }
+            };
+        }
+        Ok(form)
     }
 }
 
@@ -373,12 +498,15 @@ fn trpc_batch_query<'a>(input_data: &Value) -> Vec<(Cow<'a, str>, Cow<'a, str>)>
 
 pub struct DzmmApi {
     client: Client,
+    media_client: Client,
     base_url: String,
     auth: DzmmApiAuth,
+    clearance_provider: Arc<dyn ClearanceProvider>,
+    active_clearance: Arc<Mutex<Option<ClearanceSnapshot>>>,
     rate_limiter: Arc<Mutex<RateLimiter>>,
     refresh_lock: Arc<Mutex<()>>,
     cookie_map: Arc<Mutex<HashMap<String, String>>>,
-    cookie_jar: Arc<Jar>,
+    cookie_jar: Arc<AccountCookieStore>,
     cookie_url: Url,
 }
 
@@ -388,6 +516,18 @@ impl DzmmApi {
     }
 
     pub fn new_with_config(config: ApiClientConfig, auth: DzmmApiAuth) -> Result<Self> {
+        let clearance_provider = Arc::new(
+            ClearanceAgentClient::new(&config.clearance_agent_url)
+                .context("Invalid clearance agent configuration")?,
+        );
+        Self::new_with_clearance_provider(config, auth, clearance_provider)
+    }
+
+    pub fn new_with_clearance_provider(
+        config: ApiClientConfig,
+        auth: DzmmApiAuth,
+        clearance_provider: Arc<dyn ClearanceProvider>,
+    ) -> Result<Self> {
         let base_url = normalize_base_url(&config.base_url)?;
         let cookie_url = Url::parse(&base_url).context("Invalid API base URL")?;
         let cookie_map = if let Some(ref c) = auth.cookies {
@@ -395,7 +535,7 @@ impl DzmmApi {
         } else {
             HashMap::new()
         };
-        let cookie_jar = Arc::new(Jar::default());
+        let cookie_jar = Arc::new(AccountCookieStore::default());
         for (name, value) in &cookie_map {
             cookie_jar.add_cookie_str(&format!("{name}={value}"), &cookie_url);
         }
@@ -411,10 +551,23 @@ impl DzmmApi {
             .build()
             .context("Failed to build HTTP client")?;
 
+        let mut media_client_builder = Client::builder()
+            .timeout(Duration::from_secs(config.request_timeout_secs))
+            .redirect(Policy::none());
+        if let Some(local_address) = dzmm_local_address_from_env()? {
+            media_client_builder = media_client_builder.local_address(local_address);
+        }
+        let media_client = media_client_builder
+            .build()
+            .context("Failed to build plain media HTTP client")?;
+
         Ok(Self {
             client,
+            media_client,
             base_url,
             auth,
+            clearance_provider,
+            active_clearance: Arc::new(Mutex::new(None)),
             rate_limiter: Arc::new(Mutex::new(RateLimiter::new(
                 config.min_request_delay,
                 config.max_request_delay,
@@ -439,12 +592,66 @@ impl DzmmApi {
         pairs.join("; ")
     }
 
+    #[instrument(
+        level = "debug",
+        skip(self),
+        fields(clearance_generation = tracing::field::Empty)
+    )]
+    pub async fn socket_io_credentials(&self) -> Result<SocketIoCredentials> {
+        let account_cookie_header = self.get_cookie_string().await;
+        if let Some(snapshot) = self.active_clearance_snapshot().await {
+            let generation = snapshot.generation;
+            tracing::Span::current().record("clearance_generation", generation);
+            let cookie_header = snapshot.merge_cookie_header(
+                (!account_cookie_header.is_empty()).then_some(account_cookie_header.as_str()),
+            );
+            return Ok(SocketIoCredentials {
+                generation,
+                user_agent: snapshot.user_agent,
+                cookie_header,
+            });
+        }
+
+        tracing::Span::current().record("clearance_generation", 0);
+        Ok(SocketIoCredentials {
+            generation: 0,
+            user_agent: DEFAULT_SOCKET_IO_USER_AGENT.to_string(),
+            cookie_header: account_cookie_header,
+        })
+    }
+
+    async fn active_clearance_snapshot(&self) -> Option<ClearanceSnapshot> {
+        let mut active = self.active_clearance.lock().await;
+        if active
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.validate_at(chrono::Utc::now()).is_err())
+        {
+            *active = None;
+        }
+        active.clone()
+    }
+
+    async fn activate_clearance_snapshot(&self, snapshot: ClearanceSnapshot) {
+        *self.active_clearance.lock().await = Some(snapshot);
+    }
+
     async fn combined_cookie_map(&self) -> HashMap<String, String> {
-        let mut map = self.cookie_map.lock().await.clone();
+        let mut map: HashMap<String, String> = self
+            .cookie_map
+            .lock()
+            .await
+            .iter()
+            .filter(|(name, _)| !is_cloudflare_cookie_name(name))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
         if let Some(header) = self.cookie_jar.cookies(&self.cookie_url)
             && let Ok(cookie_header) = header.to_str()
         {
-            map.extend(parse_cookie_header(cookie_header));
+            map.extend(
+                parse_cookie_header(cookie_header)
+                    .into_iter()
+                    .filter(|(name, _)| !is_cloudflare_cookie_name(name)),
+            );
         }
         map
     }
@@ -455,7 +662,11 @@ impl DzmmApi {
         {
             let jar_cookies = parse_cookie_header(cookie_header);
             if !jar_cookies.is_empty() {
-                self.cookie_map.lock().await.extend(jar_cookies);
+                self.cookie_map.lock().await.extend(
+                    jar_cookies
+                        .into_iter()
+                        .filter(|(name, _)| !is_cloudflare_cookie_name(name)),
+                );
             }
         }
     }
@@ -472,6 +683,9 @@ impl DzmmApi {
         if !new_cookies.is_empty() {
             let mut map = self.cookie_map.lock().await;
             for (k, v) in new_cookies {
+                if is_cloudflare_cookie_name(&k) {
+                    continue;
+                }
                 self.cookie_jar
                     .add_cookie_str(&format!("{k}={v}"), &self.cookie_url);
                 map.insert(k, v);
@@ -506,15 +720,11 @@ impl DzmmApi {
         let _guard = self.refresh_lock.lock().await;
         info!("Refreshing authentication cookies...");
 
-        let token_url = format!("{}/api/auth/token", self.base_url());
-        match self
-            .send_request(self.client.get(&token_url).headers(self.build_headers()))
-            .await
-        {
-            Ok(response) => {
-                self.merge_response_cookies(response.headers()).await;
-                if response.status() == StatusCode::OK {
-                    let auth_data: Value = response.json().await.unwrap_or_default();
+        let request = ApiRequest::get("/api/auth/token");
+        match self.request_with_clearance_retry(&request).await {
+            Ok((status, body, _)) => {
+                if status == StatusCode::OK {
+                    let auth_data: Value = serde_json::from_slice(&body).unwrap_or_default();
                     if let Some(uid) = auth_data.get("user_id").and_then(|v| v.as_str()) {
                         info!(
                             "Token refresh successful (used refresh_token), User ID: {}",
@@ -532,9 +742,12 @@ impl DzmmApi {
                     self.invoke_cookies_refreshed().await;
                     return Ok(true);
                 }
-                warn!("Token refresh failed with status {}", response.status());
+                warn!("Token refresh failed with status {}", status);
             }
             Err(e) => {
+                if e.downcast_ref::<ClearanceError>().is_some() {
+                    return Err(e);
+                }
                 warn!("Token refresh failed: {}", e);
             }
         }
@@ -567,43 +780,32 @@ impl DzmmApi {
 
         self.clear_cookies().await;
 
-        let sign_in_url = format!("{}/api/auth/sign-in", self.base_url());
         let body = json!({"email": email, "password": password});
-
-        let sign_in_response = self
-            .send_request(
-                self.client
-                    .post(&sign_in_url)
-                    .headers(self.build_headers())
-                    .json(&body),
-            )
+        let request = ApiRequest::post("/api/auth/sign-in").json(body);
+        let (sign_in_status, _, _) = self
+            .request_with_clearance_retry(&request)
             .await
             .context("Sign-in request failed")?;
 
-        self.merge_response_cookies(sign_in_response.headers())
-            .await;
-
-        if sign_in_response.status() != StatusCode::OK {
-            error!("Sign-in failed: {}", sign_in_response.status());
+        if sign_in_status != StatusCode::OK {
+            error!("Sign-in failed: {}", sign_in_status);
             return Ok(false);
         }
 
         info!("Sign-in successful");
 
-        let token_url = format!("{}/api/auth/token", self.base_url());
-        let token_response = self
-            .send_request(self.client.get(&token_url).headers(self.build_headers()))
+        let request = ApiRequest::get("/api/auth/token");
+        let (token_status, token_body, _) = self
+            .request_with_clearance_retry(&request)
             .await
             .context("Token request failed")?;
 
-        self.merge_response_cookies(token_response.headers()).await;
-
-        if token_response.status() != StatusCode::OK {
-            error!("Token retrieval failed: {}", token_response.status());
+        if token_status != StatusCode::OK {
+            error!("Token retrieval failed: {}", token_status);
             return Ok(false);
         }
 
-        let auth_data: Value = token_response.json().await.unwrap_or_default();
+        let auth_data: Value = serde_json::from_slice(&token_body).unwrap_or_default();
         if let Some(uid) = auth_data.get("user_id").and_then(|v| v.as_str()) {
             info!(
                 "Token retrieved successfully (used password), User ID: {}",
@@ -626,17 +828,11 @@ impl DzmmApi {
 
         self.clear_cookies().await;
 
-        let url = format!(
-            "{}/api/auth/sign-in-code/{}",
-            self.base_url(),
-            encrypted_token
-        );
-        let response = self
-            .send_request(self.client.get(&url).headers(self.build_headers()))
+        let endpoint = format!("/api/auth/sign-in-code/{encrypted_token}");
+        let request = ApiRequest::get(endpoint);
+        self.request_with_clearance_retry(&request)
             .await
             .context("QR code login request failed")?;
-
-        self.merge_response_cookies(response.headers()).await;
 
         self.sync_cookie_jar_to_map().await;
         let has_auth_cookie = self.has_auth_cookie().await;
@@ -673,28 +869,15 @@ impl DzmmApi {
         };
         let filename = format!("signin-code.{}", ext);
 
-        let part = Part::bytes(image.to_vec())
-            .file_name(filename)
-            .mime_str(mime_type)
-            .context("Failed to build multipart part")?;
-        let form = Form::new().part("image", part);
-
-        let url = format!("{}/api/auth/sign-in-code/scan", self.base_url());
-        let response = self
-            .send_request(
-                self.client
-                    .post(&url)
-                    .headers(self.build_headers())
-                    .multipart(form),
-            )
+        let form = MultipartSpec::new().file("image", image.to_vec(), filename, mime_type);
+        let request = ApiRequest::post("/api/auth/sign-in-code/scan").multipart(form);
+        let (status, body, _) = self
+            .request_with_clearance_retry(&request)
             .await
             .context("QR image login request failed")?;
 
-        self.merge_response_cookies(response.headers()).await;
-
-        if response.status() != StatusCode::OK {
-            let status = response.status();
-            let error_data: Value = response.json().await.unwrap_or_default();
+        if status != StatusCode::OK {
+            let error_data: Value = serde_json::from_slice(&body).unwrap_or_default();
             let error_msg = error_data
                 .get("message")
                 .and_then(|v| v.as_str())
@@ -716,47 +899,84 @@ impl DzmmApi {
         Ok(false)
     }
 
-    fn build_headers(&self) -> HeaderMap {
+    fn build_headers(&self, snapshot: Option<&ClearanceSnapshot>) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
-        for (k, v) in DZMM_HEADERS {
-            headers.insert(*k, HeaderValue::from_static(v));
+        let user_agent = snapshot
+            .map(|snapshot| snapshot.user_agent.as_str())
+            .unwrap_or(DEFAULT_HTTP_USER_AGENT);
+        headers.insert(
+            USER_AGENT,
+            HeaderValue::from_str(user_agent)
+                .context("Selected identity has an invalid user agent")?,
+        );
+        if snapshot.is_none() {
+            for (name, value) in DEFAULT_HTTP_CLIENT_HINTS {
+                headers.insert(*name, HeaderValue::from_static(value));
+            }
         }
         headers.insert(
             "Accept",
             HeaderValue::from_static("application/json, text/plain, */*"),
         );
+        headers.insert(
+            "Accept-Language",
+            HeaderValue::from_static("en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7"),
+        );
         headers.insert("Sec-Fetch-Dest", HeaderValue::from_static("empty"));
         headers.insert("Sec-Fetch-Mode", HeaderValue::from_static("cors"));
         headers.insert("Sec-Fetch-Site", HeaderValue::from_static("same-origin"));
-        headers.insert(ORIGIN, HeaderValue::from_str(self.base_url()).unwrap());
+        headers.insert(
+            ORIGIN,
+            HeaderValue::from_str(self.base_url()).context("Invalid DZMM origin header")?,
+        );
 
         let referer = format!("{}/chat", self.base_url());
-        headers.insert(REFERER, HeaderValue::from_str(&referer).unwrap());
+        headers.insert(
+            REFERER,
+            HeaderValue::from_str(&referer).context("Invalid DZMM referer header")?,
+        );
 
         headers.insert(
             "x-dzmm-request-id",
-            HeaderValue::from_str(&generate_string(10)).unwrap(),
+            HeaderValue::from_str(&generate_string(10)).context("Invalid DZMM request ID")?,
         );
 
-        headers
+        Ok(headers)
     }
 
-    async fn build_cookie_header_value(&self) -> Option<String> {
+    async fn build_cookie_header_value(
+        &self,
+        snapshot: Option<&ClearanceSnapshot>,
+    ) -> Option<String> {
         let cookie_str = self.get_cookie_string().await;
-        if cookie_str.is_empty() {
+        let merged = snapshot.map_or_else(
+            || cookie_str.clone(),
+            |snapshot| {
+                snapshot
+                    .merge_cookie_header((!cookie_str.is_empty()).then_some(cookie_str.as_str()))
+            },
+        );
+        if merged.is_empty() {
             return None;
         }
-        Some(cookie_str)
+        Some(merged)
     }
 
     async fn send_request(&self, builder: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+        Self::send_request_with_client(&self.client, builder).await
+    }
+
+    async fn send_request_with_client(
+        client: &Client,
+        builder: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response> {
         let request = builder.build().context("Failed to build HTTP request")?;
         let method = request.method().clone();
         let url = request.url().clone();
         let logged_url = sanitize_logged_url(&url);
         let started_at = Instant::now();
 
-        match self.client.execute(request).await {
+        match client.execute(request).await {
             Ok(response) => {
                 let status = response.status();
                 let version = response.version();
@@ -784,13 +1004,41 @@ impl DzmmApi {
         }
     }
 
+    #[instrument(
+        level = "debug",
+        skip(self),
+        fields(endpoint = %sanitize_logged_endpoint(endpoint))
+    )]
+    async fn download_plain_media(
+        &self,
+        endpoint: &str,
+    ) -> Result<(StatusCode, Vec<u8>, HeaderMap)> {
+        let url = Url::parse(&format!("{}{}", self.base_url(), endpoint))
+            .context("Invalid media download URL")?;
+        let response =
+            Self::send_request_with_client(&self.media_client, self.media_client.get(url)).await?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response
+            .bytes()
+            .await
+            .context("Failed to read media response body")?;
+        Ok((status, body.to_vec(), headers))
+    }
+
     #[instrument(level = "debug"
-        skip(self, request),
-        fields(method = ?request.method, endpoint = %request.endpoint, user_id = ?self.auth.user_id.as_deref())
+        skip(self, request, snapshot),
+        fields(
+            method = ?request.method,
+            endpoint = %sanitize_logged_endpoint(request.endpoint.as_ref()),
+            user_id = ?self.auth.user_id.as_deref(),
+            clearance_generation = snapshot.map_or(0, |snapshot| snapshot.generation)
+        )
     )]
     async fn _request_inner(
         &self,
-        request: &mut ApiRequest<'_>,
+        request: &ApiRequest<'_>,
+        snapshot: Option<&ClearanceSnapshot>,
     ) -> Result<(StatusCode, Vec<u8>, HeaderMap)> {
         let mut url = Url::parse(&format!("{}{}", self.base_url(), request.endpoint.as_ref()))?;
         if !request.query.is_empty() {
@@ -804,9 +1052,12 @@ impl DzmmApi {
 
         let mut builder = self.client.request(request.method.clone(), url);
 
-        let mut headers = self.build_headers();
-        if let Some(cookie_val) = self.build_cookie_header_value().await {
-            headers.insert(COOKIE, HeaderValue::from_str(&cookie_val).unwrap());
+        let mut headers = self.build_headers(snapshot)?;
+        if let Some(cookie_val) = self.build_cookie_header_value(snapshot).await {
+            headers.insert(
+                COOKIE,
+                HeaderValue::from_str(&cookie_val).context("Invalid merged cookie header")?,
+            );
         }
         builder = builder.headers(headers);
 
@@ -814,8 +1065,8 @@ impl DzmmApi {
             builder = builder.json(body);
         }
 
-        if let Some(form) = request.multipart_form.take() {
-            builder = builder.multipart(form);
+        if let Some(form) = &request.multipart_form {
+            builder = builder.multipart(form.build()?);
         }
 
         if let Some(t) = request.timeout {
@@ -833,10 +1084,93 @@ impl DzmmApi {
         Ok((status, body_bytes.to_vec(), resp_headers))
     }
 
-    #[instrument(level = "debug" skip(self, request), fields(method = ?request.method, endpoint = %request.endpoint))]
-    async fn _request(&self, mut request: ApiRequest<'_>) -> Result<Value> {
+    async fn request_with_clearance_retry(
+        &self,
+        request: &ApiRequest<'_>,
+    ) -> Result<(StatusCode, Vec<u8>, HeaderMap)> {
+        let mut clearance_retry_used = false;
+        self.request_with_clearance_retry_state(request, &mut clearance_retry_used)
+            .await
+    }
+
+    #[instrument(
+        level = "debug",
+        skip(self, request, clearance_retry_used),
+        fields(
+            endpoint = %sanitize_logged_endpoint(request.endpoint.as_ref()),
+            clearance_generation = tracing::field::Empty,
+            refreshed_generation = tracing::field::Empty
+        )
+    )]
+    async fn request_with_clearance_retry_state(
+        &self,
+        request: &ApiRequest<'_>,
+        clearance_retry_used: &mut bool,
+    ) -> Result<(StatusCode, Vec<u8>, HeaderMap)> {
+        let mut snapshot = self.active_clearance_snapshot().await;
+        tracing::Span::current().record(
+            "clearance_generation",
+            snapshot.as_ref().map_or(0, |snapshot| snapshot.generation),
+        );
+
+        loop {
+            let (status, body, headers) = self._request_inner(request, snapshot.as_ref()).await?;
+            if is_cloudflare_challenge(status, &headers) {
+                if *clearance_retry_used {
+                    return Err(anyhow::Error::new(ClearanceError::ChallengePersisted {
+                        endpoint: sanitize_logged_endpoint(request.endpoint.as_ref()),
+                        generation: snapshot.as_ref().map_or(0, |snapshot| snapshot.generation),
+                    }));
+                }
+
+                let observed_generation =
+                    snapshot.as_ref().map_or(0, |snapshot| snapshot.generation);
+                warn!(
+                    endpoint = %sanitize_logged_endpoint(request.endpoint.as_ref()),
+                    generation = observed_generation,
+                    "Cloudflare challenge detected; refreshing clearance"
+                );
+                let refreshed = self
+                    .clearance_provider
+                    .refresh(observed_generation, ClearanceRefreshReason::CfMitigated)
+                    .await
+                    .map_err(anyhow::Error::new)?;
+                refreshed
+                    .validate_at(chrono::Utc::now())
+                    .map_err(anyhow::Error::new)?;
+                tracing::Span::current().record("refreshed_generation", refreshed.generation);
+                self.activate_clearance_snapshot(refreshed.clone()).await;
+                snapshot = Some(refreshed);
+                *clearance_retry_used = true;
+                continue;
+            }
+
+            if *clearance_retry_used {
+                info!(
+                    endpoint = %sanitize_logged_endpoint(request.endpoint.as_ref()),
+                    generation = snapshot.as_ref().map_or(0, |snapshot| snapshot.generation),
+                    status = status.as_u16(),
+                    "DZMM request completed after clearance refresh"
+                );
+            }
+            self.merge_response_cookies(&headers).await;
+            return Ok((status, body, headers));
+        }
+    }
+
+    #[instrument(
+        level = "debug",
+        skip(self, request),
+        fields(
+            method = ?request.method,
+            endpoint = %sanitize_logged_endpoint(request.endpoint.as_ref())
+        )
+    )]
+    async fn _request(&self, request: ApiRequest<'_>) -> Result<Value> {
         let mut retried = false;
+        let mut clearance_retry_used = false;
         let mut retry_429_count: u32 = 0;
+        let logged_endpoint = sanitize_logged_endpoint(request.endpoint.as_ref());
 
         loop {
             // Compute the proactive delay under the lock, then sleep *after*
@@ -847,9 +1181,9 @@ impl DzmmApi {
                 tokio::time::sleep(Duration::from_secs_f64(delay)).await;
             }
 
-            let (status, body_bytes, resp_headers) = self._request_inner(&mut request).await?;
-
-            self.merge_response_cookies(&resp_headers).await;
+            let (status, body_bytes, resp_headers) = self
+                .request_with_clearance_retry_state(&request, &mut clearance_retry_used)
+                .await?;
 
             if status.is_success() {
                 match serde_json::from_slice::<Value>(&body_bytes) {
@@ -872,7 +1206,7 @@ impl DzmmApi {
                     .min(MAX_RETRY_AFTER_SECS);
                 warn!(
                     "429 Too Many Requests for {}, backing off {}s (attempt {})",
-                    request.endpoint,
+                    logged_endpoint,
                     backoff,
                     retry_429_count + 1
                 );
@@ -887,28 +1221,37 @@ impl DzmmApi {
             if is_auth && !is_biz_forbidden && self.auth.auto_refresh && !retried {
                 warn!(
                     "Auth error before retry {} for {}\nResult: {}",
-                    status, request.endpoint, body_text
+                    status, logged_endpoint, body_text
                 );
-                if self.refresh_cookies().await.unwrap_or(false) {
-                    info!("Retrying with fresh cookies...");
-                    retried = true;
-                    continue;
+                match self.refresh_cookies().await {
+                    Ok(true) => {
+                        info!("Retrying with fresh cookies...");
+                        retried = true;
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(error) if error.downcast_ref::<ClearanceError>().is_some() => {
+                        return Err(error);
+                    }
+                    Err(error) => {
+                        warn!(error = %error, "Authentication cookie refresh failed");
+                    }
                 }
             }
 
             if is_biz_forbidden {
                 warn!(
                     "Business forbidden {} for {}\nResult: {}",
-                    status, request.endpoint, body_text
+                    status, logged_endpoint, body_text
                 );
                 bail!("Business forbidden: {} {}", status, body_text);
             }
 
             error!(
                 "HTTP error {} for {}\nResult: {}",
-                status, request.endpoint, body_text
+                status, logged_endpoint, body_text
             );
-            bail!("HTTP {} for {}: {}", status, request.endpoint, body_text);
+            bail!("HTTP {} for {}: {}", status, logged_endpoint, body_text);
         }
     }
 
@@ -1147,7 +1490,7 @@ impl DzmmApi {
     ) -> Result<Value> {
         let tags_json =
             serde_json::to_string(&tags.unwrap_or(&[])).unwrap_or_else(|_| "[]".to_string());
-        let form = Form::new()
+        let form = MultipartSpec::new()
             .text("title", title.to_string())
             .text(
                 "isPublic",
@@ -1220,28 +1563,21 @@ impl DzmmApi {
         filename: &str,
         content_type: &str,
     ) -> Result<()> {
-        let part = Part::bytes(image_data.to_vec())
-            .file_name(filename.to_string())
-            .mime_str(content_type)
-            .context("Failed to build multipart part")?;
-        let form = Form::new().part("file".to_string(), part);
-
-        let url = format!("{}/api/group-chat/{}/avatar", self.base_url(), chatroom_id);
-        let response = self
-            .send_request(
-                self.client
-                    .put(&url)
-                    .headers(self.build_headers())
-                    .multipart(form),
-            )
+        let form = MultipartSpec::new().file(
+            "file",
+            image_data.to_vec(),
+            filename.to_string(),
+            content_type.to_string(),
+        );
+        let endpoint = format!("/api/group-chat/{chatroom_id}/avatar");
+        let request = ApiRequest::new(Method::PUT, endpoint).multipart(form);
+        let (status, body, _) = self
+            .request_with_clearance_retry(&request)
             .await
             .context("Failed to update room avatar")?;
 
-        self.merge_response_cookies(response.headers()).await;
-
-        if response.status() != StatusCode::OK {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
+        if status != StatusCode::OK {
+            let text = String::from_utf8_lossy(&body);
             bail!("Failed to update avatar: {} {}", status, text);
         }
 
@@ -1934,30 +2270,15 @@ impl DzmmApi {
                 }
 
                 let relative_url = output_images.unwrap()[0].as_str().unwrap_or("");
-                let temp_image_url = format!("{}{}", self.base_url(), relative_url);
-                info!("Downloading image from: {}", temp_image_url);
-
-                let download_response = self
-                    .send_request(self.client.get(&temp_image_url))
+                info!("Downloading generated image");
+                let (download_status, image_bytes, headers) = self
+                    .download_plain_media(relative_url)
                     .await
                     .context("Failed to download generated image")?;
 
-                if !download_response.status().is_success() {
-                    bail!("Failed to download image: {}", download_response.status());
+                if !download_status.is_success() {
+                    bail!("Failed to download image: {}", download_status);
                 }
-
-                let _mime_type = download_response
-                    .headers()
-                    .get(CONTENT_TYPE)
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.split(';').next().unwrap_or(s).trim().to_string())
-                    .unwrap_or_else(|| "image/png".to_string());
-
-                let headers = download_response.headers().clone();
-                let image_bytes = download_response
-                    .bytes()
-                    .await
-                    .context("Failed to read image bytes")?;
 
                 let mime_type = headers
                     .get(CONTENT_TYPE)
@@ -1970,7 +2291,7 @@ impl DzmmApi {
                     image_bytes.len(),
                     mime_type
                 );
-                return Ok((Some(image_bytes.to_vec()), Some(mime_type)));
+                return Ok((Some(image_bytes), Some(mime_type)));
             }
 
             if status == "failed" {
@@ -2135,36 +2456,28 @@ impl DzmmApi {
                 }
 
                 let relative_url = output_images.unwrap()[0].as_str().unwrap_or("");
-                let temp_image_url = format!("{}{}", self.base_url(), relative_url);
-                info!("Downloading edited image from: {}", temp_image_url);
-
-                let download_response = self
-                    .send_request(self.client.get(&temp_image_url))
+                info!("Downloading edited image");
+                let (download_status, result_bytes, headers) = self
+                    .download_plain_media(relative_url)
                     .await
                     .context("Failed to download edited image")?;
 
-                if !download_response.status().is_success() {
-                    bail!("Failed to download image: {}", download_response.status());
+                if !download_status.is_success() {
+                    bail!("Failed to download image: {}", download_status);
                 }
 
-                let mime_type = download_response
-                    .headers()
+                let mime_type = headers
                     .get(CONTENT_TYPE)
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.split(';').next().unwrap_or(s).trim().to_string())
                     .unwrap_or_else(|| "image/png".to_string());
-
-                let result_bytes = download_response
-                    .bytes()
-                    .await
-                    .context("Failed to read image bytes")?;
 
                 info!(
                     "Image edit complete: {} bytes, {}",
                     result_bytes.len(),
                     mime_type
                 );
-                return Ok((Some(result_bytes.to_vec()), Some(mime_type)));
+                return Ok((Some(result_bytes), Some(mime_type)));
             }
 
             if status == "failed" {
@@ -2177,19 +2490,26 @@ impl DzmmApi {
     }
 }
 
-fn build_file_upload_form(name: &str, data: Vec<u8>, filename: &str, mime_type: &str) -> Form {
-    let part = Part::bytes(data)
-        .file_name(filename.to_string())
-        .mime_str(mime_type)
-        .expect("Invalid MIME type");
-    Form::new().part(name.to_string(), part)
+fn build_file_upload_form(
+    name: &str,
+    data: Vec<u8>,
+    filename: &str,
+    mime_type: &str,
+) -> MultipartSpec {
+    MultipartSpec::new().file(name, data, filename, mime_type)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clearance::{
+        ClearanceCookie, ClearanceError, ClearanceFuture, ClearanceProvider,
+        ClearanceRefreshReason, ClearanceSnapshot,
+    };
     use crate::config::parse_dzmm_local_address;
+    use chrono::Utc;
     use serde_json::json;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -2433,16 +2753,146 @@ mod tests {
     struct RecordedRequest {
         method: String,
         target: String,
+        headers: HashMap<String, String>,
         body: Vec<u8>,
     }
 
+    struct FakeClearanceProvider {
+        current: ClearanceSnapshot,
+        refreshed: ClearanceSnapshot,
+        refreshed_active: AtomicBool,
+        snapshot_calls: AtomicUsize,
+        refresh_calls: AtomicUsize,
+        last_observed_generation: AtomicU64,
+    }
+
+    impl FakeClearanceProvider {
+        fn new() -> Self {
+            Self {
+                current: clearance_snapshot(1, "browser-ua-generation-1", "clearance-1"),
+                refreshed: clearance_snapshot(2, "browser-ua-generation-2", "clearance-2"),
+                refreshed_active: AtomicBool::new(false),
+                snapshot_calls: AtomicUsize::new(0),
+                refresh_calls: AtomicUsize::new(0),
+                last_observed_generation: AtomicU64::new(u64::MAX),
+            }
+        }
+    }
+
+    impl ClearanceProvider for FakeClearanceProvider {
+        fn snapshot(&self) -> ClearanceFuture<'_> {
+            self.snapshot_calls.fetch_add(1, Ordering::SeqCst);
+            let snapshot = if self.refreshed_active.load(Ordering::SeqCst) {
+                self.refreshed.clone()
+            } else {
+                self.current.clone()
+            };
+            Box::pin(std::future::ready(Ok(snapshot)))
+        }
+
+        fn refresh(
+            &self,
+            observed_generation: u64,
+            _reason: ClearanceRefreshReason,
+        ) -> ClearanceFuture<'_> {
+            self.refresh_calls.fetch_add(1, Ordering::SeqCst);
+            self.last_observed_generation
+                .store(observed_generation, Ordering::SeqCst);
+            self.refreshed_active.store(true, Ordering::SeqCst);
+            Box::pin(std::future::ready(Ok(self.refreshed.clone())))
+        }
+    }
+
+    struct FailingClearanceProvider {
+        snapshot_calls: AtomicUsize,
+        refresh_calls: AtomicUsize,
+    }
+
+    impl FailingClearanceProvider {
+        fn new() -> Self {
+            Self {
+                snapshot_calls: AtomicUsize::new(0),
+                refresh_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl ClearanceProvider for FailingClearanceProvider {
+        fn snapshot(&self) -> ClearanceFuture<'_> {
+            self.snapshot_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::ready(Err(ClearanceError::AgentUnavailable {
+                operation: "snapshot",
+                status: None,
+                code: None,
+                message: "unexpected snapshot query".to_string(),
+                retryable: true,
+            })))
+        }
+
+        fn refresh(
+            &self,
+            _observed_generation: u64,
+            _reason: ClearanceRefreshReason,
+        ) -> ClearanceFuture<'_> {
+            self.refresh_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::ready(Err(ClearanceError::AgentUnavailable {
+                operation: "refresh",
+                status: Some(StatusCode::SERVICE_UNAVAILABLE),
+                code: Some("CLEARANCE_UNAVAILABLE".to_string()),
+                message: "solve failed".to_string(),
+                retryable: true,
+            })))
+        }
+    }
+
+    fn clearance_snapshot(generation: u64, user_agent: &str, value: &str) -> ClearanceSnapshot {
+        ClearanceSnapshot {
+            generation,
+            user_agent: user_agent.to_string(),
+            cookies: vec![ClearanceCookie {
+                name: "cf_clearance".to_string(),
+                value: value.to_string(),
+                domain: ".dzmm.ai".to_string(),
+                path: "/".to_string(),
+                expires: (Utc::now() + chrono::Duration::hours(1)).timestamp() as f64,
+            }],
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+            verified_at: Utc::now(),
+        }
+    }
+
     fn test_api(base_url: String) -> DzmmApi {
-        let mut api = DzmmApi::new_with_config(
+        let mut api = DzmmApi::new_with_clearance_provider(
             ApiClientConfig {
                 base_url,
                 ..ApiClientConfig::default()
             },
             DzmmApiAuth::default(),
+            Arc::new(FakeClearanceProvider::new()),
+        )
+        .unwrap();
+        api.rate_limiter = Arc::new(Mutex::new(RateLimiter {
+            min_delay: 0.0,
+            max_delay: 0.0,
+            batch_size: 1,
+            batch_delay: 0.0,
+            request_count: 0,
+        }));
+        api
+    }
+
+    fn test_api_with_provider(
+        base_url: String,
+        auth: DzmmApiAuth,
+        provider: Arc<dyn ClearanceProvider>,
+    ) -> DzmmApi {
+        let mut api = DzmmApi::new_with_clearance_provider(
+            ApiClientConfig {
+                base_url,
+                ..ApiClientConfig::default()
+            },
+            auth,
+            provider,
         )
         .unwrap();
         api.rate_limiter = Arc::new(Mutex::new(RateLimiter {
@@ -2473,10 +2923,13 @@ mod tests {
         let mut parts = request_line.split_whitespace();
         let method = parts.next().unwrap().to_string();
         let target = parts.next().unwrap().to_string();
-        let content_length = lines
+        let headers: HashMap<String, String> = lines
             .filter_map(|line| line.split_once(':'))
-            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_string()))
+            .collect();
+        let content_length = headers
+            .get("content-length")
+            .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(0);
 
         while data.len() < header_end + content_length {
@@ -2488,6 +2941,7 @@ mod tests {
         RecordedRequest {
             method,
             target,
+            headers,
             body: data[header_end..header_end + content_length].to_vec(),
         }
     }
@@ -2614,9 +3068,10 @@ mod tests {
         });
 
         let api = test_api(base_url);
-        let mut request = ApiRequest::get("/compressed");
+        let request = ApiRequest::get("/compressed");
+        let snapshot = clearance_snapshot(1, "test-user-agent", "test-clearance");
         let (status, body, _) = api
-            ._request_inner(&mut request)
+            ._request_inner(&request, Some(&snapshot))
             .await
             .expect("request succeeds");
 
@@ -2625,6 +3080,449 @@ mod tests {
         assert_eq!(request.target, "/compressed");
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, br#"{"ok":true}"#);
+    }
+
+    #[tokio::test]
+    async fn cf_mitigated_refreshes_once_and_retries_with_one_new_atomic_identity() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            let (mut first, _) = listener.accept().await.unwrap();
+            requests.push(read_request(&mut first).await);
+            first
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\ncf-mitigated: challenge\r\nContent-Type: text/html\r\nContent-Length: 9\r\nConnection: close\r\n\r\nchallenge",
+                )
+                .await
+                .unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            requests.push(read_request(&mut second).await);
+            write_json_response(
+                &mut second,
+                json!([{"result": {"data": {"json": {"isLoggedIn": true}}}}]),
+            )
+            .await;
+            requests
+        });
+
+        let provider = Arc::new(FakeClearanceProvider::new());
+        let api = test_api_with_provider(
+            base_url,
+            DzmmApiAuth {
+                cookies: Some(Cow::Borrowed("session=account")),
+                ..DzmmApiAuth::default()
+            },
+            provider.clone(),
+        );
+
+        api.get_my_info(false).await.expect("retry succeeds");
+        let requests = handle.await.unwrap();
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].headers.get("user-agent").map(String::as_str),
+            Some(DEFAULT_HTTP_USER_AGENT)
+        );
+        assert_eq!(
+            requests[1].headers.get("user-agent").map(String::as_str),
+            Some("browser-ua-generation-2")
+        );
+        assert_eq!(
+            requests[0].headers.get("cookie").map(String::as_str),
+            Some("session=account")
+        );
+        assert!(
+            requests[1]
+                .headers
+                .get("cookie")
+                .is_some_and(|value| value.contains("cf_clearance=clearance-2"))
+        );
+        assert!(requests[0].headers.contains_key("sec-ch-ua"));
+        assert!(!requests[1].headers.contains_key("sec-ch-ua"));
+        assert_eq!(provider.snapshot_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.refresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.last_observed_generation.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn second_cf_mitigated_returns_retryable_semantic_clearance_error() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_request(&mut stream).await;
+                stream
+                    .write_all(
+                        b"HTTP/1.1 403 Forbidden\r\ncf-mitigated: challenge\r\nContent-Type: text/html\r\nContent-Length: 9\r\nConnection: close\r\n\r\nchallenge",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let provider = Arc::new(FakeClearanceProvider::new());
+        let api = test_api_with_provider(base_url, DzmmApiAuth::default(), provider.clone());
+
+        let error = api
+            .get_my_info(false)
+            .await
+            .expect_err("second challenge is returned");
+        let clearance_error = error
+            .downcast_ref::<ClearanceError>()
+            .expect("typed clearance error");
+        assert!(clearance_error.retryable());
+        assert!(matches!(
+            clearance_error,
+            ClearanceError::ChallengePersisted { generation: 2, .. }
+        ));
+        assert_eq!(provider.refresh_calls.load(Ordering::SeqCst), 1);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn business_forbidden_does_not_refresh_clearance() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            let body = json!({
+                "error": {
+                    "json": {
+                        "code": -32003
+                    }
+                }
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let provider = Arc::new(FakeClearanceProvider::new());
+        let api = test_api_with_provider(
+            base_url,
+            DzmmApiAuth {
+                auto_refresh: true,
+                ..DzmmApiAuth::default()
+            },
+            provider.clone(),
+        );
+
+        let error = api.get_my_info(false).await.unwrap_err();
+        assert!(error.to_string().contains("Business forbidden"));
+        assert_eq!(provider.refresh_calls.load(Ordering::SeqCst), 0);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unchallenged_request_uses_default_identity_without_provider_query() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            write_json_response(&mut stream, json!({"ok": true})).await;
+            request
+        });
+        let provider = Arc::new(FakeClearanceProvider::new());
+        let api = test_api_with_provider(
+            base_url,
+            DzmmApiAuth {
+                cookies: Some(Cow::Borrowed(
+                    "session=account; cf_clearance=stale-account-value",
+                )),
+                ..DzmmApiAuth::default()
+            },
+            provider.clone(),
+        );
+
+        let (status, _, _) = api
+            .request_with_clearance_retry(&ApiRequest::get("/unchallenged"))
+            .await
+            .expect("unchallenged request succeeds");
+        let request = handle.await.unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            request.headers.get("user-agent").map(String::as_str),
+            Some(DEFAULT_HTTP_USER_AGENT)
+        );
+        assert!(request.headers.contains_key("sec-ch-ua"));
+        assert_eq!(
+            request.headers.get("cookie").map(String::as_str),
+            Some("session=account")
+        );
+        assert_eq!(provider.snapshot_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.refresh_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn default_and_clearance_http_headers_use_their_own_atomic_identity() {
+        let api = test_api("http://127.0.0.1:1".to_string());
+
+        let default_headers = api.build_headers(None).unwrap();
+        assert_eq!(
+            default_headers
+                .get(USER_AGENT)
+                .and_then(|value| value.to_str().ok()),
+            Some(DEFAULT_HTTP_USER_AGENT)
+        );
+        assert!(default_headers.contains_key("sec-ch-ua"));
+
+        let snapshot = clearance_snapshot(3, "browser-ua-generation-3", "clearance-3");
+        let clearance_headers = api.build_headers(Some(&snapshot)).unwrap();
+        assert_eq!(
+            clearance_headers
+                .get(USER_AGENT)
+                .and_then(|value| value.to_str().ok()),
+            Some("browser-ua-generation-3")
+        );
+        assert!(!clearance_headers.contains_key("sec-ch-ua"));
+    }
+
+    #[tokio::test]
+    async fn clearance_agent_failure_does_not_retry_challenge_with_default_identity() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\ncf-mitigated: challenge\r\nContent-Length: 9\r\nConnection: close\r\n\r\nchallenge",
+                )
+                .await
+                .unwrap();
+            request
+        });
+        let provider = Arc::new(FailingClearanceProvider::new());
+        let api = test_api_with_provider(base_url, DzmmApiAuth::default(), provider.clone());
+
+        let error = api
+            .get_my_info(false)
+            .await
+            .expect_err("clearance failure is returned");
+        let clearance_error = error
+            .downcast_ref::<ClearanceError>()
+            .expect("typed clearance error");
+        assert!(matches!(
+            clearance_error,
+            ClearanceError::AgentUnavailable {
+                operation: "refresh",
+                ..
+            }
+        ));
+        assert!(clearance_error.retryable());
+        assert_eq!(provider.snapshot_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.refresh_calls.load(Ordering::SeqCst), 1);
+
+        let request = handle.await.unwrap();
+        assert_eq!(
+            request.headers.get("user-agent").map(String::as_str),
+            Some(DEFAULT_HTTP_USER_AGENT)
+        );
+        assert!(request.headers.contains_key("sec-ch-ua"));
+        assert!(!request.headers.contains_key("cookie"));
+    }
+
+    #[tokio::test]
+    async fn authentication_refresh_starts_after_clearance_retry_finishes() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let mut requests = Vec::new();
+
+            let (mut first, _) = listener.accept().await.unwrap();
+            requests.push(read_request(&mut first).await);
+            first
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\ncf-mitigated: challenge\r\nContent-Length: 9\r\nConnection: close\r\n\r\nchallenge",
+                )
+                .await
+                .unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            requests.push(read_request(&mut second).await);
+            second
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 12\r\nConnection: close\r\n\r\nunauthorized",
+                )
+                .await
+                .unwrap();
+
+            let (mut token, _) = listener.accept().await.unwrap();
+            requests.push(read_request(&mut token).await);
+            write_json_response(&mut token, json!({"user_id": "user-1"})).await;
+
+            let (mut final_request, _) = listener.accept().await.unwrap();
+            requests.push(read_request(&mut final_request).await);
+            write_json_response(
+                &mut final_request,
+                json!([{"result": {"data": {"json": {"isLoggedIn": true}}}}]),
+            )
+            .await;
+            requests
+        });
+
+        let provider = Arc::new(FakeClearanceProvider::new());
+        let api = test_api_with_provider(
+            base_url,
+            DzmmApiAuth {
+                auto_refresh: true,
+                ..DzmmApiAuth::default()
+            },
+            provider.clone(),
+        );
+
+        api.get_my_info(false)
+            .await
+            .expect("authentication succeeds");
+        let requests = handle.await.unwrap();
+        assert!(requests[0].target.starts_with("/api/trpc/user.getMe"));
+        assert!(requests[1].target.starts_with("/api/trpc/user.getMe"));
+        assert_eq!(requests[2].target, "/api/auth/token");
+        assert!(requests[3].target.starts_with("/api/trpc/user.getMe"));
+        assert_eq!(
+            requests[0].headers.get("user-agent").map(String::as_str),
+            Some(DEFAULT_HTTP_USER_AGENT)
+        );
+        assert!(requests[1..].iter().all(|request| {
+            request.headers.get("user-agent").map(String::as_str) == Some("browser-ua-generation-2")
+        }));
+        assert_eq!(provider.refresh_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn multipart_body_is_rebuilt_after_clearance_refresh() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            let (mut first, _) = listener.accept().await.unwrap();
+            requests.push(read_request(&mut first).await);
+            first
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\ncf-mitigated: challenge\r\nContent-Length: 9\r\nConnection: close\r\n\r\nchallenge",
+                )
+                .await
+                .unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            requests.push(read_request(&mut second).await);
+            write_json_response(
+                &mut second,
+                json!({"result": {"data": {"json": {"url": "https://example.com/image.png"}}}}),
+            )
+            .await;
+            requests
+        });
+
+        let provider = Arc::new(FakeClearanceProvider::new());
+        let api = test_api_with_provider(base_url, DzmmApiAuth::default(), provider);
+        api.upload_tweet_image(
+            None,
+            Some(b"multipart-image-payload"),
+            Some("payload.png"),
+            Some("image/png"),
+        )
+        .await
+        .expect("multipart retry succeeds");
+
+        let requests = handle.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in &requests {
+            let body = String::from_utf8_lossy(&request.body);
+            assert!(body.contains("multipart-image-payload"));
+            assert!(body.contains("payload.png"));
+            assert!(body.contains("image/png"));
+        }
+    }
+
+    #[tokio::test]
+    async fn default_socket_io_credentials_use_python_identity_without_clearance() {
+        let provider = Arc::new(FakeClearanceProvider::new());
+        let api = test_api_with_provider(
+            "http://127.0.0.1:1".to_string(),
+            DzmmApiAuth {
+                cookies: Some(Cow::Borrowed(
+                    "session=account; cf_clearance=stale-account-value",
+                )),
+                ..DzmmApiAuth::default()
+            },
+            provider.clone(),
+        );
+
+        let credentials = api.socket_io_credentials().await.unwrap();
+
+        assert_eq!(credentials.generation, 0);
+        assert_eq!(credentials.user_agent, DEFAULT_SOCKET_IO_USER_AGENT);
+        assert_eq!(credentials.cookie_header, "session=account");
+        assert!(!credentials.cookie_header.contains("stale-account-value"));
+        assert_eq!(provider.snapshot_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.refresh_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cached_clearance_identity_is_reused_by_socket_io_without_provider_query() {
+        let provider = Arc::new(FakeClearanceProvider::new());
+        let api = test_api_with_provider(
+            "http://127.0.0.1:1".to_string(),
+            DzmmApiAuth {
+                cookies: Some(Cow::Borrowed("session=account")),
+                ..DzmmApiAuth::default()
+            },
+            provider.clone(),
+        );
+        api.activate_clearance_snapshot(clearance_snapshot(
+            7,
+            "browser-ua-generation-7",
+            "clearance-7",
+        ))
+        .await;
+
+        let credentials = api.socket_io_credentials().await.unwrap();
+
+        assert_eq!(credentials.generation, 7);
+        assert_eq!(credentials.user_agent, "browser-ua-generation-7");
+        assert!(credentials.cookie_header.contains("session=account"));
+        assert!(
+            credentials
+                .cookie_header
+                .contains("cf_clearance=clearance-7")
+        );
+        assert_eq!(provider.snapshot_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.refresh_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn expired_cached_clearance_falls_back_to_default_socket_io_identity() {
+        let provider = Arc::new(FakeClearanceProvider::new());
+        let api = test_api_with_provider(
+            "http://127.0.0.1:1".to_string(),
+            DzmmApiAuth {
+                cookies: Some(Cow::Borrowed("session=account")),
+                ..DzmmApiAuth::default()
+            },
+            provider.clone(),
+        );
+        let mut expired = clearance_snapshot(7, "expired-browser-ua", "expired-clearance");
+        expired.expires_at = Utc::now() - chrono::Duration::minutes(1);
+        api.activate_clearance_snapshot(expired).await;
+
+        let credentials = api.socket_io_credentials().await.unwrap();
+
+        assert_eq!(credentials.generation, 0);
+        assert_eq!(credentials.user_agent, DEFAULT_SOCKET_IO_USER_AGENT);
+        assert_eq!(credentials.cookie_header, "session=account");
+        assert_eq!(provider.snapshot_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.refresh_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -2734,6 +3632,15 @@ mod tests {
         assert!(payload.get("json").is_none());
         assert_eq!(records[1].target, "/api/gamefy/draw/status?taskId=task-123");
         assert_eq!(records[2].target, "/api/draw/image/task-123?index=0");
+        assert!(
+            !records[2].headers.contains_key("cookie"),
+            "plain media download must not send account or Cloudflare cookies"
+        );
+        assert_ne!(
+            records[2].headers.get("user-agent").map(String::as_str),
+            Some("browser-ua-generation-1"),
+            "plain media download must not reuse the clearance identity"
+        );
     }
 
     #[tokio::test]
@@ -2781,6 +3688,15 @@ mod tests {
         assert!(edit_payload.get("json").is_none());
         assert_eq!(records[2].target, "/api/gamefy/draw/status?taskId=task-456");
         assert_eq!(records[3].target, "/api/draw/image/task-456?index=0");
+        assert!(
+            !records[3].headers.contains_key("cookie"),
+            "plain media download must not send account or Cloudflare cookies"
+        );
+        assert_ne!(
+            records[3].headers.get("user-agent").map(String::as_str),
+            Some("browser-ua-generation-1"),
+            "plain media download must not reuse the clearance identity"
+        );
     }
 
     // ========================================================================
@@ -3737,6 +4653,24 @@ mod tests {
         assert!(map.is_empty());
     }
 
+    #[test]
+    fn logged_endpoint_redacts_sign_in_token_and_query() {
+        assert_eq!(
+            sanitize_logged_endpoint("/api/auth/sign-in-code/sensitive-token?next=secret"),
+            "/api/auth/sign-in-code/<redacted>"
+        );
+        assert_eq!(
+            sanitize_logged_endpoint("/api/trpc/user.getMe?input=sensitive"),
+            "/api/trpc/user.getMe"
+        );
+        assert_eq!(
+            sanitize_logged_url(
+                &Url::parse("https://www.dzmm.ai/api/trpc/user.getMe?input=sensitive").unwrap()
+            ),
+            "https://www.dzmm.ai/api/trpc/user.getMe"
+        );
+    }
+
     // ========================================================================
     // get_public_user_profile parsing
     // ========================================================================
@@ -3800,5 +4734,53 @@ mod tests {
         }
         assert_eq!(map.get("existing").unwrap(), "old");
         assert_eq!(map.get("newkey").unwrap(), "newval");
+    }
+
+    #[tokio::test]
+    async fn cloudflare_response_cookies_are_not_added_to_account_cookie_state() {
+        let api = test_api("http://127.0.0.1:1".to_string());
+        let mut headers = HeaderMap::new();
+        headers.append(
+            SET_COOKIE,
+            HeaderValue::from_static("session=updated-account; Path=/"),
+        );
+        headers.append(
+            SET_COOKIE,
+            HeaderValue::from_static("cf_clearance=edge-owned; Path=/"),
+        );
+        headers.append(
+            SET_COOKIE,
+            HeaderValue::from_static("__cf_bm=edge-owned-too; Path=/"),
+        );
+
+        api.merge_response_cookies(&headers).await;
+        let account_cookies = api.get_cookie_string().await;
+
+        assert!(account_cookies.contains("session=updated-account"));
+        assert!(!account_cookies.contains("cf_clearance"));
+        assert!(!account_cookies.contains("__cf_bm"));
+    }
+
+    #[tokio::test]
+    async fn automatic_cookie_store_rejects_cloudflare_response_cookies() {
+        let api = test_api("http://127.0.0.1:1".to_string());
+        let response_cookies = [
+            HeaderValue::from_static("session=account-owned; Path=/"),
+            HeaderValue::from_static("cf_clearance=edge-owned; Path=/"),
+            HeaderValue::from_static("__cf_bm=edge-owned-too; Path=/"),
+        ];
+
+        api.cookie_jar
+            .set_cookies(&mut response_cookies.iter(), &api.cookie_url);
+
+        let stored = api
+            .cookie_jar
+            .cookies(&api.cookie_url)
+            .expect("account cookie is stored");
+        let stored = stored.to_str().expect("stored cookies are valid headers");
+
+        assert!(stored.contains("session=account-owned"));
+        assert!(!stored.contains("cf_clearance"));
+        assert!(!stored.contains("__cf_bm"));
     }
 }

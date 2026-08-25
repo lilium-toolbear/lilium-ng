@@ -1,15 +1,16 @@
 // Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 services/account_service.py
-// Python parity source: dzmm_archive@dd724947e194006e5c5cc55b910937745de84655 services/account_service.py
 use crate::Result;
 use chrono::Utc;
-use lilium_api_client::http::{DzmmApi, DzmmApiAuth};
+use lilium_api_client::http::{CookieRefreshCallback, DzmmApi, DzmmApiAuth};
 use lilium_common::LiliumError;
+use lilium_database::Database;
 use lilium_models::dzmm::{account as dzmm_account, websocket_connection as websocket_connections};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter,
     QueryOrder, Set,
 };
 use std::borrow::Cow;
+use std::sync::Arc;
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -26,19 +27,63 @@ pub struct CreateAccountParams<'a> {
     pub cookies: Option<&'a str>,
 }
 
-pub fn create_auth_client(account: DzmmAccount) -> Result<DzmmApi> {
-    DzmmApi::new(DzmmApiAuth {
-        email: account.email.map(Cow::Owned),
-        password: account.password.map(Cow::Owned),
-        signin_code: account.signin_code.map(Cow::Owned),
-        signin_code_image: account.signin_code_image,
-        signin_code_image_mime: account.signin_code_image_mime.map(Cow::Owned),
-        cookies: account.cookies.map(Cow::Owned),
-        user_id: Some(Cow::Owned(account.user_id.to_string())),
-        auto_refresh: true,
-        on_cookies_refreshed: None,
-    })
-    .map_err(|e| LiliumError::service("ACCOUNT_AUTH_CLIENT_BUILD_FAILED", e.to_string()))
+#[derive(Clone)]
+pub struct AuthClientFactory {
+    database: Database,
+}
+
+impl AuthClientFactory {
+    pub fn new(database: Database) -> Self {
+        Self { database }
+    }
+
+    fn build_auth(&self, account: DzmmAccount) -> DzmmApiAuth {
+        let account_id = account.user_id;
+        let database = self.database.clone();
+        let on_cookies_refreshed: CookieRefreshCallback = Arc::new(move |cookies| {
+            let database = database.clone();
+            Box::pin(async move {
+                let result = lilium_database::transaction!(database, |tx| {
+                    update_cookies(tx, account_id, &cookies).await?;
+                    Ok(())
+                })
+                .await;
+
+                match result {
+                    Ok(()) => {
+                        tracing::debug!(
+                            account_id = %account_id,
+                            "Persisted refreshed account cookies"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            account_id = %account_id,
+                            error = %error,
+                            "Failed to persist refreshed account cookies"
+                        );
+                    }
+                }
+            })
+        });
+
+        DzmmApiAuth {
+            email: account.email.map(Cow::Owned),
+            password: account.password.map(Cow::Owned),
+            signin_code: account.signin_code.map(Cow::Owned),
+            signin_code_image: account.signin_code_image,
+            signin_code_image_mime: account.signin_code_image_mime.map(Cow::Owned),
+            cookies: account.cookies.map(Cow::Owned),
+            user_id: Some(Cow::Owned(account_id.to_string())),
+            auto_refresh: true,
+            on_cookies_refreshed: Some(on_cookies_refreshed),
+        }
+    }
+
+    pub fn create(&self, account: DzmmAccount) -> Result<DzmmApi> {
+        DzmmApi::new(self.build_auth(account))
+            .map_err(|e| LiliumError::service("ACCOUNT_AUTH_CLIENT_BUILD_FAILED", e.to_string()))
+    }
 }
 
 #[instrument(level = "debug"
@@ -401,5 +446,69 @@ mod tests {
         })
         .await
         .expect("account roundtrip");
+    }
+
+    #[tokio::test]
+    async fn auth_client_factory_persists_refreshed_cookies() {
+        let test_db =
+            lilium_test_fixtures::TestDb::acquire(lilium_test_fixtures::FixtureProfile::Account)
+                .await
+                .expect("init account db");
+        let user_id = Uuid::new_v4();
+
+        lilium_database::transaction!(test_db.database(), |tx| {
+            let now = Utc::now();
+            users::Entity::insert(users::ActiveModel {
+                user_id: Set(user_id),
+                message_count: Set(0),
+                deleted_count: Set(0),
+                recalled_count: Set(0),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            })
+            .exec(tx)
+            .await
+            .expect("seed account user");
+            create_account(
+                tx,
+                CreateAccountParams {
+                    user_id,
+                    user_profile: json!({"nickname": "cookie_callback"}),
+                    email: Some("callback@example.com"),
+                    password: Some("password"),
+                    signin_code: None,
+                    signin_code_image: None,
+                    signin_code_image_mime: None,
+                    cookies: Some("old=cookie"),
+                },
+            )
+            .await
+            .expect("create account");
+            Ok(())
+        })
+        .await
+        .expect("seed account transaction");
+
+        let account = get_account(test_db.database().orm(), user_id)
+            .await
+            .expect("fetch account")
+            .expect("account exists");
+        let factory = AuthClientFactory::new(test_db.database().clone());
+        let auth = factory.build_auth(account);
+        let callback = auth
+            .on_cookies_refreshed
+            .expect("factory installs cookie persistence callback");
+
+        callback("sb-rls-auth-token=new-token; refresh=rotated".to_owned()).await;
+
+        let updated = get_account(test_db.database().orm(), user_id)
+            .await
+            .expect("fetch updated account")
+            .expect("account still exists");
+        assert_eq!(
+            updated.cookies.as_deref(),
+            Some("sb-rls-auth-token=new-token; refresh=rotated")
+        );
     }
 }
