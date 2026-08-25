@@ -15,6 +15,13 @@ use uuid::Uuid;
 
 type User = users::Model;
 
+/// The upstream tRPC endpoint accepts at most ten room-user calls per batch.
+const CHATROOM_USER_BATCH_SIZE: usize = 10;
+
+fn room_user_batch_chunks(user_ids: &[Uuid]) -> impl Iterator<Item = &[Uuid]> {
+    user_ids.chunks(CHATROOM_USER_BATCH_SIZE)
+}
+
 #[derive(Debug, Clone)]
 pub struct SearchUsersParams {
     pub query: Option<String>,
@@ -666,7 +673,7 @@ where
     let mut updated_count = 0;
     let mut avatar_downloads = Vec::new();
 
-    for chunk in users_to_fetch.chunks(30) {
+    for chunk in room_user_batch_chunks(&users_to_fetch) {
         let pairs_to_fetch = chunk
             .iter()
             .map(|user_id| {
@@ -941,6 +948,23 @@ mod tests {
             assert_eq!(p.user_id, test_uuid("u2"));
             assert!(p.display_name.is_none());
             assert!(p.avatar_url.is_none());
+        }
+    }
+
+    mod room_user_batching {
+        use super::{room_user_batch_chunks, test_uuid};
+
+        #[test]
+        fn profile_fetch_batches_respect_the_remote_limit() {
+            let user_ids = (0..11)
+                .map(|index| test_uuid(&format!("room-user-{index}")))
+                .collect::<Vec<_>>();
+
+            let batches = room_user_batch_chunks(&user_ids)
+                .map(|batch| batch.len())
+                .collect::<Vec<_>>();
+
+            assert_eq!(batches, vec![10, 1]);
         }
     }
 
